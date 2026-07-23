@@ -42,6 +42,29 @@ const result = transform(`const view = <div>Hello</div>;`, {
 console.log(result.code);
 ```
 
+## Rust compiler core
+
+The crate also exposes a host-independent Rust API:
+
+```rust
+use dom_expressions_compiler::{compile, CompileOptions};
+
+let output = compile(
+    "const view = <div>{name()}</div>;",
+    &CompileOptions::default(),
+)?;
+```
+
+Build with `--no-default-features` when embedding the compiler without its
+Node-API adapter. Set `CompileOptions::semantic_trace` for DOM output to
+receive normalized, typed facts about how JSX source values and callbacks are
+lowered and executed. The facts are collected during the normal lowering pass;
+the existing Node `transform()` delegates to the same compiler core and keeps
+its current interface. An independent source census prevents the trace from
+silently omitting a lowering site. Trace production fails on missing or
+conflicting decisions and on output paths that cannot prove complete coverage.
+The trace API is experimental while its vocabulary is evaluated by tooling.
+
 `transformAsync()` is also available for integration points that expect a
 promise-returning transform:
 
