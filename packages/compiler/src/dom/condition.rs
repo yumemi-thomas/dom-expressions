@@ -37,7 +37,7 @@ impl<'a> crate::shared::component_children::ComponentChildLower<'a>
     fn lower_child_element_with_setup(
         &mut self,
         element: &JSXElement<'a>,
-    ) -> napi::bindgen_prelude::Result<(Expression<'a>, std::vec::Vec<oxc_ast::ast::Statement<'a>>)>
+    ) -> crate::error::Result<(Expression<'a>, std::vec::Vec<oxc_ast::ast::Statement<'a>>)>
     {
         self.lower_element_with_setup(element)
     }
@@ -51,7 +51,7 @@ impl<'a> ModeLower<'a> for AstDomTransform<'a, '_> {
     fn lower_child_element(
         &mut self,
         element: &JSXElement<'a>,
-    ) -> napi::bindgen_prelude::Result<Expression<'a>> {
+    ) -> crate::error::Result<Expression<'a>> {
         self.lower_element(element)
     }
 
