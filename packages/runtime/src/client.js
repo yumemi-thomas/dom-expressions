@@ -1,4 +1,4 @@
-import { ChildProperties, Namespaces, DelegatedEvents, $$SLOT, $$HOST } from "./constants";
+import { ChildProperties, Namespaces, DelegatedEvents, $$SLOT, $$HOST, $$FRAME } from "./constants";
 import {
   root,
   effect,
@@ -202,16 +202,54 @@ export function setProperty(node, name, value) {
 // their own reactive system (e.g. onCleanup), not through this hook.
 let claimHandlers = null;
 
+// The live handler list is mirrored onto a registered symbol so the frame
+// runtime — deliberately importless in both directions, like the FRAME
+// brand — sweeps serialized server content against the SAME registry, even
+// when the two land in separately bundled copies of this module.
+const CLAIM_SEAM = Symbol.for("dom-expressions.element-claims");
+
 /**
  * Register a consumer for compiler-emitted element claims. Returns an
  * unregister function.
  */
 export function registerElementClaim(handler) {
-  (claimHandlers || (claimHandlers = [])).push(handler);
+  (claimHandlers || (claimHandlers = globalThis[CLAIM_SEAM] = [])).push(handler);
   return () => {
     const index = claimHandlers.indexOf(handler);
     index > -1 && claimHandlers.splice(index, 1);
   };
+}
+
+// Elements the claim contract covers, and the subtree sweep over them.
+// Serialized server content (frame streams, adopted SSR ranges) becomes
+// live DOM without per-element compiled creation code, so its producer
+// claims whole subtrees at materialization instead. Claims fire
+// indiscriminately per the attribute contract — filtering (external links,
+// `download`, `target`, base paths) belongs to the consumer.
+const CLAIMED_ELEMENTS = "a[href], form[action]";
+
+/**
+ * Sweep-claim every navigation-relevant element in `root` (an element or a
+ * DocumentFragment) — the subtree equivalent of the per-element
+ * `claimElement` compiled output emits. Dormant like every claim hook:
+ * without a registered consumer this is one check and the selector never
+ * runs.
+ */
+export function claimElementTree(root) {
+  // Read through the seam (not the module-local) so a separately bundled
+  // copy of this function still sees the registry consumers write to.
+  const handlers = globalThis[CLAIM_SEAM];
+  if (handlers === undefined || handlers.length === 0) return root;
+  const isElement = root.nodeType === 1;
+  if (!isElement && root.nodeType !== 11) return root;
+  if (isElement && root.matches(CLAIMED_ELEMENTS)) {
+    for (let i = 0; i < handlers.length; i++) handlers[i](root);
+  }
+  const found = root.querySelectorAll(CLAIMED_ELEMENTS);
+  for (let i = 0; i < found.length; i++) {
+    for (let j = 0; j < handlers.length; j++) handlers[j](found[i]);
+  }
+  return root;
 }
 
 /**
@@ -1133,6 +1171,16 @@ function insertExpression(parent, value, current, marker) {
       parent.appendChild(value);
     }
     if (marker) value[$$SLOT] = marker;
+  } else if (value[$$FRAME]) {
+    // Branded frame-insertable (frame-client.js): mount is delegated to the
+    // handler the value carries, so recognizing frames costs client.js no
+    // imports. One static mount per value — lifecycle belongs to the
+    // creator (dispose on the value), and updates flow through the frame's
+    // own stream (policy A), not through re-inserting a new value.
+    if (current) {
+      cleanChildren(parent, Array.isArray(current) ? current : [current], multi ? marker : null);
+    }
+    value[$$FRAME](parent, multi ? marker : null);
   } else if (Array.isArray(value)) {
     const currentArray = current && Array.isArray(current);
     if (value.length === 0) {
@@ -1151,6 +1199,9 @@ function insertExpression(parent, value, current, marker) {
 function normalize(value, current, multi, doNotUnwrap) {
   value = flatten(value, { skipNonRendered: true, doNotUnwrap });
   if (doNotUnwrap && typeof value === "function") return value;
+  // Branded frame-insertables mount as a self-contained range — never
+  // array-wrap them into the multi path (insertExpression delegates whole).
+  if (value != null && value[$$FRAME]) return value;
   if (multi && !Array.isArray(value)) value = [value != null ? value : ""];
   if (Array.isArray(value)) {
     for (let i = 0, len = value.length; i < len; i++) {

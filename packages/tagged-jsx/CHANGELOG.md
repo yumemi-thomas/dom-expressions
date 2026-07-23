@@ -1,5 +1,13 @@
 # tagged-jsx-dom-expressions
 
+## 0.50.0-next.29
+
+## 0.50.0-next.28
+
+## 0.50.0-next.27
+
+## 0.50.0-next.26
+
 ## 0.50.0-next.25
 
 ### Patch Changes

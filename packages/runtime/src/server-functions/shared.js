@@ -223,7 +223,9 @@ export const BodyFormat = {
   Blob: "4",
   File: "5",
   ArrayBuffer: "6",
-  Uint8Array: "7"
+  Uint8Array: "7",
+  /** Plain `JSON.stringify(args)` — the fast path for JSON-safe arguments. */
+  Json: "8"
 };
 
 /**
@@ -304,6 +306,8 @@ export async function extractBody(source, codecOptions) {
   switch (true) {
     case format === BodyFormat.Serialized:
       return await deserializeStream(clone, codecOptions);
+    case format === BodyFormat.Json:
+      return JSON.parse(await clone.text());
     case format === BodyFormat.String:
       return await clone.text();
     case format === BodyFormat.File: {
@@ -336,7 +340,10 @@ export async function extractBody(source, codecOptions) {
  * how much data to buffer before parsing, so multiple chunks (async values
  * resolving over time) can share one connection.
  */
-function createChunk(data) {
+// Exported for other framed transports over the same wire convention (frame
+// streams frame their chunks identically — see frame-transport.js) so there
+// is exactly one framing implementation.
+export function createChunk(data) {
   const encodeData = new TextEncoder().encode(data);
   const bytes = encodeData.length;
   const baseHex = bytes.toString(16);
@@ -349,7 +356,7 @@ function createChunk(data) {
   return chunk;
 }
 
-class ChunkReader {
+export class ChunkReader {
   constructor(stream) {
     this.reader = stream.getReader();
     this.buffer = new Uint8Array(0);

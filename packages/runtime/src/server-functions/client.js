@@ -15,9 +15,7 @@ import {
   getFlightDataConsumer,
   getHeadersAndBody,
   getServerFunctionMetadata,
-  getServerFunctionsCodec,
   isServerFunction,
-  serializeString,
   withMeta
 } from "./shared.js";
 
@@ -37,8 +35,46 @@ export {
 
 const config = {
   endpoint: "/_server",
-  prepareRequest: undefined
+  prepareRequest: undefined,
+  responseHandler: undefined,
+  serializeArgs: undefined
 };
+
+/**
+ * Whether the argument list survives a `JSON.stringify` round trip
+ * faithfully: JSON primitives (finite numbers only), arrays, and plain
+ * objects. Anything else — Dates, Maps, typed arrays, undefined, NaN,
+ * class instances — needs the codec (see `enableRichArguments`).
+ */
+function isJSONSafe(value) {
+  if (value === null) return true;
+  const t = typeof value;
+  if (t === "string" || t === "boolean") return true;
+  if (t === "number") return Number.isFinite(value);
+  if (t !== "object") return false;
+  if (Array.isArray(value)) {
+    for (const v of value) if (!isJSONSafe(v)) return false;
+    return true;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return false;
+  for (const k in value) if (!isJSONSafe(value[k])) return false;
+  return true;
+}
+
+function serializeArguments(args) {
+  if (!config.serializeArgs) {
+    throw new Error(
+      "Server function arguments are sent as JSON by default and these " +
+        "arguments are not JSON-serializable. Call enableRichArguments() " +
+        "(from the server-functions rich-args entry) once at startup to " +
+        "send Dates, Maps, Sets, typed arrays, etc. through the codec — or " +
+        "pass a single Blob/FormData/File argument, which has a native " +
+        "HTTP encoding."
+    );
+  }
+  return config.serializeArgs(args);
+}
 
 /**
  * Configures the transport before any server function is called: the
@@ -47,11 +83,27 @@ const config = {
  * `decodeResponse` sees them too), and the `prepareRequest` hook applied
  * to every outgoing server-function fetch (session-dynamic transport
  * policy — bearer tokens, tracing headers).
+ *
+ * `responseHandler` is the response-side integration seam — the client
+ * mirror of the handler's `transformResult`. `handle(response, ctx)` sees
+ * every response before the transport decodes it; returning anything but
+ * undefined resolves the call with that value instead. `capture(info)`
+ * runs synchronously at the call site, before any await, and its return
+ * arrives as `ctx.context` — ambient per-call state (e.g. a reactive
+ * owner) survives to response time even though handling is async.
  */
-export function configureServerFunctionsClient({ endpoint, codec, prepareRequest } = {}) {
+export function configureServerFunctionsClient({
+  endpoint,
+  codec,
+  prepareRequest,
+  responseHandler,
+  serializeArgs
+} = {}) {
   if (endpoint !== undefined) config.endpoint = endpoint;
   if (codec !== undefined) configureServerFunctionsCodec(codec);
   if (prepareRequest !== undefined) config.prepareRequest = prepareRequest;
+  if (responseHandler !== undefined) config.responseHandler = responseHandler;
+  if (serializeArgs !== undefined) config.serializeArgs = serializeArgs;
 }
 
 let INSTANCE = 0;
@@ -109,14 +161,34 @@ async function initializeResponse(base, id, instance, options, args, meta) {
       );
     }
   }
-  // Everything else goes through the codec
+  // JSON-safe argument lists go as plain JSON — no codec on the wire, and
+  // (because nothing else here references the serializer) no serialize-half
+  // of the codec in the bundle.
+  if (isJSONSafe(args)) {
+    return createRequest(
+      base,
+      id,
+      instance,
+      {
+        ...options,
+        body: JSON.stringify(args),
+        headers: {
+          ...options.headers,
+          "Content-Type": "application/json",
+          [BODY_FORMAT_HEADER]: BodyFormat.Json
+        }
+      },
+      meta
+    );
+  }
+  // Everything else needs the codec, which is opt-in (enableRichArguments).
   return createRequest(
     base,
     id,
     instance,
     {
       ...options,
-      body: await serializeString(args, getServerFunctionsCodec()),
+      body: await serializeArguments(args),
       headers: {
         ...options.headers,
         "Content-Type": "text/plain",
@@ -129,8 +201,19 @@ async function initializeResponse(base, id, instance, options, args, meta) {
 
 async function fetchServerFunction(base, id, options, args, meta) {
   const instance = `server-function:${INSTANCE++}`;
+  // Captured synchronously at the call site (an async function body runs
+  // sync up to its first await), so ambient call context is still live.
+  const handler = config.responseHandler;
+  const context = handler && handler.capture ? handler.capture({ id, meta }) : undefined;
 
   const response = await initializeResponse(base, id, instance, options, args, meta);
+
+  // The integration seam sees the response first: a handler that claims it
+  // (returns non-undefined) owns the call's result.
+  if (handler) {
+    const handled = handler.handle(response, { id, meta, args, context });
+    if (handled !== undefined) return handled;
+  }
 
   // Single-flight responses: with a registered consumer the transport owns
   // the unwrap — the standardized `{ value, data }` body is decoded, `data`
@@ -192,7 +275,19 @@ export function createServerReference(id, name, base) {
   // its bound arguments in the query string, where the server reads them
   // for natural-encoding bodies. Default calls derive from the configured
   // endpoint (lazily — it may be configured after module scope runs).
-  const fn = (...args) => fetchServerFunction(base || config.endpoint, id, {}, args, metadata);
+  const fn = (...args) => {
+    // Local-answer seam, SYNCHRONOUS on purpose: an integration that already
+    // holds this call's result (e.g. a document-SSR'd server-component
+    // boundary at hydration time) answers without a promise — so async
+    // consumers (dynamic under a hydrating Loading) never observe a pending
+    // beat that would commit them to a fallback and discard SSR'd content.
+    const handler = config.responseHandler;
+    if (handler && handler.intercept) {
+      const hit = handler.intercept({ id, meta: metadata, args });
+      if (hit !== undefined) return hit;
+    }
+    return fetchServerFunction(base || config.endpoint, id, {}, args, metadata);
+  };
   fn[SERVER_FUNCTION_METADATA] = metadata;
 
   return new Proxy(fn, {
@@ -235,9 +330,17 @@ export function GET(fn) {
   // metadata (withMeta composes with GET in either order)
   const metadata = { ...getServerFunctionMetadata(fn) };
   const wrapped = async (...args) => {
+    const handler = config.responseHandler;
+    if (handler && handler.intercept) {
+      const hit = handler.intercept({ id, meta: metadata, args });
+      if (hit !== undefined) return hit;
+    }
     let base = `${config.endpoint}?id=${encodeURIComponent(id)}`;
     if (args.length) {
-      base += `&args=${encodeURIComponent(await serializeString(args, getServerFunctionsCodec()))}`;
+      // The handler's GET path accepts both encodings: plain JSON and the
+      // codec's framed string (distinguished by the `;0x` frame prefix).
+      const encoded = isJSONSafe(args) ? JSON.stringify(args) : await serializeArguments(args);
+      base += `&args=${encodeURIComponent(encoded)}`;
     }
     return fetchServerFunction(base, id, { method: "GET" }, [], metadata);
   };
