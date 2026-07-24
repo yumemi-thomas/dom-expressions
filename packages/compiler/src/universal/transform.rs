@@ -11,17 +11,15 @@ use oxc_ast_visit::VisitMut;
 use oxc_span::{GetSpan, Span};
 
 use crate::dom::element::{jsx_expression_to_expression, AstDomTransform, DomTransformConfig};
-use crate::shared::ast::{
-    arrow_return_expression, expression_to_argument, object_method_property,
-};
+use crate::shared::ast::{arrow_return_expression, expression_to_argument, object_method_property};
 use crate::shared::bindings::BindingTable;
+use crate::shared::classify::Classify;
 use crate::shared::component_props::ComponentPropContext;
 use crate::shared::condition::{
     is_condition_shape, memo_wrap_thunk, transform_condition, transform_condition_inline,
     zero_arg_call_thunk, ConditionBuilder,
 };
 use crate::shared::refs::{assignment_fallback, callable_test};
-use crate::shared::classify::Classify;
 use crate::shared::utils::{
     element_name, escape_html_text_expression, get_numbered_id, is_component_name,
     static_jsx_expression, trim_jsx_text,
@@ -699,10 +697,16 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
                         _ => None,
                     };
                     let dynamic = container.is_some_and(|container| {
-                        container.expression.as_expression().is_some_and(|expression| {
-                            self.classify()
-                                .is_dynamic(Some(container.span.start), expression, false)
-                        })
+                        container
+                            .expression
+                            .as_expression()
+                            .is_some_and(|expression| {
+                                self.classify().is_dynamic(
+                                    Some(container.span.start),
+                                    expression,
+                                    false,
+                                )
+                            })
                     });
                     let can_native_spread = key != "ref"
                         && !(key.contains(':')
@@ -1066,10 +1070,13 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
             );
             return Ok(());
         }
-        let dynamic = container.expression.as_expression().is_some_and(|expression| {
-            self.classify()
-                .is_dynamic(Some(container.span.start), expression, false)
-        });
+        let dynamic = container
+            .expression
+            .as_expression()
+            .is_some_and(|expression| {
+                self.classify()
+                    .is_dynamic(Some(container.span.start), expression, false)
+            });
         let mut value = jsx_expression_to_expression(&container.expression, self.allocator);
         self.visit_expression(&mut value);
         let value = if dynamic {
@@ -1423,7 +1430,11 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
     }
 
     pub(crate) fn lower_fragment(&mut self, fragment: &JSXFragment<'a>) -> Result<Expression<'a>> {
-        crate::shared::fragment::lower_fragment(self, fragment)
+        crate::shared::fragment::lower_fragment(
+            self,
+            fragment,
+            crate::semantic_trace::ExecutionSiteKind::JsxChild,
+        )
     }
 
     fn create_text_node(&mut self, span: Span, value: &str) -> Expression<'a> {

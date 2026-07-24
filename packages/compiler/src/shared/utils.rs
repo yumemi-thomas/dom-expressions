@@ -90,6 +90,22 @@ pub(crate) fn is_component_name(name: &JSXElementName<'_>) -> bool {
     )
 }
 
+/// Source values that cannot contain reads, writes, calls, or callbacks and
+/// therefore have no observable runtime execution to report.
+pub(crate) fn is_literal_only_expression(expression: &Expression<'_>) -> bool {
+    matches!(
+        expression,
+        Expression::StringLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+    ) || matches!(
+        expression,
+        Expression::Identifier(identifier)
+            if matches!(identifier.name.as_str(), "undefined" | "NaN" | "Infinity")
+    )
+}
+
 pub(crate) fn static_jsx_expression_value(expression: &JSXExpression<'_>) -> Option<String> {
     static_jsx_expression(expression, None).map(StaticValue::into_template_value)
 }

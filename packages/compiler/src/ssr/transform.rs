@@ -1440,11 +1440,9 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                     }
                     let expression =
                         jsx_expression_to_expression(&container.expression, self.allocator);
-                    let dynamic = self.classify().is_dynamic(
-                        Some(container.span.start),
-                        &expression,
-                        false,
-                    );
+                    let dynamic =
+                        self.classify()
+                            .is_dynamic(Some(container.span.start), &expression, false);
                     let allocates = self.hydratable && child_slot_allocates_ids(child);
                     let value = self.dynamic_child_value(container.span, expression, dynamic);
                     let value = if do_not_escape {
@@ -1526,7 +1524,11 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
     }
 
     pub(crate) fn lower_fragment(&mut self, fragment: &JSXFragment<'a>) -> Result<Expression<'a>> {
-        crate::shared::fragment::lower_fragment(self, fragment)
+        crate::shared::fragment::lower_fragment(
+            self,
+            fragment,
+            crate::semantic_trace::ExecutionSiteKind::JsxChild,
+        )
     }
 
     /// Babel's `createTemplate` wrap for dynamic fragment children:
@@ -2137,11 +2139,9 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                     }
                     let expression =
                         jsx_expression_to_expression(&container.expression, self.allocator);
-                    let dynamic = self.classify().is_dynamic(
-                        Some(container.span.start),
-                        &expression,
-                        false,
-                    );
+                    let dynamic =
+                        self.classify()
+                            .is_dynamic(Some(container.span.start), &expression, false);
                     let allocates = self.hydratable && child_slot_allocates_ids(child);
                     let value = self.dynamic_child_value(container.span, expression, dynamic);
                     let value = if do_not_escape {

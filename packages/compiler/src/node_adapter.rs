@@ -109,6 +109,7 @@ fn core_options(options: TransformOptions) -> Result<CompileOptions> {
                 elements: renderer.elements,
             })
             .collect(),
+        semantic_trace: false,
     })
 }
 

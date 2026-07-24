@@ -51,11 +51,13 @@ struct ChildValue<'a> {
     /// per-child IIFE inside multi-child arrays — matching Babel, where each
     /// array entry is its own `(() => { ... })()`.
     setup: std::vec::Vec<Statement<'a>>,
+    semantic_span: Option<oxc_span::Span>,
 }
 
 pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
     ctx: &mut C,
     children: &[JSXChild<'a>],
+    render_callbacks: bool,
 ) -> Result<Option<ComponentChildren<'a>>> {
     let allocator = ctx.condition_allocator();
     let ast = mode_ast(ctx);
@@ -70,6 +72,7 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
                         value: ast.expression_string_literal(span, ast.atom(&value), None),
                         kind: ChildKind::Static,
                         setup: std::vec::Vec::new(),
+                        semantic_span: None,
                     });
                 }
             }
@@ -83,14 +86,27 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
                 // and namespace-import members short-circuit inside the
                 // shared predicate. JSX inside the value stays raw for the
                 // deferred pass.
-                let dynamic = container.expression.as_expression().is_some_and(|expression| {
-                    ctx.classify()
-                        .is_dynamic(Some(container.span.start), expression, true)
-                });
-                let mut value = container
+                let dynamic = container
                     .expression
-                    .clone_in(allocator)
-                    .into_expression();
+                    .as_expression()
+                    .is_some_and(|expression| {
+                        ctx.classify()
+                            .is_dynamic(Some(container.span.start), expression, true)
+                    });
+                let render_callback = render_callbacks
+                    && matches!(
+                        container.expression,
+                        JSXExpression::ArrowFunctionExpression(_)
+                            | JSXExpression::FunctionExpression(_)
+                    );
+                if render_callback {
+                    ctx.trace_callback(
+                        container.expression.span(),
+                        crate::semantic_trace::ExecutionSiteKind::ControlFlowRender,
+                        crate::semantic_trace::CallbackDecision::LaterRender,
+                    );
+                }
+                let mut value = container.expression.clone_in(allocator).into_expression();
                 if dynamic && ctx.wrap_conditionals_enabled() && is_condition_shape(&value) {
                     // `transformCondition(..., true)` — memos collapse inline.
                     value = transform_condition_inline(ctx, container.span, value);
@@ -103,6 +119,7 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
                         ChildKind::Static
                     },
                     setup: std::vec::Vec::new(),
+                    semantic_span: (!render_callback).then(|| container.expression.span()),
                 });
             }
             JSXChild::Element(element) => {
@@ -111,6 +128,7 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
                     value,
                     kind: ChildKind::Element,
                     setup,
+                    semantic_span: None,
                 });
             }
             JSXChild::Spread(spread) => {
@@ -124,6 +142,7 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
                         ChildKind::Static
                     },
                     setup: std::vec::Vec::new(),
+                    semantic_span: Some(spread.expression.span()),
                 });
             }
             JSXChild::Fragment(fragment) => {
@@ -135,12 +154,17 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
                 // (Babel's zero-arg callee unwrap in
                 // `transformComponentChildren`); arrays re-fold the setup into
                 // a per-entry IIFE, reproducing the original shape.
-                let value = lower_fragment(ctx, fragment)?;
+                let value = lower_fragment(
+                    ctx,
+                    fragment,
+                    crate::semantic_trace::ExecutionSiteKind::ComponentChild,
+                )?;
                 let (value, setup) = crate::shared::ast::split_zero_arg_iife(allocator, value);
                 values.push(ChildValue {
                     value,
                     kind: ChildKind::Element,
                     setup,
+                    semantic_span: None,
                 });
             }
         }
@@ -150,6 +174,17 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
         0 => None,
         1 => {
             let child = values.pop().expect("component child exists");
+            if let Some(span) = child.semantic_span {
+                ctx.trace_value(
+                    span,
+                    crate::semantic_trace::ExecutionSiteKind::ComponentChild,
+                    if matches!(child.kind, ChildKind::Static) {
+                        crate::semantic_trace::ValueDecision::EagerOnce
+                    } else {
+                        crate::semantic_trace::ValueDecision::CallerContext
+                    },
+                );
+            }
             Some(ComponentChildren {
                 value: child.value,
                 needs_getter: !matches!(child.kind, ChildKind::Static),
@@ -157,6 +192,15 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
             })
         }
         _ => {
+            for child in &values {
+                if let Some(span) = child.semantic_span {
+                    ctx.trace_value(
+                        span,
+                        crate::semantic_trace::ExecutionSiteKind::ComponentChild,
+                        crate::semantic_trace::ValueDecision::CallerContext,
+                    );
+                }
+            }
             let span = children
                 .first()
                 .map_or_else(|| oxc_span::Span::new(0, 0), JSXChild::span);
