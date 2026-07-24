@@ -160,13 +160,7 @@ fn compile_inner(source: &str, options: &CompileOptions) -> Result<CompileOutput
     }
 
     if let Some(lib) = options.require_import_source.as_deref() {
-        let has_pragma = parsed.program.comments.iter().any(|comment| {
-            let text = comment.content_span().source_text(source);
-            let mut pieces = text.split("@jsxImportSource");
-            pieces.next();
-            matches!((pieces.next(), pieces.next()), (Some(rest), None) if rest.trim() == lib)
-        });
-        if !has_pragma {
+        if !has_jsx_import_source(&parsed.program, source, lib) {
             if options.semantic_trace {
                 return Err(CompileError::configuration(
                     "semantic tracing cannot claim coverage for a file skipped by requireImportSource",
@@ -288,6 +282,19 @@ fn compile_inner(source: &str, options: &CompileOptions) -> Result<CompileOutput
         code: build.code,
         source_map: build.map.map(|map| map.to_json_string()),
         semantic_trace,
+    })
+}
+
+pub(crate) fn has_jsx_import_source(
+    program: &oxc_ast::ast::Program<'_>,
+    source: &str,
+    required: &str,
+) -> bool {
+    program.comments.iter().any(|comment| {
+        let text = comment.content_span().source_text(source);
+        let mut pieces = text.split("@jsxImportSource");
+        pieces.next();
+        matches!((pieces.next(), pieces.next()), (Some(rest), None) if rest.trim() == required)
     })
 }
 
