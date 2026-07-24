@@ -1,3 +1,4 @@
+//! Public compiler-interface coverage without the Node/N-API adapter.
 #![cfg(not(feature = "node"))]
 
 use dom_expressions_compiler::{
