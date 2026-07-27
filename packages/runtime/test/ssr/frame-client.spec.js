@@ -383,6 +383,54 @@ describe("morph", () => {
     expect(div.textContent).toBe("Goodbye");
   });
 
+  it("preserves a user-toggled <details open> across a morph (browser-owned state)", () => {
+    const frame = withContent("<details><summary>s</summary><p>body v1</p></details>");
+    const details = boundary.firstElementChild;
+    // The user opens it — a browser-owned toggle the server never sees.
+    details.open = true;
+    expect(details.hasAttribute("open")).toBe(true);
+    // A navigation morph re-renders the details as the server default (closed).
+    frame.apply({
+      version: 2,
+      r: { "": html("<details><summary>s</summary><p>body v2</p></details>") }
+    });
+    // Same element, content morphed, but the user's open state survives.
+    expect(boundary.firstElementChild).toBe(details);
+    expect(details.open).toBe(true);
+    expect(details.querySelector("p").textContent).toBe("body v2");
+  });
+
+  it("does not force a user-closed <details> back open when the server renders it open", () => {
+    const frame = withContent("<details open><summary>s</summary><p>v1</p></details>");
+    const details = boundary.firstElementChild;
+    details.open = false; // user closes it
+    frame.apply({
+      version: 2,
+      r: { "": html("<details open><summary>s</summary><p>v2</p></details>") }
+    });
+    expect(details.open).toBe(false); // user wins
+    expect(details.querySelector("p").textContent).toBe("v2");
+  });
+
+  it("leaves a data-preserve element's attributes and subtree untouched", () => {
+    const frame = withContent('<div data-preserve class="widget"><span>init</span></div>');
+    const widget = boundary.firstElementChild;
+    const span = widget.firstElementChild;
+    // A third-party widget mutates the interior after mount.
+    span.textContent = "runtime-state";
+    widget.setAttribute("data-ready", "1");
+    // The morph tries to reset it to fresh server output.
+    frame.apply({
+      version: 2,
+      r: { "": html('<div data-preserve class="widget"><span>server</span></div>') }
+    });
+    // Frozen: same nodes, runtime state intact, server output ignored.
+    expect(boundary.firstElementChild).toBe(widget);
+    expect(widget.firstElementChild).toBe(span);
+    expect(span.textContent).toBe("runtime-state");
+    expect(widget.getAttribute("data-ready")).toBe("1");
+  });
+
   it("inserts and removes children without recreating siblings", () => {
     const frame = withContent("<ul><li>a</li></ul>");
     const ul = boundary.firstElementChild;
@@ -801,9 +849,13 @@ describe("render-function slots", () => {
     const firstP = wrapper.querySelector("p");
     expect(wrapper.textContent).toContain("Client ida");
     expect(firstP.textContent).toBe("first");
-    // No wrapper element around the server content: it sits directly in the
-    // client output, between the region markers.
-    expect(firstP.parentElement).toBe(wrapper);
+    // The server content sits inside its region element — a `display:contents`
+    // frame element (layout-transparent, so visually still inline in the
+    // client output), whose parent is the client wrapper.
+    const region = firstP.parentElement;
+    expect(region.tagName).toBe("DX-FRAME");
+    expect(region.style.display).toBe("contents");
+    expect(region.parentElement).toBe(wrapper);
 
     host.apply({ type: "html", id: "child", version: 2, html: "<p>second</p>" });
 
@@ -813,6 +865,46 @@ describe("render-function slots", () => {
     expect(wrapper.querySelector("p")).toBe(firstP);
     expect(firstP.textContent).toBe("second");
     expect(wrapper.textContent).toContain("Client ida");
+  });
+
+  it("an occluded region binds detached and fills before the wrapper places it", () => {
+    // The occlusion case (a collapsed wrapper that doesn't render its region):
+    // the region element is created when args resolve but is never placed, so
+    // it must bind and fill off-DOM from the streamed chunk — then reveal in
+    // place when the wrapper finally inserts the single node. A bare element
+    // has no parentNode, so binding cannot gate on placement.
+    const host = createFrameHost(createMockSerializer());
+    let region;
+    createFrame(boundary, {
+      id: "f",
+      host,
+      slots: {
+        // Capture the region element but DON'T place it (wrapper "collapsed").
+        row: props => {
+          region = props.children;
+          return document.createElement("span");
+        }
+      }
+    });
+    host.apply({
+      type: "html",
+      id: "f",
+      version: 1,
+      html: "<div><!--slot:row#0:start--><!--slot:row#0:end--></div>"
+    });
+    host.apply({
+      type: "slot",
+      id: "f",
+      version: 1,
+      key: "row#0",
+      args: { children: { $frame: "f.row#0.children" } }
+    });
+    // The region is a detached, empty element — never placed by the wrapper.
+    expect(region.tagName).toBe("DX-FRAME");
+    expect(region.parentNode).toBe(null);
+    // Its content streams in and fills the detached element (bound off-DOM).
+    host.apply({ type: "html", id: "f.row#0.children", version: 1, html: "<p>body</p>" });
+    expect(region.innerHTML).toBe("<p>body</p>");
   });
 
   it("re-calls the render function on an args change, preserving the region", () => {
@@ -1418,12 +1510,39 @@ describe("adoption -> first morph with nested regions (#547)", () => {
     "<article><h1>Row</h1>" +
     "<!--slot:row#r1:start-->" +
     '<div class="row"><button>[-]</button>' +
-    "<!--frame:f.row#r1.children:start--><em>body-1</em><!--frame:f.row#r1.children:end-->" +
+    '<dx-frame data-fid="f.row#r1.children" style="display:contents"><em>body-1</em></dx-frame>' +
     "</div>" +
     "<!--slot:row#r1:end-->" +
     "</article>";
   const streamHtml =
     "<article><h1>Row v2</h1><!--slot:row#r1:start--><!--slot:row#r1:end--></article>";
+
+  it("threads a used region's EXISTING element into the wrapper's props at t=0 (client reactivity must own it)", () => {
+    // A used region is omitted from the t=0 record (it shipped as page
+    // markup), so a record-less adopt must still hand the wrapper the
+    // already-rendered region element as `props.children` — otherwise the
+    // wrapper's own conditional never owns it, and a client-only toggle that
+    // conditionally renders it can't hide/show it until a stream re-call
+    // (which is why the HN global-collapse toggle failed at t=0 but worked
+    // after navigation).
+    boundary.innerHTML = adoptedDom;
+    const host = createFrameHost(createMockSerializer());
+    let received;
+    createFrame(boundary, {
+      id: "f",
+      host,
+      adopt: true,
+      slots: {
+        row: props => {
+          received = props.children;
+          return undefined; // claim in place
+        }
+      }
+    });
+    const existing = boundary.querySelector('dx-frame[data-fid="f.row#r1.children"]');
+    expect(existing).toBeTruthy();
+    expect(received).toBe(existing);
+  });
 
   it("an ARMED adopted occurrence (t=0 record drained pre-adoption) does not re-call when the stream adds its used region as {$frame}; the region morphs in place", () => {
     boundary.innerHTML = adoptedDom;
@@ -1564,104 +1683,6 @@ describe("adoption -> first morph with nested regions (#547)", () => {
     // And the region still morphs after the re-place.
     host.apply({ type: "html", id: "f.row#r1.children", version: 2, html: "<em>body-3</em>" });
     expect(fresh.querySelector("em").textContent).toBe("body-3");
-  });
-});
-
-describe("template / block payload mode", () => {
-  it("materializes many block instances from one shared template (markup sent once)", () => {
-    const host = createFrameHost(createMockSerializer());
-    createFrame(boundary, { id: "f", host });
-
-    host.apply({
-      type: "html",
-      id: "f",
-      version: 1,
-      html: `<ul>${ph("c0")}${ph("c1")}${ph("c2")}</ul>`
-    });
-    host.apply({
-      type: "template",
-      id: "f",
-      version: 1,
-      key: "comment",
-      html: "<li><b><!--field:author--></b>: <!--field:text--></li>",
-      fields: ["author", "text"]
-    });
-    host.apply({
-      type: "block",
-      id: "f",
-      version: 1,
-      key: "c0",
-      template: "comment",
-      values: ["Ada", "first"]
-    });
-    host.apply({
-      type: "block",
-      id: "f",
-      version: 1,
-      key: "c1",
-      template: "comment",
-      values: ["Grace", "second"]
-    });
-    host.apply({
-      type: "block",
-      id: "f",
-      version: 1,
-      key: "c2",
-      template: "comment",
-      values: ["Linus", "third"]
-    });
-    host.apply({ type: "reveal", id: "f", version: 1, keys: ["c0", "c1", "c2"] });
-
-    expect(boundary.innerHTML).toBe(
-      "<ul><li><b>Ada</b>: first</li><li><b>Grace</b>: second</li><li><b>Linus</b>: third</li></ul>"
-    );
-
-    // The markup lives once, as a single template record; each instance carries
-    // only its values — that is the deduplication.
-    const frame = host.get("f");
-    expect(frame.store["tpl:comment"].kind).toBe("template");
-    expect(frame.store["seg:c0"]).toEqual({
-      kind: "block",
-      template: "tpl:comment",
-      values: ["Ada", "first"]
-    });
-    expect(frame.store["seg:c2"]).toEqual({
-      kind: "block",
-      template: "tpl:comment",
-      values: ["Linus", "third"]
-    });
-  });
-
-  it("buffers a block that arrives before its template, then reveals it", () => {
-    const host = createFrameHost(createMockSerializer());
-    createFrame(boundary, { id: "f", host });
-
-    host.apply({ type: "html", id: "f", version: 1, html: `<ul>${ph("c0")}</ul>` });
-    host.apply({
-      type: "block",
-      id: "f",
-      version: 1,
-      key: "c0",
-      template: "comment",
-      values: ["Ada"]
-    });
-    host.apply({ type: "reveal", id: "f", version: 1, keys: ["c0"] });
-
-    // Template dependency not yet present -> block is buffered, not revealed.
-    expect(host.get("f").isRevealed("c0")).toBe(false);
-    expect(boundary.innerHTML).toContain(ph("c0"));
-
-    host.apply({
-      type: "template",
-      id: "f",
-      version: 1,
-      key: "comment",
-      html: "<li><!--field:author--></li>",
-      fields: ["author"]
-    });
-
-    expect(host.get("f").isRevealed("c0")).toBe(true);
-    expect(boundary.innerHTML).toBe("<ul><li>Ada</li></ul>");
   });
 });
 

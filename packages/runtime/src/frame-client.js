@@ -107,20 +107,6 @@ export function chunkToRecords(chunk) {
       // called with these (resolved) args. Data args are serializer refs;
       // server-content args are frame refs resolved to nested regions.
       return { [`slot:${chunk.key}`]: { kind: "slot", args: chunk.args } };
-    case "template":
-      // Static markup sent once, stored under `tpl:<key>`; block instances
-      // reference it so repeated structures never re-send their markup.
-      return { [`tpl:${chunk.key}`]: { kind: "template", html: chunk.html, fields: chunk.fields } };
-    case "block":
-      // A keyed instance carrying only its dynamic values, revealed like any
-      // other segment (`seg:<key>`), materialized from its template.
-      return {
-        [`seg:${chunk.key}`]: {
-          kind: "block",
-          template: `tpl:${chunk.template}`,
-          values: chunk.values
-        }
-      };
     case "complete":
       return { ":complete": true };
     case "error":
@@ -398,13 +384,13 @@ class FrameImpl {
       // every stream (`pl-0`, ...), so a new version's placeholder must not
       // be skipped because the OLD version's segment of the same name
       // already revealed — nor revealed instantly with the old version's
-      // content. Reveal bookkeeping and seg/tpl/error records reset; slot
+      // content. Reveal bookkeeping and seg/error records reset; slot
       // records stay (dedupe is what preserves occurrence state).
       this.#version = v;
       this.#revealed.clear();
       this.#fallbackShown.clear();
       for (const key of Object.keys(this.#store)) {
-        if (key.startsWith("seg:") || key.startsWith("tpl:") || key === ":error") {
+        if (key.startsWith("seg:") || key === ":error") {
           delete this.#store[key];
         }
       }
@@ -511,7 +497,30 @@ class FrameImpl {
     return this.#options.resolveSlotRecord?.(occurrence);
   }
 
-  #syncSlots() {
+  /**
+   * Delete an occurrence's args record from the store that OWNS it. A nested
+   * occurrence's record lives on the frame whose props proxy emitted it — an
+   * ancestor keyed by the root stream — not on the region frame that mounts
+   * it, so removal threads up exactly like `#resolveSlotRecord`. Without this,
+   * tearing down a region (a comment navigated away from) leaves its nested
+   * occurrences' records stranded in the root store; on navigating back the
+   * stale record (a subset of the re-sent one — the t=0 shape omits used
+   * `{$frame}` regions) dedupes the re-introduced region away, and the wrapper
+   * re-mounts with no children (the doubly-nested reply's body vanishes).
+   */
+  #removeSlotRecord(occurrence) {
+    const key = `slot:${occurrence}`;
+    if (key in this.#store) delete this.#store[key];
+    else this.#options.removeSlotRecord?.(occurrence);
+  }
+
+  // `root`, when given, scopes discovery to a detached fragment instead of the
+  // frame's live content: a boundary-driven reveal renders a segment's fills
+  // INSIDE the reconstructed `<Loading>` (so their readiness gates the reveal),
+  // then the filled fragment is committed. Those occurrences mount here and are
+  // skipped by the next full sync; the unmount sweep is full-frame-only (a
+  // scoped fill only ADDS occurrences, never removes the frame's others).
+  #syncSlots(root) {
     if (!this.#slots && !this.#options.resolveSlot) return;
 
     // Range-driven discovery: find every server-owned slot occurrence in this
@@ -520,7 +529,8 @@ class FrameImpl {
     // "#" — so one callback services N occurrences from an iterated render
     // prop.
     const found = new Map();
-    this.#collectSlots(found);
+    if (root) collectSlots(root, found);
+    else this.#collectSlots(found);
 
     for (const [occurrence, start] of found) {
       const callback = this.#resolveSlot(propOf(occurrence));
@@ -554,16 +564,21 @@ class FrameImpl {
         // stream introduces mount with EMPTY interiors (the producer ships
         // bare marker pairs), so consumers' existing-content gate already
         // excludes them from claiming.
+        // Discover the interior's region elements BEFORE invoking, on the
+        // adopt path: a used region is omitted from the t=0 record (it
+        // shipped as markup), so it is only knowable from the existing DOM —
+        // and #invokeSlot must thread it into the wrapper's props so the
+        // wrapper OWNS the already-rendered element (see #invokeSlot). A
+        // fresh mount has no interior regions yet; discovery is a no-op then,
+        // and #resolveArgs creates its entries during the invoke instead.
+        if (this.#options.adopt) this.#discoverRegions(occurrence, start);
         const nodes = this.#invokeSlot(occurrence, callback, record, start, this.#options.adopt);
         if (nodes) this.#replaceRange(occurrence, start, nodes);
         this.#slotNodes.set(occurrence, nodes);
         this.#mountedSlots.add(occurrence);
-        // Discover regions the interior already carries between
-        // frame:<childId> markers. Adopted mounts NEED this whether or not
-        // a t=0 record armed them (the record omits used regions by
-        // design, so the ranges are only knowable from the markers — #547);
-        // fresh mounts already hold entries from #resolveArgs, which the
-        // discovery walk skips. Idempotent either way.
+        // Re-scan after invoke: a fresh mount's regions come from
+        // #resolveArgs during the invoke, and the callback's output may have
+        // introduced more. Idempotent with the pre-invoke adopt discovery.
         this.#discoverRegions(occurrence, start);
         this.#bindRegions(occurrence);
       } else if (record !== this.#slotArgs.get(occurrence)) {
@@ -586,9 +601,12 @@ class FrameImpl {
       }
     }
 
-    // Unmount occurrences whose range has disappeared from the server content.
-    for (const occurrence of [...this.#mountedSlots]) {
-      if (!found.has(occurrence)) this.#unmountSlot(occurrence);
+    // Unmount occurrences whose range has disappeared from the server content
+    // — full-frame syncs only; a scoped fragment fill never removes siblings.
+    if (!root) {
+      for (const occurrence of [...this.#mountedSlots]) {
+        if (!found.has(occurrence)) this.#unmountSlot(occurrence);
+      }
     }
   }
 
@@ -620,6 +638,23 @@ class FrameImpl {
     };
     const props =
       record && record.kind === "slot" ? this.#resolveArgs(occurrence, record.args) : {};
+    // Thread already-discovered regions into props (adopt path): a USED
+    // region is omitted from the t=0 record (it shipped as page markup), so
+    // without this the wrapper's `props.children` is undefined and its own
+    // reactivity never OWNS the already-rendered region element — a
+    // client-only toggle that conditionally renders it then can't hide/show
+    // it until a stream re-call re-arms the arg. Threading the EXISTING
+    // element (discovered from the interior before this invoke) makes the
+    // wrapper's conditional track it as `current`, so removal works at t=0.
+    // Keyed by the arg name (the childId's final segment); skips keys the
+    // record already resolved, so a re-call's #resolveArgs regions win.
+    const regions = this.#slotRegions.get(occurrence);
+    if (regions) {
+      for (const entry of regions.values()) {
+        const argKey = entry.childId.slice(entry.childId.lastIndexOf(".") + 1);
+        if (!(argKey in props)) props[argKey] = entry.element;
+      }
+    }
     const content = callback(props, ctx);
     this.#slotArgs.set(occurrence, record);
     if (cleanups.length) this.#slotCleanups.set(occurrence, cleanups);
@@ -647,7 +682,7 @@ class FrameImpl {
     // record and caches — keyed churn must not accumulate forever.
     this.#slotArgs.delete(key);
     this.#slotResolvedRefs.delete(key);
-    delete this.#store[`slot:${key}`];
+    this.#removeSlotRecord(key);
     this.#runSlotCleanups(key);
     const regions = this.#slotRegions.get(key);
     if (regions) {
@@ -696,27 +731,17 @@ class FrameImpl {
         cache[key] = resolved;
         props[key] = resolved;
       } else if (isFrameRef(value)) {
-        const fragment = document.createDocumentFragment();
+        // A nested server-content region: a single frame ELEMENT the wrapper
+        // places. On re-call the wrapper re-places the SAME element (the
+        // platform moves the subtree as one node — no marker range to walk,
+        // no fragment refill), and the bound frame's parent follows live.
         let entry = regions.get(value.$frame);
         if (!entry) {
-          const start = document.createComment(`frame:${value.$frame}:start`);
-          const end = document.createComment(`frame:${value.$frame}:end`);
-          entry = { childId: value.$frame, start, end, frame: undefined };
+          const element = makeFrameElement(value.$frame);
+          entry = { childId: value.$frame, element, frame: undefined };
           regions.set(value.$frame, entry);
-          fragment.append(start, end);
-        } else {
-          // Re-call: move the existing range (markers + content) into a
-          // fragment so the client re-places it; the bound frame's parent
-          // follows live.
-          let n = entry.start;
-          while (n) {
-            const next = n.nextSibling;
-            fragment.append(n);
-            if (n === entry.end) break;
-            n = next;
-          }
         }
-        props[key] = fragment;
+        props[key] = entry.element;
       } else {
         props[key] = value;
       }
@@ -727,14 +752,16 @@ class FrameImpl {
   /** Bind nested frames for a slot's regions once their markers are in the DOM. */
   /**
    * Marker-driven region discovery for the adopt path: a claimed
-   * occurrence's interior already holds its nested server-content regions
-   * between `frame:<childId>:start/:end` comments (the document producer
-   * emitted them), but no slot record exists at t = 0 to create the region
-   * entries `#resolveArgs` would. Seed entries from the OUTERMOST marker
-   * pairs found in the interior (deeper pairs belong to the regions' own
-   * occurrences and are discovered recursively when those claim);
-   * `#bindRegions` then constructs adopting frames over them, which run
-   * their own slot sync — this is what wires nested occurrences at boot.
+   * occurrence's interior already holds its nested server-content regions as
+   * frame ELEMENTS (the document producer emitted them), but no slot record
+   * exists at t = 0 to create the region entries `#resolveArgs` would. Seed
+   * entries from the OUTERMOST region elements in the interior (a region's
+   * own deeper regions belong to its occurrences and are discovered
+   * recursively when those claim); `#bindRegions` then constructs adopting
+   * frames over them, which run their own slot sync — this is what wires
+   * nested occurrences at boot. An element boundary makes discovery a scoped
+   * walk that stops at each region, replacing the flat-comment-list + depth-
+   * stack pairing a marker range needed.
    */
   #discoverRegions(slotKey, start) {
     if (!start) return;
@@ -743,52 +770,11 @@ class FrameImpl {
       regions = new Map();
       this.#slotRegions.set(slotKey, regions);
     }
-    // Flat, document-ordered comment list for the interior (top-level
-    // comments and element subtrees alike), then a depth stack pairs the
-    // OUTERMOST frame ranges.
-    const doc = start.ownerDocument;
     const endData = slotEnd(slotKey);
-    const comments = [];
     let n = start.nextSibling;
     while (n && !(n.nodeType === COMMENT_NODE && n.data === endData)) {
-      if (n.nodeType === COMMENT_NODE) comments.push(n);
-      else if (n.nodeType === 1) {
-        const walker = doc.createTreeWalker(n, 128 /* COMMENT */);
-        let c;
-        while ((c = walker.nextNode())) comments.push(c);
-      }
+      collectRegionElements(n, regions);
       n = n.nextSibling;
-    }
-    let depth = 0;
-    let openId = null;
-    let openStart = null;
-    for (const c of comments) {
-      const data = c.data;
-      if (!data.startsWith("frame:")) continue;
-      if (data.endsWith(":start")) {
-        const childId = data.slice(6, -6);
-        if (!childId) continue; // the insertable's unnamed boundary markers
-        if (depth === 0) {
-          openId = childId;
-          openStart = c;
-        }
-        depth++;
-      } else if (data.endsWith(":end")) {
-        const childId = data.slice(6, -4);
-        if (!childId) continue;
-        if (depth > 0) {
-          depth--;
-          if (depth === 0 && childId === openId && !regions.has(openId)) {
-            regions.set(openId, {
-              childId: openId,
-              start: openStart,
-              end: c,
-              frame: undefined,
-              adopt: true
-            });
-          }
-        }
-      }
     }
   }
 
@@ -854,16 +840,21 @@ class FrameImpl {
     const regions = this.#slotRegions.get(slotKey);
     if (!regions) return;
     for (const entry of regions.values()) {
-      if (!entry.frame && entry.start.parentNode) {
-        // parentNode (not isConnected) so regions also bind during detached
-        // rendering. Host buffering flushes any queued childId chunks. The
+      if (!entry.frame) {
+        // Bind eagerly — the region ELEMENT always exists (unlike the old
+        // marker range, which needed placement in a fragment/DOM to count).
+        // This is what makes an OCCLUDED region work: its element is created
+        // when args resolve but the wrapper doesn't place it until (e.g.)
+        // expand, so it must bind and fill (from buffered/streamed chunks)
+        // off-DOM, then reveal in place when the wrapper finally inserts the
+        // single node. Host buffering flushes any queued childId chunks. The
         // region inherits this frame's slot resolution, so client slots
         // revealed in its streamed content are filled by the same callbacks
         // the client threaded down — no global registry.
-        entry.frame = new FrameImpl(null, entry.start, entry.end, {
+        entry.frame = new FrameImpl(entry.element, null, null, {
           id: entry.childId,
           host: this.#options.host,
-          // Regions discovered from adopted document markers already hold
+          // Regions discovered from adopted document elements already hold
           // their server-rendered content (adopt); streamed regions start
           // empty. Claim scoping threads the root boundary's id down.
           adopt: entry.adopt,
@@ -872,7 +863,8 @@ class FrameImpl {
           // boundary owner as the root's.
           ownerScope: this.#options.ownerScope,
           resolveSlot: prop => this.#resolveSlot(prop),
-          resolveSlotRecord: occurrence => this.#resolveSlotRecord(occurrence)
+          resolveSlotRecord: occurrence => this.#resolveSlotRecord(occurrence),
+          removeSlotRecord: occurrence => this.#removeSlotRecord(occurrence)
         });
       }
     }
@@ -885,19 +877,15 @@ class FrameImpl {
     while (n && n !== end) {
       const id = slotStartId(n);
       if (id !== null) {
+        if ("_DX_DEV_") devCheckRange(n, id);
         if (!found.has(id)) found.set(id, n);
         n = afterRange(n, id);
         continue;
       }
-      const regionId = frameRegionStartId(n);
-      if (regionId !== null) {
-        // Nested frame regions are child-owned: their interiors are opaque
-        // to this frame's discovery (the child discovers, with callbacks and
-        // records threaded down).
-        n = afterFrameRegion(n, regionId);
-        continue;
-      }
-      if (n.nodeType === ELEMENT_NODE) collectSlots(n, found);
+      // A nested frame/region element is child-owned: its interior is opaque
+      // to this frame's discovery (the child discovers, with callbacks and
+      // records threaded down). Don't descend into it.
+      if (n.nodeType === ELEMENT_NODE && !isFrameElement(n)) collectSlots(n, found);
       n = n.nextSibling;
     }
   }
@@ -923,6 +911,10 @@ class FrameImpl {
     if (this.#disposed) return;
     this.#disposed = true;
     for (const key of [...this.#slotCleanups.keys()]) this.#runSlotCleanups(key);
+    // Release this frame's occurrences' records from the store that owns them
+    // (an ancestor's, for a region frame's nested occurrences) so a torn-down
+    // region leaves nothing stale to dedupe a later re-navigation against.
+    for (const key of this.#mountedSlots) this.#removeSlotRecord(key);
     for (const regions of this.#slotRegions.values()) {
       for (const { frame } of regions.values()) frame?.dispose();
     }
@@ -973,15 +965,7 @@ class FrameImpl {
 
   #segmentReady(name) {
     const content = this.#store[`seg:${name}`];
-    if (!content) return false;
-    if (content.kind === "block") {
-      // A block also depends on its template being present — so a block that
-      // arrives before its template is buffered until the template lands.
-      const template = this.#store[content.template];
-      if (!template || template.kind !== "template") return false;
-    } else if (content.kind !== "html") {
-      return false;
-    }
+    if (!content || content.kind !== "html") return false;
     // Reveal gate must be present and truthy.
     if (!this.#store[`seg:${name}:reveal`]) return false;
     // Style gate: the segment's streamed stylesheets must be loaded before it
@@ -1016,13 +1000,54 @@ class FrameImpl {
     if (assets && assets.inlineStyles) applyInlineStyles(assets.inlineStyles);
     const content = this.#store[`seg:${name}`];
     const closing = rangeClose(tpl, placeholderId(name));
+    if ("_DX_DEV_" && !closing) {
+      console.error(
+        `Frame fragment placeholder "${name}" is missing its closing comment ` +
+          `(<!--${placeholderId(name)}-->); revealed content will be appended at the end of ` +
+          `its parent instead of in place. Likely an HTML-rewriting layer stripped the ` +
+          `comment, or invalid nesting split the placeholder range.`,
+        tpl
+      );
+    }
     const parent = tpl.parentNode;
+    // Clear the current range interior (a materialized fallback, if #showFallback
+    // ran) — both paths below re-own this position.
     let n = tpl.nextSibling;
     while (n && n !== closing) {
       const next = n.nextSibling;
       parent.removeChild(n);
       n = next;
     }
+
+    if (this.#options.reveal) {
+      // Boundary-driven reveal (the ratified "per-`<Loading>`" model): the
+      // server `<Loading>` boundary's footprint on the client is this exact
+      // placeholder seam, so the binding reconstructs a client boundary here —
+      // fallback = the placeholder's own template content, children = the
+      // segment content plus its client fills, rendered INSIDE the boundary so
+      // their readiness gates it. An unboundaried async fill suspends up to
+      // THIS boundary and is covered, not orphaned; a fill with its own
+      // boundary contains itself. Cost is one boundary per revealed segment —
+      // and segments are `<Loading>` boundaries (few, author-placed), so this
+      // is React's granularity, not a per-chunk tax. `closing` stays as the
+      // boundary's insertion anchor; only the template is removed.
+      const fallbackFrag = tpl.content.cloneNode(true);
+      this.#claimTree(fallbackFrag);
+      this.#options.reveal({
+        before: closing,
+        fallback: [...fallbackFrag.childNodes],
+        content: () => {
+          const materialized = this.#materialize(content);
+          this.#syncSlots(materialized);
+          this.#claimTree(materialized);
+          return materialized;
+        }
+      });
+      tpl.remove();
+      this.#revealed.add(name);
+      return;
+    }
+
     const materialized = this.#materialize(content);
     this.#claimTree(materialized);
     parent.insertBefore(materialized, closing);
@@ -1047,101 +1072,84 @@ class FrameImpl {
     return true;
   }
 
-  /** Materialize a content record into nodes: HTML directly, or a block by
-   *  cloning its template and filling fields with the block's values. */
+  /** Materialize a content record into nodes (HTML fragments — the v1 and
+   *  only payload mode; see docs/frame-seams-decision.md on why structural
+   *  compression is not pursued). */
   #materialize(record) {
-    if (record.kind === "html") return parseFragment(record.value);
-    if (record.kind === "block") {
-      const template = this.#store[record.template];
-      // Readiness guarantees the template is present; guard defensively anyway.
-      if (!template || template.kind !== "template") return parseFragment("");
-      return materializeBlock(template, record.values);
-    }
-    return parseFragment("");
+    return record.kind === "html" ? parseFragment(record.value) : parseFragment("");
   }
-}
-
-/** Clone a template's markup and fill each `<!--field:<name>-->` marker with
- *  the matching value, positionally aligned to the template's `fields`. */
-function materializeBlock(template, values) {
-  const fragment = parseFragment(template.html);
-  for (let i = 0; i < template.fields.length; i++) {
-    const marker = `field:${template.fields[i]}`;
-    const value = values[i] == null ? "" : String(values[i]);
-    let hole = findComment(fragment, marker);
-    while (hole) {
-      hole.replaceWith(document.createTextNode(value));
-      hole = findComment(fragment, marker);
-    }
-  }
-  return fragment;
 }
 
 export function createFrame(boundary, options) {
   return new FrameImpl(boundary, null, null, options);
 }
 
-/**
- * Binds a frame to an EXISTING marker range — the document-SSR adoption
- * path. The page already holds the server-rendered boundary between
- * `frame:<id>:start`/`:end` comments: the frame constructed over it treats
- * that content as its own (first stream morphs rather than materializes)
- * and slots sync immediately, claiming their server-rendered DOM via
- * `ctx.existing`.
- */
-export function adoptFrameRange(start, end, options) {
-  return new FrameImpl(null, start, end, { ...options, adopt: true });
-}
-
-// Well-known brand shared with client.js's `insert` (constants.js defines
-// the same registered symbol) — Symbol.for keeps the two modules importless
-// in both directions, which is what makes frames zero-cost for apps that
-// never import this entry.
-const FRAME = Symbol.for("dom-expressions.frame");
+// The boundary/region element vocabulary — the DOM contract the producer
+// (frame-sink.js) emits at t=0 and this consumer creates/adopts on the
+// client. A frame mounts INTO this element: server content is its children,
+// morphed in place. Making the boundary a first-class node is the whole
+// point of the element-seams decision — `insert`/`reconcileArrays`/Suspense
+// handle it natively with no brand (closing #550), and it cannot be split by
+// invalid nesting or stripped by a CDN the way a comment-marker range can
+// (see docs/frame-seams-decision.md). Kept in sync with the producer by
+// convention, like the `slot:`/`frame:` marker strings already are — the two
+// don't share a module (one is server-only, one client-only).
+export const FRAME_TAG = "dx-frame";
+export const FRAME_ID_ATTR = "data-fid";
 
 /**
- * A branded frame-insertable value: `insert()` recognizes the brand and
- * calls the mount handler this value carries, which establishes a comment
- * range at the insertion point and binds a frame to it (registered with
- * `options.host` under `options.id`, so streamed chunks route to it —
- * including any buffered before mount).
+ * Create a boundary/region element and bind a frame to it (element mode).
+ * Boundary identity belongs to the client, so the client creates the
+ * element: a `<dx-frame>` rendered `display:contents` — layout- and
+ * box-transparent, exactly like the comment range it replaces. Registered
+ * with `options.host` under `options.id`, so streamed chunks route to it,
+ * including any buffered before mount.
  *
- * One static mount per value. Lifecycle belongs to the creator: server
- * updates flow through the frame's stream (policy A morphs in place), and
- * teardown is `value.dispose()` — the Solid binding registers it with its
- * owner (`onCleanup`), keeping the reactive-core dependency on that side.
+ * Returns the element (a real node `insert()` places with no brand, in any
+ * position — array, fragment, single) plus lifecycle. One frame per element;
+ * server updates flow through the stream (policy A morphs in place), and
+ * teardown is `dispose()` — the Solid binding ties it to its owner via
+ * `onCleanup`.
+ *
+ * The tag is always `<dx-frame>`: a boundary can't sit inside table
+ * internals at t=0 (the parser foster-parents a non-table element out of a
+ * `<table>`), which is a documented, nameable limitation — own the whole
+ * table in the server component, or supply rows via a client slot — not an
+ * `as` escape hatch.
  */
-export function createFrameInsertable(options) {
-  let frame = null;
-  let start = null;
-  let end = null;
+export function createFrameElement(options) {
+  const el = makeFrameElement(options.id);
+  const frame = new FrameImpl(el, null, null, options);
   return {
+    element: el,
     get frame() {
       return frame;
     },
     dispose() {
-      if (!frame) return;
       frame.dispose();
-      frame = null;
-      const parent = start.parentNode;
-      if (!parent) return;
-      let n = start;
-      while (n) {
-        const next = n.nextSibling;
-        parent.removeChild(n);
-        if (n === end) break;
-        n = next;
-      }
-    },
-    [FRAME](parent, marker) {
-      if (frame) return; // single-mount contract
-      start = document.createComment("frame:start");
-      end = document.createComment("frame:end");
-      parent.insertBefore(start, marker);
-      parent.insertBefore(end, marker);
-      frame = new FrameImpl(null, start, end, options);
+      el.remove();
     }
   };
+}
+
+/**
+ * Create a bare boundary/region element (no frame bound yet). `<dx-frame>` is
+ * inlined as `display:contents` — not a stylesheet or custom-element
+ * registration — so it holds before any bundle loads and needs nothing
+ * defined: an undefined custom element is inert HTMLUnknownElement, and
+ * `display:contents` makes it generate no box, so its children lay out in the
+ * frame's parent.
+ */
+function makeFrameElement(id) {
+  const el = document.createElement(FRAME_TAG);
+  el.style.display = "contents";
+  if (id !== undefined) el.setAttribute(FRAME_ID_ATTR, id);
+  return el;
+}
+
+/** Whether `node` is a frame boundary/region element (carries our id attr). */
+function isFrameElement(node) {
+  return node.nodeType === ELEMENT_NODE && node.hasAttribute(FRAME_ID_ATTR);
 }
 
 /** Returns the segment name for a `seg:<name>` content key, else `null`. */
@@ -1281,38 +1289,35 @@ function collectSlots(root, out) {
   while (n) {
     const id = slotStartId(n);
     if (id !== null) {
+      if ("_DX_DEV_") devCheckRange(n, id);
       if (!out.has(id)) out.set(id, n);
       n = afterRange(n, id);
       continue;
     }
-    const regionId = frameRegionStartId(n);
-    if (regionId !== null) {
-      n = afterFrameRegion(n, regionId);
-      continue;
+    // Skip nested frame/region element interiors — child-owned (see
+    // #collectSlots).
+    if (n.nodeType === ELEMENT_NODE && !isFrameElement(n)) collectSlots(n, out);
+    n = n.nextSibling;
+  }
+}
+
+/**
+ * Collect the OUTERMOST frame region elements in `node`'s subtree into
+ * `regions` (keyed by childId, seeded for adoption). A region is opaque — its
+ * own deeper regions belong to its occurrences, discovered when they claim —
+ * so the walk stops descending at each region element. Client wrapper
+ * elements around a region are descended through.
+ */
+function collectRegionElements(node, regions) {
+  if (node.nodeType !== ELEMENT_NODE) return;
+  if (isFrameElement(node)) {
+    const childId = node.getAttribute(FRAME_ID_ATTR);
+    if (childId && !regions.has(childId)) {
+      regions.set(childId, { childId, element: node, frame: undefined, adopt: true });
     }
-    if (n.nodeType === ELEMENT_NODE) collectSlots(n, out);
-    n = n.nextSibling;
+    return;
   }
-}
-
-const FRAME_REGION_START = /^frame:(.+):start$/;
-
-/** If `node` is a `frame:<id>:start` comment, return its id; else `null`. */
-function frameRegionStartId(node) {
-  if (node.nodeType !== COMMENT_NODE) return null;
-  const m = FRAME_REGION_START.exec(node.data);
-  return m ? m[1] : null;
-}
-
-/** The sibling immediately after the `frame:<id>:end` marker for `start`. */
-function afterFrameRegion(start, id) {
-  const end = `frame:${id}:end`;
-  let n = start.nextSibling;
-  while (n) {
-    if (n.nodeType === COMMENT_NODE && n.data === end) return n.nextSibling;
-    n = n.nextSibling;
-  }
-  return null;
+  for (let c = node.firstChild; c; c = c.nextSibling) collectRegionElements(c, regions);
 }
 
 /**
@@ -1359,20 +1364,6 @@ function rangeInterior(start, endData) {
   return nodes;
 }
 
-/** Depth-first search for a comment node with exact `data`. */
-function findComment(root, data) {
-  const children = root.childNodes;
-  for (let i = 0; i < children.length; i++) {
-    const node = children[i];
-    if (node.nodeType === COMMENT_NODE && node.data === data) return node;
-    if (node.nodeType === ELEMENT_NODE) {
-      const found = findComment(node, data);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
 // --- Morph -----------------------------------------------------------------
 //
 // A zero-allocation, two-cursor server-owned DOM patch path: text/attribute
@@ -1408,12 +1399,28 @@ function compatible(a, b) {
   return a.nodeType === TEXT_NODE || a.nodeType === COMMENT_NODE;
 }
 
+// Live-state the server can't know: `open` on <details>/<dialog> IS the
+// user's toggle (unlike form value/checked, which are PROPERTIES that
+// decouple from their attributes after input, so an attribute-only morph
+// already leaves them alone). The morph makes attributes match server output
+// exactly, which would reset a user-opened <details> on every navigation —
+// so `open` is preserved: never removed, never set by the morph. A server
+// that must force it can rebuild the boundary (a genuine teardown), not a
+// morph. Popover/dialog "showing" is not an attribute (JS API), so nothing
+// to guard there.
+function preservesOpen(el) {
+  const t = el.tagName;
+  return t === "DETAILS" || t === "DIALOG";
+}
+
 function morphAttributes(oldEl, newEl, claim) {
   let reclaim = false;
   let changed = false;
+  const keepOpen = preservesOpen(oldEl);
   const oldAttrs = oldEl.attributes;
   for (let i = oldAttrs.length - 1; i >= 0; i--) {
     const name = oldAttrs[i].name;
+    if (keepOpen && name === "open") continue;
     if (!newEl.hasAttribute(name)) {
       oldEl.removeAttribute(name);
       changed = true;
@@ -1423,6 +1430,7 @@ function morphAttributes(oldEl, newEl, claim) {
   const newAttrs = newEl.attributes;
   for (let i = 0; i < newAttrs.length; i++) {
     const attr = newAttrs[i];
+    if (keepOpen && attr.name === "open") continue;
     if (oldEl.getAttribute(attr.name) !== attr.value) {
       oldEl.setAttribute(attr.name, attr.value);
       changed = true;
@@ -1442,6 +1450,12 @@ function morphAttributes(oldEl, newEl, claim) {
 /** Morph `oldNode` in place to match `newNode` (assumed `compatible`). */
 function morphNode(oldNode, newNode, claim) {
   if (oldNode.nodeType === ELEMENT_NODE) {
+    // Escape hatch (the claim contract's analogue): an element the author
+    // marks `data-preserve` keeps its live attributes AND subtree untouched
+    // by the morph — for server DOM that a third-party widget has taken over
+    // (a rich editor, a chart) or any state the deny-list above can't name.
+    // The element stays matched in position; only its interior is frozen.
+    if (oldNode.hasAttribute("data-preserve")) return;
     morphAttributes(oldNode, newNode, claim);
     reconcileChildren(oldNode, newNode, null, null, claim);
   } else if (oldNode.data !== newNode.data) {
@@ -1458,6 +1472,32 @@ function afterRange(start, id) {
     n = n.nextSibling;
   }
   return null;
+}
+
+/**
+ * Dev-only range integrity check: a slot start marker whose end marker is not
+ * a later sibling means the range was corrupted between the producer and
+ * here. `afterRange` returning null is ambiguous (an end marker that IS the
+ * last sibling also has no `nextSibling`), so this re-scans for the marker
+ * itself and reports the two known corruption causes loudly instead of
+ * letting collection silently truncate at the broken range.
+ */
+function devCheckRange(start, id) {
+  if (!"_DX_DEV_") return;
+  const end = slotEnd(id);
+  let n = start.nextSibling;
+  while (n) {
+    if (n.nodeType === COMMENT_NODE && n.data === end) return;
+    n = n.nextSibling;
+  }
+  console.error(
+    `Frame slot range "${id}" is missing its end marker (<!--${end}-->) among its start ` +
+      `marker's siblings. Slots after it in this content cannot be discovered. Likely causes: ` +
+      `invalid HTML nesting split the range during parsing (e.g. a block element inside <p>), ` +
+      `or an HTML-rewriting layer (CDN/minifier/translator) removed or moved the comment — ` +
+      `serve frame documents with Cache-Control: no-transform.`,
+    start
+  );
 }
 
 /** The sibling after the `slot:<id>:end` marker in the incoming source. */
