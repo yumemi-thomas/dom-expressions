@@ -147,6 +147,7 @@ impl<'a> AstDomTransform<'a, '_> {
             }
             operations.push(self.spread_attribute_statement(
                 attributes,
+                tag_name,
                 element_id,
                 has_children,
                 children_from_attribute,

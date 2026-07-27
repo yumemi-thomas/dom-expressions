@@ -1,4 +1,4 @@
-import { ChildProperties, Namespaces, DelegatedEvents, $$SLOT, $$HOST, $$FRAME } from "./constants";
+import { ChildProperties, Namespaces, DelegatedEvents, $$SLOT, $$HOST } from "./constants";
 import {
   root,
   effect,
@@ -488,11 +488,27 @@ export function installHydrationRuntime() {
 
 // Drop the `<!--!$-->` text-hole separators the server emits so adjacent
 // text nodes stay individually claimable; the array is compacted in place.
+// A pending boundary's placeholder scaffolding — `<template id="pl-X">` and
+// its `<!--pl-X-->` end marker — is excluded from the claim array but KEPT in
+// the DOM (the $df swap still needs it). While the boundary is pending its
+// fallback hydrates into the region between the two; counting the scaffolding
+// shifted every positional text claim, so the fallback's reactive text never
+// adopted the server node and updates appended beside it as permanent debris
+// (solidjs/solid#2936).
 function stripTextSeparators(nodes) {
   let j = 0;
   for (let i = 0; i < nodes.length; i++) {
-    if (nodes[i].nodeType === 8 && nodes[i].nodeValue === "!$") nodes[i].remove();
-    else nodes[j++] = nodes[i];
+    const node = nodes[i],
+      t = node.nodeType;
+    if (t === 8) {
+      const v = node.nodeValue;
+      if (v === "!$") {
+        node.remove();
+        continue;
+      }
+      if (v.startsWith("pl-")) continue;
+    } else if (t === 1 && node.localName === "template" && node.id.startsWith("pl-")) continue;
+    nodes[j++] = node;
   }
   nodes.length = j;
   return nodes;
@@ -1171,16 +1187,6 @@ function insertExpression(parent, value, current, marker) {
       parent.appendChild(value);
     }
     if (marker) value[$$SLOT] = marker;
-  } else if (value[$$FRAME]) {
-    // Branded frame-insertable (frame-client.js): mount is delegated to the
-    // handler the value carries, so recognizing frames costs client.js no
-    // imports. One static mount per value — lifecycle belongs to the
-    // creator (dispose on the value), and updates flow through the frame's
-    // own stream (policy A), not through re-inserting a new value.
-    if (current) {
-      cleanChildren(parent, Array.isArray(current) ? current : [current], multi ? marker : null);
-    }
-    value[$$FRAME](parent, multi ? marker : null);
   } else if (Array.isArray(value)) {
     const currentArray = current && Array.isArray(current);
     if (value.length === 0) {
@@ -1199,9 +1205,6 @@ function insertExpression(parent, value, current, marker) {
 function normalize(value, current, multi, doNotUnwrap) {
   value = flatten(value, { skipNonRendered: true, doNotUnwrap });
   if (doNotUnwrap && typeof value === "function") return value;
-  // Branded frame-insertables mount as a self-contained range — never
-  // array-wrap them into the multi path (insertExpression delegates whole).
-  if (value != null && value[$$FRAME]) return value;
   if (multi && !Array.isArray(value)) value = [value != null ? value : ""];
   if (Array.isArray(value)) {
     for (let i = 0, len = value.length; i < len; i++) {

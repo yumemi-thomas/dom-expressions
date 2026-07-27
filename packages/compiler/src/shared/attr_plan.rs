@@ -9,7 +9,7 @@ use oxc_span::{GetSpan, Span, SPAN};
 
 use crate::shared::bindings::BindingTable;
 use crate::shared::utils::{
-    decode_html_entities, dedupe_attributes, format_number, is_literal_only_expression, StaticValue,
+    decode_html_entities, format_number, is_literal_only_expression, StaticValue,
 };
 
 /// Planned attribute value, mirroring the states a Babel JSX attribute value
@@ -328,9 +328,9 @@ impl<'a> AttrPlanner<'a, '_> {
     }
 
     /// Builds the ordered attribute plan for an element without spreads,
-    /// porting Babel's preprocessing pipeline: `evaluateAndInline`, dedupe,
-    /// and `transformSpecialCaseAttributes` are shared across generates; the
-    /// style/class splitting passes belong to the dom generate's
+    /// porting Babel's preprocessing pipeline: `evaluateAndInline`,
+    /// `transformSpecialCaseAttributes`, then dedupe are shared across
+    /// generates; the style/class splitting passes belong to the dom generate's
     /// `transformAttributes` and are skipped for SSR (which has its own
     /// style/class serialization at emission time).
     pub(crate) fn plan_attributes(
@@ -341,7 +341,7 @@ impl<'a> AttrPlanner<'a, '_> {
         let mut plans = std::vec::Vec::new();
         let mut elided_value_spans = std::vec::Vec::new();
         let mut relevant_object_value_spans = std::vec::Vec::new();
-        for attr in dedupe_attributes(attributes) {
+        for attr in attributes {
             let JSXAttributeItem::Attribute(attr) = attr else {
                 return Err(Error::from_reason(
                     "plan_attributes only handles spread-free attribute lists",
@@ -421,6 +421,7 @@ impl<'a> AttrPlanner<'a, '_> {
         }
 
         let children_replacement = self.special_case_stateful_plans(tag_name, &mut plans);
+        dedupe_plans(&mut plans);
         if !self.is_ssr {
             if !self.inline_styles {
                 self.wrap_styles_for_no_inline(&mut plans);
@@ -1028,6 +1029,21 @@ impl<'a> AttrPlanner<'a, '_> {
             plans.remove(*index);
         }
     }
+}
+
+/// Resolves duplicate attributes after stateful DOM properties have been
+/// normalized, matching Babel's preprocessing order. The last occurrence of
+/// a normalized name wins, except `ref` which may appear multiple times.
+fn dedupe_plans(plans: &mut std::vec::Vec<AttrPlan<'_>>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped = std::vec::Vec::with_capacity(plans.len());
+    for plan in plans.drain(..).rev() {
+        if plan.key == "ref" || seen.insert(plan.key.clone()) {
+            deduped.push(plan);
+        }
+    }
+    deduped.reverse();
+    *plans = deduped;
 }
 
 /// Non-computed object key as a static string (`color`, `"background-color"`,

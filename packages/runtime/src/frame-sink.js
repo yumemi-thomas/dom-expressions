@@ -80,7 +80,21 @@ export function createFrameSink(emit, frame) {
   // Fragments that streamed styles ahead of a grouped reveal; the group's
   // reveal chunk must tell the consumer to wait on them.
   const styledKeys = new Set();
+  // Fragment keys registered while a REGION (a `{$frame}` slot arg) resolves,
+  // mapped to that region's childId. A region is a nested frame the client
+  // owns end-to-end, so its Suspense fragment/reveal must route to the region,
+  // not this root frame — else the root store carries the region's segment
+  // state and the region's independent morph across responses desyncs from it.
+  // First write wins so a fragment inside a nested region is tagged with the
+  // innermost region (the region wrap runs before the enclosing one).
+  const regionKeys = new Map();
+  const frameOf = key => regionKeys.get(key) || id;
   return {
+    // Tag a fragment key to the region resolving around its registration, so
+    // its later fragment/reveal chunks address the region frame.
+    tagRegion(key, childId) {
+      if (!regionKeys.has(key)) regionKeys.set(key, childId);
+    },
     shell(html, meta = {}) {
       // Pre-flush assets (entry modules, hoisted boundary styles) are head
       // splices in the document sink; a frame carries them as an assets chunk
@@ -137,25 +151,26 @@ export function createFrameSink(emit, frame) {
       // meta.styles is the core's { links, inline } split: stylesheet URLs
       // gate the reveal (they load async); inline styles are CSS content that
       // applies on insertion, carried by value, no gating.
+      const fid = frameOf(key);
       const links = (meta.styles && meta.styles.links) || [];
       const inline = (meta.styles && meta.styles.inline) || [];
       if (links.length || inline.length) {
         if (links.length) styledKeys.add(key);
-        const chunk = { type: "assets", id, version, key };
+        const chunk = { type: "assets", id: fid, version, key };
         if (links.length) chunk.styles = links;
         if (inline.length) {
           chunk.inlineStyles = inline.map(e => ({ id: e.id, content: e.content, attrs: e.attrs }));
         }
         emit(chunk);
       }
-      emit({ type: "fragment", id, version, key, html: value });
+      emit({ type: "fragment", id: fid, version, key, html: value });
       // A fragment that ERRORED still reveals (its html is the fallback /
       // error template), but the failure is surfaced as a keyed error chunk
       // — the frame protocol has no `<key>_fr` rejection to ride.
       if (meta.error) {
         emit({
           type: "error",
-          id,
+          id: fid,
           version,
           key,
           error: { message: String((meta.error && meta.error.message) || meta.error) }
@@ -164,15 +179,28 @@ export function createFrameSink(emit, frame) {
       // An eagerly-revealed fragment (no reveal group) carries its own
       // reveal; grouped fragments wait for an explicit reveal() call.
       if (!meta.revealGroup) {
-        emit({ type: "reveal", id, version, keys: [key], waitForStyles: !!links.length });
+        emit({ type: "reveal", id: fid, version, keys: [key], waitForStyles: !!links.length });
       }
     },
     reveal(keys, meta = {}) {
-      let waitForStyles = false;
-      for (const key of keys) if (styledKeys.has(key)) waitForStyles = true;
-      const chunk = { type: "reveal", id, version, keys, waitForStyles };
-      if (meta.fallback) chunk.fallback = true;
-      emit(chunk);
+      // Keys in one reveal group can belong to different frames (a region's
+      // fragment shares a group with the root's). Split by frame so each
+      // reveal chunk addresses the frame that owns those placeholders, keeping
+      // registration order within each frame.
+      const byFrame = new Map();
+      for (const key of keys) {
+        const fid = frameOf(key);
+        let group = byFrame.get(fid);
+        if (!group) byFrame.set(fid, (group = []));
+        group.push(key);
+      }
+      for (const [fid, groupKeys] of byFrame) {
+        let waitForStyles = false;
+        for (const key of groupKeys) if (styledKeys.has(key)) waitForStyles = true;
+        const chunk = { type: "reveal", id: fid, version, keys: groupKeys, waitForStyles };
+        if (meta.fallback) chunk.fallback = true;
+        emit(chunk);
+      }
     },
     asset(type, url) {
       // Post-flush styles ride their fragment's assets chunk (fragment() gets
@@ -312,6 +340,41 @@ function slotRange(occurrence) {
   return { t: `<!--slot:${occurrence}:start--><!--slot:${occurrence}:end-->` };
 }
 
+// Occurrence ids embed user data (`$key`), and they land in contexts with
+// hard character constraints: HTML comment markers (`-->` terminates the
+// comment — the Qwik marker-XSS class, GHSA-m6jq-g7gq-5w3c), unquoted `_hk`
+// attribute values (whitespace/quotes/`=`/`<`/`>`/backtick truncate or split
+// the attribute), and `#`, which is the occurrence separator `propOf` splits
+// on. Keys are percent-encoded onto a conservative alphabet at the single
+// point occurrences are minted; both proxies and the wire carry the encoded
+// form, and the client never decodes — occurrence identity only requires the
+// two sides to agree byte-for-byte. `%` itself encodes, so the mapping is
+// injective and distinct keys can never collide.
+const OCCURRENCE_UNSAFE = /[^A-Za-z0-9_.-]/g;
+function encodeOccurrenceKey(key) {
+  return String(key).replace(OCCURRENCE_UNSAFE, c => {
+    const code = c.codePointAt(0);
+    return "%" + (code < 16 ? "0" : "") + code.toString(16);
+  });
+}
+
+/**
+ * Mint the occurrence id for one render-prop call: `prop#<$key>` when the
+ * caller named the occurrence, positional `prop#<n>` otherwise. Shared by the
+ * stream and document proxies so identity is byte-identical across t=0
+ * adoption and every later stream.
+ */
+function occurrenceId(prop, raw, counts) {
+  const k = raw.$key;
+  // Numbers encode too: exponent forms ("1e+21") carry `+`.
+  if (typeof k === "string" || typeof k === "number") {
+    return `${prop}#${encodeOccurrenceKey(k)}`;
+  }
+  const n = counts[prop] || 0;
+  counts[prop] = n + 1;
+  return `${prop}#${n}`;
+}
+
 /**
  * Document-mode slot props — the t = 0 counterpart of
  * `createSlotProps`. During initial document SSR a server component
@@ -387,15 +450,7 @@ export function createDocumentSlotProps(clientProps, frameId) {
             });
           }
           const raw = callArgs[0];
-          let occurrence;
-          const k = raw.$key;
-          if (typeof k === "string" || typeof k === "number") {
-            occurrence = `${prop}#${k}`;
-          } else {
-            const n = counts[prop] || 0;
-            counts[prop] = n + 1;
-            occurrence = `${prop}#${n}`;
-          }
+          const occurrence = occurrenceId(prop, raw, counts);
           const slot = clientProps[prop];
           if (typeof slot !== "function") return range(occurrence, undefined);
           const resolved = {};
@@ -407,20 +462,42 @@ export function createDocumentSlotProps(clientProps, frameId) {
           // serialized once as hydration-data records (the occurrence's args
           // + the region html, keyed for the adopting frame's store) and the
           // client mounts it from there when the wrapper finally renders it.
-          const regions = [];
+          // Unwrap function-valued args once (a function can't be serialized,
+          // so it is a thunk producing content or a scalar): resolve one-shot,
+          // then both the region-detection here and the t=0 arming below see
+          // the same classified value. This is how top-level one-shot reactive
+          // control flow (<For>/<Show>) reaches the region path when it arrives
+          // as a thunk/memo. Bounded against a pathological self-returning fn.
+          const vals = {};
           for (const key of Object.keys(raw)) {
-            const value = raw[key];
-            if (key !== "$key" && isServerContent(value)) {
+            if (key === "$key") continue;
+            let value = raw[key];
+            for (let d = 0; typeof value === "function" && d < 16; d++) value = value();
+            vals[key] = value;
+          }
+          const regions = [];
+          for (const key of Object.keys(vals)) {
+            const value = vals[key];
+            if (isServerContent(value)) {
               const childId = `${frameId}.${occurrence}.${key}`;
-              const region = { key, childId, value, used: false };
+              const region = { key, childId, value, used: false, locked: false };
               regions.push(region);
               resolved[key] = () => {
+                // Streaming occlusion lock: the usage flip below runs at the
+                // wrapper's SYNCHRONOUS return, but a wrapper that places this
+                // region behind an async boundary (a Suspense that resolves
+                // after the shell flush) calls this thunk LATER — after the
+                // flip already deemed the region occluded and serialized its
+                // content once as a data record. Re-emitting it as markup now
+                // would double-ship the same content (data + markup), the one
+                // thing single-copy forbids. So a locked region contributes
+                // nothing — identical to a region the wrapper never placed; the
+                // client mounts it from the `sc:region:` record on placement.
+                if (region.locked) return [];
                 region.used = true;
-                return [
-                  { t: `<!--frame:${childId}:start-->` },
-                  value,
-                  { t: `<!--frame:${childId}:end-->` }
-                ];
+                // A region is a frame ELEMENT the client wrapper adopts —
+                // the same DOM contract as the boundary, one level down.
+                return [{ t: frameElementOpen(childId) }, value, { t: FRAME_ELEMENT_CLOSE }];
               };
             } else {
               resolved[key] = value;
@@ -429,20 +506,22 @@ export function createDocumentSlotProps(clientProps, frameId) {
           const out = scoped(occurrence, () => range(occurrence, slot(resolved)));
           const unused = regions.filter(r => !r.used);
           if (sharedConfig.context) {
-            // Every occurrence re-arms with real args at adoption via a
-            // t=0 slot record — occluded args become region refs, and
-            // primitives ride along UNLESS their (escaped) value already
-            // appears in the occurrence's rendered output: those are
-            // recoverable from the page (reverse-templating's job, not yet
-            // built) and re-sending them would break the single-copy
-            // invariant. Exclusion errs toward the claim: a coincidental
-            // substring match just means that arg reads undefined at t=0.
-            const rendered = renderedHtmlOf(out);
+            // Every occurrence re-arms with real args at adoption via a t=0
+            // slot record — occluded args become region refs, and primitive
+            // args always ship. Deduplication of a value that ALSO appears in
+            // rendered content is a structural concern (template mode: an arg
+            // provably fills a known hole), never a substring guess: matching
+            // an arg's escaped value against the occurrence's rendered HTML
+            // silently dropped correct args whenever the value coincided with
+            // any rendered text (`cid={1}` with a "1" anywhere), and every
+            // construct that embeds the occurrence id into markup (`_hk`,
+            // region `data-fid`) forced another strip-rule. A primitive is a
+            // scalar the client needs AS DATA to re-invoke the wrapper; the
+            // single-copy invariant covers content, not scalar args.
             const args = {};
             let any = false;
-            for (const key of Object.keys(raw)) {
-              const value = raw[key];
-              if (key === "$key") continue;
+            for (const key of Object.keys(vals)) {
+              const value = vals[key];
               const region = regions.find(r => r.key === key);
               if (region) {
                 if (!region.used) {
@@ -452,17 +531,16 @@ export function createDocumentSlotProps(clientProps, frameId) {
                 continue;
               }
               if (isServerContent(value)) continue;
-              const t = typeof value;
-              if ((t === "string" || t === "number") && rendered !== null) {
-                const needle =
-                  t === "string" ? sharedConfig.context.escape(String(value)) : String(value);
-                if (needle !== "" && rendered.includes(needle)) continue;
-              }
               args[key] = value;
               any = true;
             }
             if (any) sharedConfig.context.serialize(`sc:slot:${frameId}:${occurrence}`, args);
             for (const region of unused) {
+              // Lock BEFORE returning: the content is now committed to the data
+              // channel, so any later async placement of this region must
+              // suppress its markup (see the thunk above) — that is what makes
+              // "serialize once at flush" a guarantee rather than a race.
+              region.locked = true;
               // Resolve the region's server content through the live render
               // context. Sync content serializes directly; async content
               // serializes as a PROMISE of its final html — the hydration
@@ -484,47 +562,44 @@ export function createDocumentSlotProps(clientProps, frameId) {
   });
 }
 
+// The boundary element vocabulary — the t=0 DOM contract with the client
+// consumer (frame-client.js `FRAME_TAG`/`FRAME_ID_ATTR`, which creates and
+// adopts the same element). The boundary is an element, not a comment range:
+// a first-class node the client adopts by attribute query and that `insert`
+// places natively (see docs/frame-seams-decision.md). Kept in sync with the
+// consumer by convention — the two don't share a module (server-only vs
+// client-only). `display:contents` keeps it layout-transparent.
+const FRAME_TAG = "dx-frame";
+const FRAME_ID_ATTR = "data-fid";
+
+/** Open tag for a boundary/region element with `id`. `id` is developer-owned
+ *  (a server-function id), but attribute-escaped defensively. */
+function frameElementOpen(id) {
+  const escaped = sharedConfig.context ? sharedConfig.context.escape(String(id), true) : String(id);
+  return `<${FRAME_TAG} ${FRAME_ID_ATTR}="${escaped}" style="display:contents">`;
+}
+const FRAME_ELEMENT_CLOSE = `</${FRAME_TAG}>`;
+
 /**
  * The in-process mirror of `frameTransformResult`, for DOCUMENT SSR:
  * install as `configureServerFunctionsServer({ transformDirectResult })`
  * and a server function whose direct (same-process) call resolves to a
- * function comes back as an inline-renderable server component — boundary
- * frame markers around it, document-mode slot props inside. HTTP
- * calls are untouched (`frameTransformResult` owns that leg).
+ * function comes back as an inline-renderable server component — the boundary
+ * ELEMENT around it, document-mode slot props inside. HTTP calls are
+ * untouched (`frameTransformResult` owns that leg).
  */
 export function frameTransformDirectResult(value, { id }) {
   if (typeof value !== "function") return value;
   const component = value;
   const wrapped = props => [
-    { t: `<!--frame:${id}:start-->` },
+    { t: frameElementOpen(id) },
     serverOwned(() => component(createDocumentSlotProps(props, id))),
-    { t: `<!--frame:${id}:end-->` }
+    { t: FRAME_ELEMENT_CLOSE }
   ];
   // Branded so the hydration serializer can write it as a reference (see
   // ServerComponentPlugin) instead of meeting an unserializable function.
   wrapped[SERVER_COMPONENT] = id;
   return wrapped;
-}
-
-/**
- * The occurrence's rendered output as html when synchronously available
- * (`null` when async holes are pending — exclusion then errs toward
- * including the arg, which is safe: the value was NOT rendered yet).
- */
-function renderedHtmlOf(out) {
-  try {
-    const res = sharedConfig.context.resolve(out);
-    // Markers AND hydration keys stripped: the occurrence/region ids inside
-    // comments would false-positive the recoverability check (e.g. an arg
-    // value "c1" matching its own `slot:comment#c1` marker), and `_hk`
-    // attributes embed the occurrence key — so any `cid === $key` occurrence
-    // would match its own wrapper's hydration key and never arm its t=0
-    // record (#547). Only element TEXT counts as recoverable-from-page.
-    if (res && res.t && (!res.h || !res.h.length)) {
-      return res.t[0].replace(/<!--[^>]*-->/g, "").replace(/ _hk=("[^"]*"|[^\s>]+)/g, "");
-    }
-  } catch (e) {}
-  return null;
 }
 
 /**
@@ -667,49 +742,70 @@ export function createSlotProps(sink, frame) {
           // positional per prop — the right default for most flows: a state
           // reset across different lists is usually correct, and equivalent
           // re-sends dedupe anyway. `$key` matters when a live list reorders.
-          let occurrence;
-          const k = raw.$key;
-          if (typeof k === "string" || typeof k === "number") {
-            occurrence = `${prop}#${k}`;
-          } else {
-            const n = counts[prop] || 0;
-            counts[prop] = n + 1;
-            occurrence = `${prop}#${n}`;
-          }
+          const occurrence = occurrenceId(prop, raw, counts);
           const args = {};
           for (const key of Object.keys(raw)) {
-            const value = raw[key];
-            const t = typeof value;
-            if (value == null || t === "string" || t === "number" || t === "boolean") {
-              args[key] = value;
-            } else if (isServerContent(value)) {
-              // Server JSX flows as a nested region, never as data — the
-              // no-double-serialize invariant (transport dispatch case 1):
-              // its html is the transfer; the client wraps the range without
-              // re-rendering it. Nested occurrence markers evaluated inside
-              // this content already emitted their slot chunks against this
-              // frame — the consumer threads record lookup up the frame tree.
-              const resolved = sharedConfig.context.resolve(value);
-              if (resolved.h.length) {
-                throw new Error(
-                  "Async server content in slot args is not supported yet (arg '" +
-                    key +
-                    "' of " +
-                    occurrence +
-                    "). Move the async read above the slot or into a fragment."
-                );
+            if (key === "$key") continue; // occurrence identity, not client data
+            // Region ids derive from occurrence + arg name — stable across
+            // responses (allocation order isn't), so a later stream's region
+            // content routes to the same bound region and morphs in place, and
+            // keyed dedupe holds under reorders. Known before we resolve, so
+            // any Suspense boundary the arg renders can tag its fragment to it.
+            const childId = `${frame.id}.${occurrence}.${key}`;
+            const ctx = sharedConfig.context;
+            // A Suspense inside this arg registers its fragment as it renders —
+            // during the unwrap below (an eager component thunk) or the resolve
+            // (a deferred hole). Route those fragments to the region for the
+            // whole window: the arg may not classify as content, but only
+            // server content registers fragments, so a stray tag is inert.
+            const origRegister = ctx.registerFragment;
+            ctx.registerFragment = (fragKey, fragOptions) => {
+              sink.tagRegion(fragKey, childId);
+              return origRegister.call(ctx, fragKey, fragOptions);
+            };
+            try {
+              // A function cannot be serialized, so a function-valued arg must
+              // be a thunk producing content (or a getter producing a scalar):
+              // resolve it one-shot, then classify the result. This is how
+              // top-level one-shot reactive control flow (<For>/<Show>) reaches
+              // the content path when it arrives as a thunk/memo rather than an
+              // eager node. Bounded against a pathological self-returning fn.
+              let value = raw[key];
+              for (let d = 0; typeof value === "function" && d < 16; d++) value = value();
+              const t = typeof value;
+              if (value == null || t === "string" || t === "number" || t === "boolean") {
+                args[key] = value;
+              } else if (isServerContent(value)) {
+                // Server JSX flows as a nested region, never as data — the
+                // no-double-serialize invariant (transport dispatch case 1):
+                // its html is the transfer; the client wraps the range without
+                // re-rendering it. Nested occurrence markers evaluated inside
+                // this content already emitted their slot chunks against this
+                // frame — the consumer threads record lookup up the frame tree.
+                const resolved = ctx.resolve(value);
+                if (resolved.h.length) {
+                  // A Suspense boundary keeps its async out of `h` (it catches,
+                  // renders a fallback, and streams its fragment — now routed
+                  // to the region). A residual hole here is a BARE async read
+                  // with no boundary: nothing to show while it settles, and no
+                  // fragment to reveal into.
+                  throw new Error(
+                    "Async server content in a slot arg needs a boundary (arg '" +
+                      key +
+                      "' of " +
+                      occurrence +
+                      "). Wrap the async read in a <Suspense>, or move it above the slot."
+                  );
+                }
+                sink.region(childId, resolved.t[0]);
+                args[key] = { $frame: childId };
+              } else {
+                const ref = `arg:${occurrence}:${key}`;
+                ctx.serialize(ref, value);
+                args[key] = { $ref: ref };
               }
-              // Region ids derive from occurrence + arg name — stable across
-              // responses (allocation order isn't), so a later stream's
-              // region content routes to the same bound region and morphs in
-              // place, and keyed dedupe holds under reorders.
-              const childId = `${frame.id}.${occurrence}.${key}`;
-              sink.region(childId, resolved.t[0]);
-              args[key] = { $frame: childId };
-            } else {
-              const ref = `arg:${occurrence}:${key}`;
-              sharedConfig.context.serialize(ref, value);
-              args[key] = { $ref: ref };
+            } finally {
+              ctx.registerFragment = origRegister;
             }
           }
           sink.slot(occurrence, args);

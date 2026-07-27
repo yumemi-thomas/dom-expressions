@@ -50,12 +50,34 @@ const SCENARIOS = {
   // feature weight, re-guarded at 6250; 6460 after element-claim sweeps
   // (the router link-state contract: seam-read registry, sweep at every
   // materialization site, morph attribute re-claims, ownerScope) —
-  // deliberate feature weight, re-guarded at 6600.
+  // deliberate feature weight, re-guarded at 6600. Then the element-seams
+  // decision REMOVED weight: 6585 -> 6550 (boundary is an element; the
+  // $$FRAME brand + its insert/normalize branches deleted from core) -> 6331
+  // (regions are elements: the depth-stack region discovery, fragment-refill,
+  // and frame:-marker range helpers all deleted) -> 6091 (template/block
+  // payload mode removed: chunkToRecords cases, materializeBlock, the
+  // block-template readiness gate — dead markup-compression the producer never
+  // emitted; the only content dedup is free seroval reference-equality) —
+  // re-guarded DOWN at 6180. Then +54 for the used-region t=0 props threading
+  // (6140) and +64 for the morph live-state deny-list (<details>/<dialog>
+  // `open` preservation + the `data-preserve` escape hatch) — deliberate
+  // feature weight, re-guarded at 6250. Then the element-seams `as` escape
+  // hatch was dropped (fixed `<dx-frame>` tag, no author override) — 6191,
+  // re-guarded DOWN at 6220. Then +74 for the boundary-driven reveal hook (the
+  // per-`<Loading>` reveal: `#revealSegment` delegates to `options.reveal` so
+  // the binding can reconstruct a client `<Loading>` at the seam, and
+  // `#syncSlots` gained a scoped-fragment mode so a segment's fills render
+  // inside that boundary) — deliberate feature weight, re-guarded at 6290.
+  // Then +6 for the nested-region record-cleanup fix (`#removeSlotRecord`:
+  // region teardown releases its occurrences' records from the store that owns
+  // them — the root's, for a nested occurrence — so a navigate-away-and-back
+  // can't dedupe a re-introduced `{$frame}` region against a stranded t=0
+  // record and drop a doubly-nested reply's body) — re-guarded at 6330.
   "frames: full consumer (runtime + transport + codec glue)": [
     `export * from ${JSON.stringify(FRAME_CLIENT)};
      export * from ${JSON.stringify(FRAME_TRANSPORT)};
      export { createJSONDataTable } from ${JSON.stringify(SERIALIZER)};`,
-    6600
+    6330
   ]
 };
 
@@ -113,8 +135,10 @@ for (const [name, [imp, ceiling]] of Object.entries(SCENARIOS)) {
   await check(name, entry, ceiling);
 }
 await check(
+  // 873 -> 945 gz after the live-state deny-list (`open` preservation +
+  // `data-preserve`); still ~360 under micromorph, so the public claim holds.
   `frames: morph slice (must undercut micromorph's ${MICROMORPH_GZ} gz)`,
   await morphSliceScenario(),
-  MICROMORPH_GZ - 400
+  MICROMORPH_GZ - 320
 );
 process.exit(failed ? 1 : 0);

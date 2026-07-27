@@ -38,6 +38,10 @@ pub(crate) fn element_name(name: &JSXElementName<'_>) -> Result<String> {
 /// Resolves duplicate attributes the way the Babel plugin does when no spread
 /// is present: the last occurrence of a name wins (earlier ones are dropped),
 /// except `ref` which may appear multiple times. Spreads disable deduping.
+///
+/// The DOM attribute pipeline dedupes on normalized plan keys instead (see
+/// `dedupe_plans`); this raw-name form is retained for the semantic trace,
+/// which reports over the source attribute list.
 pub(crate) fn dedupe_attributes<'a, 'b>(
     attributes: &'b [JSXAttributeItem<'a>],
 ) -> std::vec::Vec<&'b JSXAttributeItem<'a>> {
