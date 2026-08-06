@@ -1,0 +1,676 @@
+# Server Components: The Derivation
+
+**Status:** Accepted design basis for the post-`0.50.0-next.35` architecture pass.
+**Audience:** anyone changing `frame-client.js`, `frame-transport.js`, `frame-sink.js`, the
+document inline scripts in `server.js`, or Solid's frames integration
+(`@solidjs/web/frames`, `solid-js` hydration).
+**Relationship to other docs:** [`server-components.md`](server-components.md) is the
+usage-first spec, [`frame-streams-rfc.md`](frame-streams-rfc.md) is the wire format.
+This document sits underneath both: it states the axioms the system is derived from,
+maps every existing mechanism to the axiom it serves (or marks it compensatory), and
+records the decisions of the first-principles pass. Where this document and the older
+docs disagree, this document wins and the others get revised.
+
+---
+
+## 1. Why this document exists
+
+The feature was specified by invariants (single-copy, hydrate-once, per-args identity,
+state survival) but *implemented* by accretion: each bug got a locally-correct fix, and
+several fixes created the conditions for the next bug. Three seams paid interest
+repeatedly:
+
+- **Reveal/claim ownership** needed fixes three rounds running — solidjs/solid#2964
+  (late-settling boundary never mounts), then the reveal-policy rework (`_$HY.f`),
+  then solidjs/solid#2967 (the rework changed what `_$HY.done` means, breaking
+  `documentStreaming()`; plus a claim scope severing slot reactivity). Each fix was
+  correct and each spawned the next, because *two* runtimes (document hydration and
+  the frame client) own the same placeholder vocabulary.
+- **Record shape per transport** produced the #547 cluster (`#refArgsUnchanged`, the
+  `ctx.adopted` fork, `hy.r` absorption) and then solidjs/solid#2968 (adopt-time slot
+  sync can run before its record is resolvable, misclassifying an invoked slot as
+  argless content).
+- **Boundary identity straddling cache and call site** produced the hover-preload
+  morph bug, the sidebar-collapse bug, solidjs/solid#2965 (fast navigation permanently
+  showing the wrong route), and the machinery stack that fixed them: call-site
+  handoff, `forwards`, `rebind`, retention snapshots, live slot props, and the
+  "preloads never hand off" rule.
+
+Meanwhile the client surface reached ~3,400 lines / 8.5 KB min+gzip and the CI size
+ceiling was ratcheted upward nearly every round. Ratcheting a guard to match actuals
+is the guard failing.
+
+The async work in Solid 2.0 established the antidote: state the axioms, derive the
+mechanism set from them, and delete everything that exists only to compensate for a
+mechanism that shouldn't exist. This is that pass for server components.
+
+---
+
+## 2. Axioms
+
+Everything below is derived from these seven statements plus one liveness rule. A
+mechanism that cannot cite an axiom is a bug in the architecture even if it fixes a
+bug in the behavior.
+
+- **A1 — Single-copy.** Server content travels exactly once: as HTML if it is
+  markup, as a data record if the client needs the value. Never both. (At t = 0,
+  values recoverable from the rendered page are recovered, not re-sent.)
+- **A2 — Hydrate once.** Client components hydrate at t = 0 and never again. After
+  boot the server never renders a client component; post-load responses carry server
+  content and slot records only.
+- **A3 — Addresses key content, not mounts.** Every byte the server produces belongs
+  to a `(function, arguments)` address. Arrival — any transport: preload, refetch,
+  single-flight region, document inline — *only writes the address's store*. There is
+  no code path from arrival to DOM.
+- **A4 — Sites own mounts.** A consumption site owns one mounted frame, bound to one
+  address at a time. DOM changes are pulls: the bound address's store advanced a
+  version, or the site rebound to a different address. Binding follows the site's own
+  reactive expression, nothing else.
+- **A5 — One record shape.** A slot/region record has one meaning and one
+  availability point on every transport. The t = 0 document emits the same records a
+  stream would; a consumer never branches on "how did this arrive."
+- **A6 — One reveal owner.** A pending placeholder has exactly one owner: the frame
+  store/flush model. The document is the t = 0 frame (id `""`), not a parallel
+  system with its own policy.
+- **A7 — Identity-first matching.** Occurrence identity is frame-wide. Reconciliation
+  matches client-owned ranges by identity first and position second; a live range is
+  *never* detached because of where it sat.
+- **L1 — Liveness.** Every pending state resolves to exactly one of: content, error,
+  or detectable truncation. Nothing pends silently forever. (This is the axiom
+  solidjs/solid#2958 showed was missing: a truncated stream must be observable, and
+  the `_$HY.fe` seam it relies on must actually exist.)
+
+A1, A2 are unchanged from the shipped design and have never been the source of a bug
+class. A3–A7 and L1 are the corrective ones.
+
+### The derived data flow
+
+```
+  preload ──────┐
+  refetch ──────┤ writes                    pulls (bound address, version)
+  single-flight ├──────► store[(fn, args)] ◄──────── mounted frame ──── site
+  t=0 document ─┘                                        (one per site)
+```
+
+Preload isolation, retention, and "morph on refetch" stop being rules anyone
+maintains; they are unrepresentable-failure consequences of A3/A4:
+
+- A hover-preload for `getNote(2)` writes `store[getNote,2]`. The viewer is bound to
+  `store[getNote,1]`. Nothing observes the write. (The hover-morph bug cannot be
+  expressed.)
+- Navigating rebinds the site's frame from address 1 to address 2 — the same morph
+  path as a version update on a bound address. If `store[2]` is warm, the morph is
+  synchronous: that *is* retention, with no snapshot mechanism.
+- A refetch of the bound address advances its store version; the frame pulls and
+  morphs. Client-owned ranges survive by A7.
+
+---
+
+## 3. Decision records
+
+### DR-1: The identity split (supersedes "boundary identity is the call", contract §3)
+
+**Shipped design:** the `(function, args)` address keys *everything* — the component
+identity `dynamic` sees, the DOM boundary element, and the content store. Every args
+change is therefore a component swap, which is a remount — so the design immediately
+needed machinery to undo the remount for live sites: `COMPONENT_HANDOFF` (a brand the
+new component uses to steal the old component's live mount), the path-compressed
+`forwards` map, `FrameImpl.rebind` (change a live frame's id without teardown),
+retention snapshots (a departing boundary stashes `{version, records}`), and an
+explicit rule that preloads never trigger handoff. That stack is where the
+hover-preload bug, the sidebar-collapse bug, and solidjs/solid#2965 lived.
+
+**Previously rejected design (for the record):** one boundary per call *site*,
+owner-captured, morphing across argument changes — with the *cache* keyed by site.
+Rejected correctly: a fresh per-args cache hit could resolve a component that was
+mounted showing different arguments' content. That failure was a cache-honesty
+violation.
+
+**Adopted design:** split the two roles the address was playing.
+
+- The **store** is keyed per-address (cache-honest; 1:1 with a data layer's per-args
+  cache entries by construction — the half of the shipped design that was right).
+- The **mount** is keyed per-site. The component `dynamic` resolves is stable per
+  *function*; args changes at a live site deliver a new binding to the same instance
+  ("same component, new props" — the semantics compiled components already have),
+  and the instance's frame rebinds its pull to the new address's store.
+
+The rejected design's failure mode is unrepresentable here: a cache hit fills a
+per-args store; a mount bound to a different address never observes it. The shipped
+design's machinery is unnecessary here: there is no component swap to undo, so
+handoff, forwards, rebind-by-id, retention snapshots, and the preload rule all
+delete. What remains is the one genuinely-needed mechanism the patches were
+approximating: a "new binding into the same live instance" delivery path — the same
+shape `liveSlotProps` already has one level down, now applied at the boundary level
+where it belongs.
+
+State semantics are preserved exactly: slot occurrences whose ids persist across a
+rebind keep their client state (what the collapse-bug fix was reaching for);
+occurrences that disappear unmount (per-call state does not bleed across calls);
+teardown is still disposal, never a version bump.
+
+### DR-2: Async values at the slot border
+
+**Where a read renders determines where it suspends.** A read rendered into
+*markup* suspends on the server, into the fragment model — `Loading`,
+placeholders, deferred reveals — because that is where a placeholder exists
+by construction (DR-3). A read crossing as a *slot arg* never suspends the
+server: the stream, the record, and every sibling arg ship immediately, and a
+value that isn't ready yet crosses *as* pending. Suspension for data is
+**client-side, at the consumption read** — a prop read through the live-props
+proxy follows the normal async read path into the reading component's own
+nearest `Loading`, exactly as a promise prop behaves between two client
+components. Initial SSR's shape, applied to data: emit now, settle later,
+reveal at the read site.
+
+"Nearest `Loading`" is a **border-blind search**, and that is what makes the
+no-boundary case already solved rather than a new hole. The frames client
+reconstructs a client `Loading` at the seam of every server `<Loading>` it
+reveals (`revealSeam`), precisely so a client fill that suspends top-level
+without a boundary of its own defers to the *server's* boundary. The first
+design deferred such fills to the parent *client* boundary outside the slot
+instead, and was walked back: that boundary has already latched by reveal
+time, so the suspension either re-collapses settled UI around the slot or
+orphans entirely, and it answers with the wrong fallback — the server
+already rendered the fallback for exactly this footprint, so the client
+must hold *that*, at *that* granularity. (Pinned: the seam test asserts the
+segment fallback holds while the outer fallback must **not** re-engage;
+`boundaryScope` guards the ownership half — re-parenting a fill to the
+frame's outer owner would let it escape the seam boundary that exists to
+cover it.) A pending slot arg read at mount is just one more way top-level
+suspension arises, and it escalates by the same path: the author's server
+`Loading` covers unboundaried pending *data* exactly as it covers
+unboundaried fill *markup*. One boundary tree spans both owners; what
+differs across the border is who rendered the fallback, not where suspension
+resolves. DR-2 completes the picture that seam decision started — together
+they mean an author places boundaries by UX intent alone, never by which
+side a value happens to arrive from.
+
+**Data args are live bindings for the response window.** No node kind is
+special: from the graph's perspective an expression, a sync memo, an async
+memo, and a projection are all equally downstream of sources, so the border
+must not draw a liveness cliff between them. (An earlier draft's "only
+self-driving primitives stream" drew exactly that cliff — it described the
+server implementation's shape, not the model's, and is superseded.) The
+mechanism buys graph-consistent behavior without building a dependency graph
+into SSR mode:
+
+- At record emission, each arg getter becomes an open **binding** —
+  `(record, arg, getter, last emitted state)`. Nothing holds; the record
+  ships with its mix of settled values and pending marks. The server side is
+  a binding ledger, not a boundary — the suspense boundary is the client
+  component's own `Loading` at the prop read.
+- The server has exactly one kind of update event: a **commit** — a generator
+  yields, a promise settles — already funneled through the settlement choke
+  points. Each commit bumps a global **epoch** and triggers one
+  equality-gated re-evaluation sweep over the open bindings; changed values
+  re-emit as ordinary live-props record updates. Between commits nothing
+  runs: correctness by re-evaluation instead of by tracking, over the
+  dumbest possible topology (sources → all bindings) — the right trade at
+  SSR scale, where response windows are short, commits few, getters cheap.
+- Server memos cache **per epoch** (one integer compare at pull; no
+  subscriptions), so derivations recompute lazily when a sweep pulls them.
+  Memos are pure by contract; re-running per epoch is the client contract
+  applied to the server.
+- **Lifecycle:** a binding opens at emission, updates on commits, and closes
+  at response completion or region teardown. Completion latches the last
+  value as final — principled, not truncation: the request-scoped graph is
+  disposed, so its last value *is* its final value. A binding that never
+  successfully evaluated **rejects** with a diagnosable error (the fragment
+  ledger's truncation pattern), so a client `Loading` errors instead of
+  hanging. Cross-request updates are owned by re-invocation (invalidate →
+  the address re-streams → live props update the mounted instance).
+  Unmounting the frame aborts the in-flight response, which disposes the
+  sources — no new teardown protocol.
+- Implementation notes settled in review: equality gating is *reference*
+  equality (a getter minting a fresh object re-emits per commit — exactly
+  what the client graph does with that getter; structural comparison would
+  be a silent divergence); sweeps coalesce per flush (a burst of yields in
+  one tick is one sweep, at most one emission per binding); a binding that
+  emitted and later throws not-ready re-enters pending as
+  pending-with-previous-value — the client async source already models
+  latest-vs-suspend; bindings ride the sink's existing response-window
+  context (it already holds projection taps and deferred holes), and a
+  superseded region closes its bindings mid-response.
+
+Classification (by the value's nature, before resolution — DR-3) decides each
+binding's **wire shape**, never its liveness:
+
+1. **Plain values** — including the results of expressions
+   (`value={proj.a + 1}`) and sync memos: the value itself; re-emissions
+   replace it, latest-wins. Pending-at-first-evaluation ships as a pending
+   async value and resolves on a later sweep.
+
+2. **Async values passed whole** (promises, async iterables, async memos):
+   a pending record streams on, resolutions/yields ride later data chunks
+   (seroval's streaming serialization is already this shape). Revives as a
+   client **async source**; reads suspend at consumption. The receiving side
+   already exists (the signal-backed live-props proxy plus the async read
+   path) — this tier ships first.
+
+3. **Containers passed whole** (projections and stores, or *parts* of them)
+   cross as their **bounded async trace**: one snapshot, then patch batches,
+   for as long as the response is open. Committed work, not demand-gated —
+   solidjs/solid#2966's repro *is* this crossing.
+   - *Why a trace and not a channel:* the server graph is request-scoped, so
+     a reactive value's entire observable life fits inside the response
+     window; a channel bounded by the response IS streaming serialization,
+     and one that outlives it would require server sessions this
+     architecture does not have. The binding lifecycle above applies
+     unchanged — settle-at-completion, re-invocation for cross-request
+     updates, abort-on-unmount.
+   - *Why patches and not snapshots:* seroval dedupe is identity-keyed and
+     in-place mutation keeps identity while changing content, so
+     snapshot-per-frame back-references pin *stale* serializations.
+     Immutable updates make snapshots cheap; in-place updates make patches
+     cheap — Solid chose in-place, so the aligned wire format is the
+     mutation log, which is also the single-copy answer: snapshot once,
+     deltas after.
+   - *The producer already ships:* projection hydration wraps the draft in a
+     `PatchOp`-recording deep proxy (set/delete/array-splice ops by
+     root-relative path) and serializes a tapped async iterable — one full
+     snapshot, then `patches.splice(0)` per yield — consumed by
+     `applyPatches`. It doesn't fire at this border only because its gate is
+     the hydration-owner record path (`ctx.serialize(owner.id, …)`), which
+     `NoHydration` — where server components render — correctly blocks.
+   - *Hydration's trace, the frame store's envelope:* the trace is reused;
+     hydration's transport identity is not. At the border it is addressed as
+     `(occurrence, arg)` inside the slot record — a capability of the
+     record, not a registry entry — version-gated by the store's existing
+     discipline (a superseding stream's arrival means the old version's
+     pending patch batches are *dropped*, never applied), and lifetime-bound
+     to region teardown. The snapshot serializes through seroval directly
+     (hydration's JSON-clone freeze would sever shared references within a
+     record).
+   - *The receiver is minted:* unlike hydration — where the client's own
+     `createProjection` call is the patch target because the same component
+     code runs on both sides — no user code runs on the client here, so the
+     frames integration mints the counterpart: `createStore(snapshot)`
+     pumped by `applyPatches`, handed to the live-props read. Fine-grained
+     client reads work because it *is* a store.
+   - *Parts ship as what you pass.* A nested node of a projection is itself
+     a store proxy, so classification sees it; the unit that crosses is the
+     passed subtree, never its root — the wire is an exposure contract
+     (`{ first: state.items[0] }` must not leak siblings/ancestors), which
+     rules out the hydration-equivalent root-reference design despite its
+     free aliasing. Each arg gets a server-side filtered/rebased view of the
+     one root-relative trace: ops strictly below the arg's path strip the
+     prefix; an op at or above it projects the new value down as a sub-store
+     root replacement (`[[], v]`); ops elsewhere are dropped *before* the
+     wire. A part whose ancestor is deleted settles at its final projection.
+     Overlapping parts are independent containers — share identity by
+     passing the common ancestor once (also the cheaper wire).
+   - *"Serialize what is read" holds at the author's granularity:* the
+     client's reads happen after the server is gone, so narrowing to them is
+     impossible without SSR-ing the client component or a demand-fetch
+     waterfall against a disposed source. The projection (or passed part)
+     is the author-declared read set and snapshot+deltas its minimal
+     encoding — "ship less" = "project less," and passing a part is
+     projecting less ad hoc. Single-copy is preserved because the record is
+     the only copy when the client is the only consumer; render-AND-pass
+     duplication is the authored, bounded concession DR-3 rule 2 names.
+
+4. **Async at container paths** (promises/pending nodes stored IN a
+   projection): two clocks interleave at one path — the mutation log (a path
+   may be reassigned before its promise settles; a superseded settlement must
+   lose, so per-path latest-wins sequencing) and the settlement events
+   ("pending" is a node state, not a value: minted-store reads of such paths
+   must suspend through the async read path, and the sink must serialize from
+   the raw target so a pending node cannot suspend the serializer). Excluded
+   from the first container round with a diagnosable error naming the path;
+   the sequencing discipline is designed into the container spec so this is
+   an extension, not a retrofit.
+
+5. **The serializer never crashes.** An unserializable value is a diagnosable
+   error naming the slot and the type, not `Seroval Error (step: 1)`
+   (solidjs/solid#2966's presenting symptom). With cases 1–3 unwrapping
+   reactive values into their traces, this remains only as the guard for
+   genuinely unserializable *outputs*.
+
+Rejected alternatives, for the record: **holding** (deferring the slot record,
+or the stream, on one arg — coarse, and contradicts case 1's granularity);
+**resolving passed primitives server-side to dead values** (two suspension
+sites for one kind of data, and updates the source produces later in the
+response would be dropped); **write-once expressions** (settle at first
+successful evaluation, then latch — a liveness cliff between `value={memo()}`
+and `value={memo}` that no client border has; superseded by response-window
+bindings); **persistent channels** (duplicate re-invocation with worse
+lifetime semantics); **snapshot-per-frame dedupe** (stale back-references,
+above). Server-content async (`<Loading>` inside server JSX)
+is a different async and keeps the fragment model wholesale: one is markup the
+server owns, the other is data the client owns.
+
+### DR-3: Classification precedes resolution (template detection stays tractable)
+
+Two rules keep the sink's content-vs-data decision and reverse templating decidable:
+
+1. **Async slot args are data-only.** The wire shape — an HTML placeholder in the
+   stream vs. a data chunk — is fixed at markup-emission time; a placeholder cannot
+   be inserted retroactively after surrounding markup has flushed. Therefore a value
+   that cannot be classified synchronously is data by definition: async slot args
+   must resolve to serializable values, never JSX. Async *server content* goes
+   through `Loading`/fragments, where the placeholder exists by construction.
+   (Function-valued args keep the existing "resolve, then classify" treatment — they
+   *can* be resolved synchronously.)
+2. **Async args are never reverse-templatable.** Rendered markup shows a settled
+   value; the async wrapper type (`Promise`? projection? plain value?) is not
+   recoverable from content. Async args always ship as typed records. This is a
+   bounded single-copy concession (the settled value may appear in both markup and
+   record when the wrapper's value is displayed), accepted because inferring wrapper
+   types from markup is precisely the kind of guessing this pass exists to remove.
+
+### DR-4: The document is the t = 0 frame (one reveal owner)
+
+The document inline scripts (`$df`, `$dfl`, `$dfs`/`$dfc`, the deferred/held queues)
+and the frame client (`#segmentReady`/`#revealSegment`/style gating) are two
+implementations of one concept: *a keyed pending segment with prerequisites,
+revealed when ready*. The dual ownership is what made "who may swap this
+placeholder after hydration is done" unanswerable — #2964, the `_$HY.f` policy
+patch, and #2967's `documentStreaming()` breakage are all this seam.
+
+Adopted: **one buffer, one consumer.** The inline bootstrap stays a dumb recorder
+(tiny, no policy): fragment arrivals, style counts, and data records go into the
+buffer exactly as they do today. The frames store/flush model becomes the *only*
+consumer: at runtime boot, document state drains into frame `""`'s store, and every
+reveal — document fragment or frame segment — is the same readiness predicate
+(content present + structural prerequisite + declared deps + style gate) evaluated
+by the same flush. Boundary claims are store reads by the owning boundary, not a
+side-channel policy negotiated between two runtimes. `_$HY.done`, the fragment-claim
+registry, the held-fragment replay, and `boundaryMayArrive`-style heuristics all
+dissolve: "may this swap apply" becomes "is this write's owner bound," the same
+question every other store write answers.
+
+**Stage 3 refinement — the buffer is a ledger, not a frame instance.** Two
+constraints sharpen the implementation without weakening the axiom. First, the
+0 B non-consumer budget (§6): plain streaming apps use document fragments
+without importing frames, so the one consumer for *document* fragments must
+live in the hydration runtime, not the frames bundle — frame segments keep
+`#revealSegment` for frame transports (disjoint content, same model). Second,
+the record set that answers "what may the document still deliver?" already
+mostly exists: the serializer's `<id>_fr` writes are the DECLARATIONS, seroval's
+`.s` status marks are SETTLEMENT, and one added inline mark (`_$HY.v[id] = 1`
+in `$dfr`, recording — not policy) is REVEAL, valid across the pre-boot window.
+The hydration runtime owns the ledger (declared → settled → revealed, plus its
+post-boot claimed/held policy state) and publishes it as `_$HY.fr`
+(`{ pending, subscribe }`): the frames client's document adoption reads
+"may a boundary still arrive" and learns of reveals from the ledger — the
+`pl-*` document scans and the `_$HY.fe` monkey-patch delete. One scoped residue:
+a settled-but-unswapped fragment (style-gated, retry-queued, reveal-grouped,
+policy-held) reads as pending via its content template's continued presence —
+a per-id `getElementById` at query time, an id-table lookup rather than the
+tree scan this replaces. Pre-boot reveals stay inline mechanics ($dfr): before
+the runtime exists there is no second writer, so no policy question — one
+owner *at any moment* is the invariant, not one code location.
+
+### DR-5: Identity-first reconciliation
+
+The morph is currently position-first (two-cursor sibling reconcile) with a
+frame-wide displaced-range index bolted on as a repair pass — grown across three
+fixes (cross-parent relocation, teardown release, wholesale-insert restore, the
+notes search-clear bug). Under A7 the index *is* the model: client-owned ranges
+match by occurrence identity anywhere in the frame, and position governs only
+server-owned nodes. The repair pass becomes the primary path; "a live range was
+detached because its parent didn't match" stops being a reachable state.
+
+---
+
+## 4. Mechanism audit
+
+Every mechanism in the current client surface, its axiom, and its disposition.
+**Derived** = follows from an axiom, stays (possibly simplified). **Compensatory** =
+exists to undo another mechanism's consequences; deletes with its cause.
+**Presentation** = per-mount state, stays but is explicitly not content (see §5.4).
+
+| # | Mechanism (current location) | Axiom | Disposition |
+|---|---|---|---|
+| 1 | Chunk→record store writes (`chunkToRecords`) | A3 | Derived — unchanged. |
+| 2 | Multi-mount routing + pending buffer (frame host) | A3/A4 | **Done (Stage 2):** resident per-id stores; writes land mounted or not, mounts seed from the store. The pending buffer and sibling seeding deleted into it. |
+| 3 | Retention snapshots (`snapshot`, last-unregister-wins) | — | **Done (Stage 2):** deleted — a warm store *is* retention. One residue: a last-unmount capture of a document-adopted interior (its content never rode chunks). Lifetime policy in §5.1. |
+| 4 | HTTP pump (`applyFrameResponse`: `as`/`route`/restamp) | A3 | **Done (Stage 2):** responses apply as their call's address; the `route` map deleted (region roots address stores directly). |
+| 5 | Version gating, policy A (stale-guard, not reset) | A3/A4 | Derived — unchanged, now explicitly per-address with client-stamped authority (§5.2). |
+| 6 | Slot-record identity dedupe (`argsEquivalent`) | A5 | Derived, simplified: with one record shape the conservative `$ref` special-casing shrinks. |
+| 7 | Prerequisite flush loop (`#flush`) | A6 | Derived — becomes THE reveal engine for document + frames (DR-4). |
+| 8 | `frame:applied` event | — | Derived (router affordance) — unchanged. |
+| 9 | Zero-allocation morph (`reconcileChildren`) | A7 | **Done (Stage 4):** identity-first (DR-5) — the reconcile records every wholesale-inserted root as a graft site. |
+| 10 | Displaced-range index + stash/restore | A7 | **Done (Stage 4):** the index is the primary matching path; the O(frame) end-of-morph rescan (`restoreDisplacedRanges`) deleted into one walk over recorded graft sites (`flushGrafts`). |
+| 11 | Root materialize vs morph split | A4 | Derived — unchanged. |
+| 12 | Slot marker collection/parsing | A1 | Derived — unchanged. |
+| 13 | Occurrence mount/re-call/unmount (`#syncSlots`) | A4 | Derived — unchanged in role; simpler inputs (A5). |
+| 14 | Invoke context (`ctx`: adopted/invoked/existing/…) | A5 | Derived, shrinks: the `adopted` fork exists because t = 0 records differ (A5 removes the difference). |
+| 15 | Live slot props (`ctx.onUpdate`, signal-backed proxy) | A4 | Derived — and generalized upward: the same "new binding, same instance" shape serves boundary rebinds (DR-1) and async arg updates (DR-2). |
+| 16 | `#refArgsUnchanged` value-compare | A5 | **Done (Stage 2):** the #547 `$frame`-addition leniency deleted with unified records; the plain value-compare stays (it is the dedupe, not the patch). |
+| 17 | `$ref`/`$frame` arg resolution + per-stream tables | A1/A3 | Derived; table scoping revisited under per-address stores (§5.2). |
+| 18 | Region discovery from markup (`#discoverRegions`) | A5 | **Done (Stage 2, first half):** with A5, used regions have records on every transport; discovery remains only as claim wiring — and membership is now structural (outermost dotted id in this interior), not producer-prefix-matched, so address-keyed mounts adopt fn-id-prefixed markup. |
+| 19 | Region bind/rebind/`renameRegion` (wire-id renames) | A3 | Compensatory: regions become store substructure keyed `(parent address, occurrence, arg)` (§5.3); wire-relative renames delete. |
+| 20 | `hy.r` occlusion absorption (adopt-time fake chunks) | A5/A6 | Compensatory. Deletes: occluded content is ordinary records in the one buffer, drained by the one consumer (DR-4). |
+| 21 | Segment reveal + placeholder discovery (`#revealSegment`) | A6 | Derived — and becomes the only implementation (DR-4). |
+| 22 | Stylesheet gating + modulepreload | A6/L1 | Derived — unchanged, one instance instead of two. |
+| 23 | Boundary-driven reveal seam (`options.reveal`) | A6 | Derived — unchanged. |
+| 24 | Element claim sweeps (`CLAIM_SEAM`) | A2 | Derived — unchanged. |
+| 25 | `<dx-frame>` element boundary | A4 | Derived — unchanged. |
+| 26 | Dispose/rebind lifecycle (`FrameImpl.rebind`) | — | **Done (Stage 2):** rebind survives — but demoted from handoff protocol to delivery mechanics (the site's binding-follow effect calls it); dispose stays (teardown is disposal). |
+| 27 | Address-keyed component registry (`byAddress` minting) | A3/A4 | **Done (Stage 2):** per-function components + per-address bindings (`COMPONENT_BINDING`, address as a second-argument accessor); `byAddress` is now a pure binding cache. |
+| 28 | `COMPONENT_HANDOFF` brand + `forwards` map | — | **Done (Stage 2):** deleted. `dynamic` keeps its instance on component equality and delivers the address into per-site signals. |
+| 29 | `ServerComponentPlugin` + flight codec refs | A1 | Derived — unchanged (component references serialize as addresses, never markup-as-data). |
+| 30 | Single-flight application (`applyFlightResponse`) | A3 | Derived, simplified: regions address stores directly; no mount lookup, no per-frame `as`. |
+| 31 | `slotsFor`/`claimRender`/reactive insert (Solid) | A2 | Derived; the claim-scope tracking hole (#2967's second bug) is fixed by construction: claims wrap the insert *call*, reads stay tracked. |
+| 32 | Document boot: boundary index/claim/wait (`documentBoundary`) | A2/A6 | **Done (Stage 3):** "may a boundary still arrive" is the ledger's answer (`_$HY.fr.pending()`), reveal/exhaustion arrive by subscription; the `pl-*` document scans and `_$HY.fe` patch deleted. |
+| 33 | Per-stream seroval tables (Solid `tables`) | A3 | Derived; keyed by address root (§5.2). |
+| 34 | Boundary resume/scope capture (hydration.ts) | A2 | Derived — unchanged (multi-root hydrate is orthogonal). |
+| 35 | Fragment reveal policy + claim registry (`_$HY.f`, `claimFragment`, `hasPendingFragment`) | — | **Done (Stage 3):** restructured into the fragment ledger (declared/settled/revealed/claimed/held, one Map) that also answers row 32 and detects truncation (§5.5); the ad-hoc claim/held Sets deleted into it. `hasPendingFragment` (claimRender's range-scoped template check) stays — the range is its own record. |
+
+Score: 24 derived (several simplified), 8 compensatory deletions, 3 restructured.
+The deletions are precisely the mechanisms with the worst bug-per-line record.
+
+---
+
+## 5. Settled questions
+
+### 5.1 Store lifetime and eviction
+
+A3 makes stores accumulate: preloads fill stores that may never mount. Policy:
+
+- A store's lifetime couples to its **data-layer cache entry** where one exists: the
+  transport exposes an eviction hook, and a `query`-wrapped call's cache eviction or
+  invalidation evicts/marks the store. 1:1 addressing makes this coupling exact.
+- For addresses never wrapped in a cache, the store follows the **response
+  lifecycle + LRU floor**: bounded count, mounted-address stores are pinned,
+  eviction of an unbound store is silent (a later bind refetches — the same behavior
+  as a cold cache).
+- Eviction of a *bound* address is not the eviction layer's call: teardown is
+  disposal (the site unmounts), never a cache event morphing DOM (A3).
+
+### 5.2 Versions, staleness, tables
+
+- Versions are **per-address**, client-stamped at request time (the client is the
+  only party that observes ordering across transports). Policy A is unchanged:
+  stale writes drop, newer writes morph, teardown is disposal.
+- A stream for address `A` racing a later refetch of `A`: the refetch's stamp is
+  higher; the older stream's remaining chunks drop on arrival. No transition or
+  navigation bookkeeping involved (solidjs/solid#2965's class is a version compare).
+- In-flight streams for addresses no longer bound anywhere **write through** — they
+  warm the store (arrival never touches DOM, so there is nothing to protect); actual
+  request cancellation is the data layer's concern, not the transport's.
+- Seroval cross-reference tables scope to the **response**, as today, but are
+  indexed by address root rather than mounted-frame root (drops the mount lookup).
+
+### 5.3 Regions under the split
+
+A region is **store substructure**: identity `(parent address, occurrence, arg)`,
+storage inside the parent address's store namespace. Consequences:
+
+- The wire may still ship producer-relative child ids; they normalize to canonical
+  region identity at the store boundary (one normalization, replacing scattered
+  `renameRegion` calls at bind/resolve time).
+- A parent rebind (site moves from address 1 to 2) leaves address 1's regions in
+  address 1's store — retained with it, evicted with it. Region client state follows
+  occurrence identity exactly as slot state does.
+- Regions never register independently with the transport; nested `dx-frame`
+  elements are mounts pulling substructure, so "route a region's async fragment to
+  the region, not the root" (a shipped bug fix) becomes addressing, not routing.
+
+### 5.4 Content vs presentation state
+
+The store holds **content**: records, versions, completion/error. Everything
+observable per-mount is **presentation**: segment-reveal progress, style waits,
+fallback visibility, `frame:applied` reasons. The line matters for multi-mount
+fan-out (two mounts of one address may be mid-reveal at different moments — reveal
+state cannot live in the store) and it prevents the class of bug where a mount's
+transient state leaks into retained content. Rule: nothing in the store references
+DOM; nothing per-mount survives unmount.
+
+### 5.5 Errors and truncation (L1)
+
+- `:error` is content-level state in the store, per address+segment, cleared by a
+  newer version's corresponding write (refetch-clears-error).
+- `Errored` composes at the border exactly as `Loading` does: the mount surfaces the
+  bound store's error state through the boundary seam; client boundaries decide UI.
+- **Truncation is detected, not inferred:** a response ending without its terminal
+  record marks every still-pending key of that version as truncated — an error-class
+  store write (distinguishable from a server-sent error). **Document side done
+  (Stage 3):** the parser finishing (DOMContentLoaded) is the transport's close;
+  any `_fr` declaration still unsettled then is marked rejected with a truncation
+  error, releasing its boundary through the normal rejection path and its
+  document-adoption waiters through the ledger (closes solidjs/solid#2958 for
+  documents). The sweep arms only when the runtime booted while the document was
+  still streaming — a late-loaded runtime can't tell a completed page from a
+  truncated one. Frame-stream truncation (pump ends without the root's `complete`
+  chunk) lands with the `:error` content-state records above, not before them.
+
+### 5.6 Head and assets
+
+Head effects from server content ride the same shape as styles do today: **typed
+asset records in the store, applied by the flush at reveal time**, deduplicated by
+the head-management layer's identity rules (the in-flight head RFC owns element
+identity; frames own delivery timing). Server components do not get a parallel head
+mechanism. This seam is deliberately minimal until the head RFC lands; the only
+commitment is that head effects are store records (A3) applied at reveal (A6).
+
+### 5.7 Optimistic UI at the border
+
+Single-copy has a consequence worth stating so users don't discover it as a bug:
+**server content cannot be optimistically updated** — the client has no template to
+re-render it (A1, A2). The blessed pattern: optimistic state lives in client slots
+(which can overlay, badge, strike-through, or hide server content); server content
+itself settles when the mutation's single-flight response morphs it. The transport
+guarantees the two compose: a slot's optimistic state survives the settling morph
+(A7), so the overlay never flickers.
+
+### 5.8 Producer-side symmetry
+
+The sink gets the same audit in Stage 2/3 implementation:
+
+- **Record shape (A5) lands server-side first**: t = 0 document emission writes the
+  same slot/region records a stream would (used regions included), into the one
+  buffer. The occlusion-lock machinery simplifies to "content not rendered by the
+  wrapper ships as records" — one rule, no lock negotiation.
+- Document assembly emits frame `""` (DR-4): the existing `$df`-family scripts
+  become arrival recorders; policy code in inline scripts deletes.
+- Per-root boundary scopes and hole-owner ids are unaffected (they serve A1/A2).
+
+---
+
+## 6. Size budget
+
+Derived from the mechanism set, not ratcheted from actuals. Current measured
+(min+gzip, CI-guarded): **8,228 B** full frames consumer, **1,097 B** morph
+slice. Stage 2 delivered −402 B against the 8,610 B it started from: A5's
+consumer patches −98, the resident-store host −88, the identity split −216
+(handoff/forwards/route-map deleted, net of the binding wrapper). Stage 4
+(DR-5) cost +20 consumer / +30 slice: graft sites recorded at insertion are
+a *derived* mechanism (rows 9–10) — the by-construction guarantee costs the
+recording, against which the deleted rescan was slightly smaller but O(frame)
+per apply and scan-based ("roughly size-neutral" below was optimistic by 30 B;
+the slice stays under its ≤ 1,100 budget). The #2968 deferral (+105 inside
+these figures) stays until record delivery is ordered by construction; the
+remaining distance to the ≤ 7,800 B budget is row 20's `hy.r` occlusion drain
+and that deferral — both gated on the document sink emitting frame-shaped
+records (producer work deferred to the wire freeze).
+
+Deletions and simplifications from §4 (handoff stack, retention snapshots,
+`#refArgsUnchanged`, `hy.r` absorption, rename machinery, reveal-policy glue,
+registry restructure) remove machinery; DR-1's binding delivery and DR-2's async
+revive add small derived mechanisms. Budget:
+
+| Scenario | Budget | Rationale |
+|---|---|---|
+| frames: full consumer | **≤ 7,800 B** | ≥ 700 B of compensatory machinery deletes; new derived mechanisms are ≤ 200 B combined. |
+| frames: morph slice | **≤ 1,100 B** | Identity-first restructure is roughly size-neutral (index becomes primary, repair pass deletes). |
+| non-consumer | **0 B** | Unchanged: apps that don't import frames pay nothing. |
+
+**Ratchet rule (replaces "actual + headroom"):** a ceiling increase requires a new
+mechanism row in §4 citing its axiom. A fix that needs bytes without a new mechanism
+is compensatory by definition — fix the cause instead.
+
+---
+
+## 7. What this supersedes
+
+- Contract §3 in `server-components.md` ("Boundary identity is the call") is
+  superseded by DR-1: *content* identity is the call; *mount* identity is the site.
+  §3's cache-honesty guarantee (per-args stores 1:1 with cache entries, retained
+  re-materialization) is preserved verbatim.
+- The `_$HY.f` reveal-policy routing (`0.50.0-next.35`) is an interim step that
+  DR-4 replaces wholesale.
+- `frame-streams-rfc.md` §"Versioning" gains the per-address, client-stamped
+  clarification of §5.2; §"Slot usage tracking and the streaming-occlusion case"
+  is superseded by §5.8's one-rule record shape.
+- The open questions in Solid RFC 11 (`documentation/solid-2.0/11-server-components.md`)
+  resolve as: reverse templating — constrained by DR-3; router retention — absorbed
+  into A3/A4 (warm stores); template/block payload mode — unaffected, still a
+  post-stabilization optimization; stabilization criteria — this document's
+  implementation (Stages 2–4) plus wire freeze.
+
+## 8. Staging
+
+1. **Interim triage** (pre-derivation architecture): land the solidjs/solid#2967
+   fixes and #2968 — user-facing breakage doesn't wait for redesigns. Annotated
+   below:
+   - #2967 fix 1 (`boundaryMayArrive`): does **not** survive — DR-4 deletes the
+     heuristic it improves. Land it anyway; correctness now matters.
+   - #2967 fix 2 (claim wraps the insert call): **survives** — it is the derived
+     shape (audit row 31).
+   - #2968 (records resolvable before adopt sync): the *symptom* fix is interim;
+     A5 removes the timing skew that causes it.
+2. **Stage 2 — DR-1 + A5** (identity split + record shape) in dom-expressions and
+   `@solidjs/web/frames`. Wire changes acceptable; the feature is experimental.
+   **Done:** A5 producer (t=0 records stream-identical, every region as a
+   `$frame` ref) + consumer patch deletions; resident-store host (buffer/
+   retention/sibling-seeding subsumed); identity split (per-function
+   components, `COMPONENT_BINDING` bindings, per-site delivery in `dynamic`,
+   `followBinding` → `rebind`; handoff/forwards/`documentComponent`/route-map
+   deleted). Verified end-to-end on notes + hackernews (navigation, search
+   state retention, single-flight save, rapid history, preload isolation).
+3. **Stage 3 — DR-4** (one reveal owner). Touches `server.js` inline scripts and
+   Solid hydration; the largest single surgery.
+   **Done** (as refined in DR-4 above): the fragment ledger in Solid's hydration
+   runtime (declared `_fr` records + seroval settlement + the inline `_$HY.v`
+   reveal mark) published as `_$HY.fr`; frames document adoption reads/subscribes
+   instead of scanning for `pl-*` templates and patching `_$HY.fe`; document
+   truncation detection (#2958). Remaining under this decision record: frame-side
+   truncation (with §5.5's `:error` records) and row 20's `hy.r` occlusion drain
+   (deletes when the document sink emits frame-shaped records — producer work
+   deferred until the wire freeze forces it).
+4. **Stage 4 — DR-5** (identity-first morph).
+   **Done:** the reconcile records each wholesale-inserted subtree root at
+   insertion (through nested morph levels), and one post-reconcile walk
+   (`flushGrafts`) swaps bare marker pairs in those subtrees for live ranges
+   from the index — every place a range could be owed is on the list by
+   construction, so no full-frame repair scan and no reachable "detached
+   because the parent didn't match" state. `restoreDisplacedRanges` and its
+   frame-wide `collectSlots` rescan deleted; range placement unified in
+   `placeRange` (stashed fragment vs attached start).
+5. **Re-verify** (notes, hackernews, hackernews-spa end-to-end), set §6 budgets as
+   the CI ceilings, close the issue sweep.
+   **Done, with one residual:** all three examples verified end-to-end post-DR-5
+   (notes: search filter/clear with expansion state, single-flight save, viewer
+   intact through list morphs; hackernews: rapid top-level nav without blank
+   pages, comment threads through back/forward, pagination, hover-preload
+   isolation; hackernews-spa baseline: list/item round trip). Issue sweep:
+   #2958/#2964/#2965/#2967/#2968 closed; #2966 stays open by design (DR-2's
+   async-args tiers are the plan of record for it). CI ceilings are ratcheted
+   to actual+20 (8,248 / 1,117) rather than set to the §6 budgets — the
+   ≤ 7,800 consumer budget is unreachable until the two producer-gated
+   deletions land (row 20's `hy.r` occlusion drain and the #2968 deferral,
+   both waiting on document-sink frame-shaped records at the wire freeze),
+   so pinning it now would just fail CI without forcing the right work.

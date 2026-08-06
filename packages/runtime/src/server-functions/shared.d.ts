@@ -137,6 +137,41 @@ export type FlightDataConsumer<D = unknown> = (
 export function subscribeFlightData<D = unknown>(consumer: FlightDataConsumer<D>): () => void;
 
 /**
+ * Name of the cookie carrying the outcome of a call made without the client
+ * runtime (`"flash"`). A no-JS form post has no way to receive a value —
+ * the browser follows the redirect and renders the next page — so the
+ * handler stashes the outcome here for the render after it to pick up,
+ * which is how a form submitted without JavaScript still shows its result.
+ *
+ * The name, detection and clearing are isomorphic (integrations read the
+ * cookie from code that also ships to the browser); the codec that fills it
+ * is server-only and lives behind the server entry.
+ */
+export const FLASH_COOKIE: string;
+
+/**
+ * Whether a Cookie header carries a flash cookie, readable or not. Cheap
+ * enough to call on every render so the clear can be queued before the
+ * response headers flush.
+ */
+export function hasFlashCookie(cookieHeader: string | null): boolean;
+
+/**
+ * The `Set-Cookie` value clearing the flash cookie. The outcome is
+ * one-shot: append this as soon as the cookie is detected, whether or not
+ * it decodes, so a stale outcome cannot resurface on a later request.
+ */
+export function clearFlashCookie(): string;
+
+/**
+ * The raw encoded flash payload out of a Cookie header, if present — the
+ * codec's own accessor.
+ *
+ * @internal
+ */
+export function matchFlashCookie(cookieHeader: string | null): string | undefined;
+
+/**
  * The currently registered single-flight consumer.
  *
  * Transport building block; not meant for hand-written code.
@@ -371,6 +406,19 @@ export function decodeResponse<T = unknown>(
 ): Promise<T | undefined>;
 
 /**
+ * `decodeResponse` plus the single-flight envelope split: when the response
+ * carries the single-flight header the decoded `{ value, data }` payload is
+ * unwrapped into `{ value, flightData }`; otherwise the decoded body (or
+ * undefined for body-less responses) rides as `{ value }`. Integrations
+ * that apply response metadata themselves use this so the payload shape
+ * stays core's own.
+ */
+export function decodeResponsePayload<T = unknown, D = unknown>(
+  response: Response,
+  codecOptions?: JSONCodecOptions
+): Promise<{ value: T | undefined; flightData?: D }>;
+
+/**
  * Frame one payload for the server-function wire: a `;0x<len32>;` length
  * prefix followed by the utf-8 data. Both transports (server-function
  * responses and frame streams) share this framing.
@@ -386,3 +434,12 @@ export class ChunkReader {
   constructor(stream: ReadableStream<Uint8Array>);
   next(): Promise<{ done: boolean; value: string | undefined }>;
 }
+
+/**
+ * The intrinsic wire address of a server-component call: the function id,
+ * suffixed with a realm-stable hash of the arguments when there are any.
+ * Both peers derive it independently — the server names flight regions with
+ * it, the client routes them by it — so it must stay deterministic across
+ * realms and releases.
+ */
+export function frameAddress(id: string, args?: readonly unknown[]): string;

@@ -3,8 +3,11 @@
  */
 import {
   ResponseEnvelope,
+  SAFE_ERROR,
   isHref,
   isResponseEnvelope,
+  isSafeError,
+  markSafeError,
   redirect,
   reload,
   respond
@@ -17,6 +20,7 @@ import {
   SINGLE_FLIGHT_HEADER,
   decodeErrorHeaderValue,
   decodeResponse,
+  decodeResponsePayload,
   deserializeStream,
   deserializeString,
   encodeErrorHeaderValue,
@@ -36,14 +40,21 @@ import {
 } from "../../src/server-functions/client";
 import {
   GET as serverGET,
+  GENERIC_SERVER_ERROR_MESSAGE,
   configureServerFunctionsServer,
+  createNoJSHandler,
   createServerReference,
+  decodeFlashCookie,
+  encodeFlashCookie,
+  foldSetCookies,
   getServerFunction,
-  getServerFunctionMeta,
+  getServerFunctionInvocation,
   handleServerFunctionRequest,
   registerServerFunction,
-  registerServerReference
+  registerServerReference,
+  sanitizeServerError
 } from "../../src/server-functions/server";
+import { FLASH_COOKIE, clearFlashCookie, hasFlashCookie } from "../../src/server-functions/shared";
 import { RequestContext } from "../../src/server";
 
 // Minimal AsyncLocalStorage stand-in so request-event scoping works without
@@ -268,7 +279,7 @@ describe("registration", () => {
   it("runs server-side callables under a derived request event", async () => {
     const seen = {};
     const fn = async () => {
-      seen.meta = getServerFunctionMeta();
+      seen.invocation = getServerFunctionInvocation();
       return "ok";
     };
     const reference = registerServerReference("meta#0", fn);
@@ -277,7 +288,57 @@ describe("registration", () => {
     const event = { request: new Request("http://localhost/"), locals: {} };
     const result = await globalThis[RequestContext].run(event, () => callable());
     expect(result).toBe("ok");
-    expect(seen.meta).toEqual({ id: "meta#0" });
+    expect(seen.invocation).toEqual({ id: "meta#0" });
+  });
+
+  it("keeps invocation state off locals and off the outer event", async () => {
+    const fn = async () => getServerFunctionInvocation();
+    const callable = createServerReference(registerServerReference("inv#0", fn));
+
+    const event = { request: new Request("http://localhost/"), locals: {} };
+    const seen = {};
+    const result = await globalThis[RequestContext].run(event, () => {
+      const p = callable();
+      // The call has returned to the outer scope: the ambient event is the
+      // original one again, and it never carried an invocation.
+      seen.afterCall = getServerFunctionInvocation();
+      return p;
+    });
+    expect(result).toEqual({ id: "inv#0" });
+    expect(seen.afterCall).toBeUndefined();
+    // locals is user/integration space — the invocation never lands there,
+    // under the new name or the old one.
+    expect(Object.keys(event.locals)).toEqual([]);
+    expect(event.locals.serverFunctionInvocation).toBeUndefined();
+    expect(event.locals.serverFunctionMeta).toBeUndefined();
+  });
+
+  it("scopes nested direct calls to their own invocation and restores the outer one", async () => {
+    const seen = [];
+    const inner = createServerReference(
+      registerServerReference("inv#inner", async () => {
+        seen.push(["inner", getServerFunctionInvocation()]);
+      })
+    );
+    const outer = createServerReference(
+      registerServerReference("inv#outer", async () => {
+        seen.push(["outer:before", getServerFunctionInvocation()]);
+        const p = inner();
+        // Synchronously after the nested call: the outer call's own
+        // invocation is back in scope, not the inner one's.
+        seen.push(["outer:after", getServerFunctionInvocation()]);
+        await p;
+      })
+    );
+
+    const event = { request: new Request("http://localhost/"), locals: {} };
+    await globalThis[RequestContext].run(event, () => outer());
+    expect(seen).toEqual([
+      ["outer:before", { id: "inv#outer" }],
+      ["inner", { id: "inv#inner" }],
+      ["outer:after", { id: "inv#outer" }]
+    ]);
+    expect(Object.keys(event.locals)).toEqual([]);
   });
 
   it("rejects server-side callables outside of a request", () => {
@@ -403,7 +464,9 @@ describe("handler", () => {
     }
   });
 
-  it("propagates thrown errors to the client", async () => {
+  it("propagates thrown errors to the client (dev: full message)", async () => {
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = "development";
     registerServerFunction("boom-0", async () => {
       throw new Error("kaboom");
     });
@@ -412,10 +475,23 @@ describe("handler", () => {
       await expect(createClientReference("boom-0")()).rejects.toThrow("kaboom");
     } finally {
       restore();
+      process.env.NODE_ENV = prev;
     }
   });
 
   describe("error header encoding", () => {
+    // These assert real error content on the wire — i.e. development
+    // fidelity. Outside development the handler sanitizes plain errors (see
+    // the "production error sanitization" suite), so pin the mode here.
+    let prevNodeEnv;
+    beforeEach(() => {
+      prevNodeEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = "development";
+    });
+    afterEach(() => {
+      process.env.NODE_ENV = prevNodeEnv;
+    });
+
     // Header values are latin1 ByteStrings: without the encoding guard,
     // Headers.set throws on messages with code points above U+00FF and the
     // whole call collapses into a bare 500 (solidjs/solid-start#1874).
@@ -522,16 +598,210 @@ describe("handler", () => {
     });
   });
 
-  it("provides the request event and meta during handling", async () => {
+  describe("production error sanitization", () => {
+    // The handler sanitizes plain thrown values outside development so a
+    // driver/ORM error can't leak its message or own-properties (a failing
+    // query, a connection string) to the client. Intentional error content
+    // travels as a thrown Response/envelope, or an Error branded safe.
+    let prevNodeEnv;
+    beforeEach(() => {
+      prevNodeEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = "production";
+    });
+    afterEach(() => {
+      process.env.NODE_ENV = prevNodeEnv;
+    });
+
+    function errorRequest(id) {
+      return new Request("http://localhost/_server", {
+        method: "POST",
+        headers: {
+          "X-Server-Function-Id": id,
+          "X-Server-Function-Instance": "server-function:test"
+        }
+      });
+    }
+
+    it("replaces a leaking Error's message and own-props with a generic Error", async () => {
+      registerServerFunction("prod-leak-0", async () => {
+        const err = new Error("connect ECONNREFUSED postgres://user:hunter2@10.0.0.5/prod");
+        err.query = "SELECT ssn FROM users WHERE id = 1";
+        err.code = "ECONNREFUSED";
+        throw err;
+      });
+      const response = await dispatch(errorRequest("prod-leak-0"));
+
+      // still flagged as an error on the wire...
+      expect(response.headers.get(ERROR_HEADER)).not.toBeNull();
+      // ...but the header no longer carries the real message
+      expect(decodeErrorHeaderValue(response.headers.get(ERROR_HEADER))).toBe(
+        GENERIC_SERVER_ERROR_MESSAGE
+      );
+      // ...and the serialized body is a generic Error: no message, no own-props
+      const decoded = await decodeResponse(response);
+      expect(decoded).toBeInstanceOf(Error);
+      expect(decoded.message).toBe(GENERIC_SERVER_ERROR_MESSAGE);
+      expect(decoded.message).not.toMatch(/hunter2|ECONNREFUSED|10\.0\.0\.5/);
+      expect(decoded.query).toBeUndefined();
+      expect(decoded.code).toBeUndefined();
+    });
+
+    it("still rejects the client call with an Error (generic content)", async () => {
+      registerServerFunction("prod-leak-client-0", async () => {
+        throw new Error("secret detail");
+      });
+      const restore = connectTransport();
+      try {
+        await expect(createClientReference("prod-leak-client-0")()).rejects.toThrow(
+          GENERIC_SERVER_ERROR_MESSAGE
+        );
+        await expect(createClientReference("prod-leak-client-0")()).rejects.not.toThrow(
+          "secret detail"
+        );
+      } finally {
+        restore();
+      }
+    });
+
+    it("sanitizes thrown non-Error values (strings, objects) too", async () => {
+      registerServerFunction("prod-leak-string-0", async () => {
+        throw "raw secret string";
+      });
+      const response = await dispatch(errorRequest("prod-leak-string-0"));
+      expect(decodeErrorHeaderValue(response.headers.get(ERROR_HEADER))).toBe(
+        GENERIC_SERVER_ERROR_MESSAGE
+      );
+      const decoded = await decodeResponse(response);
+      expect(decoded).toBeInstanceOf(Error);
+      expect(decoded.message).toBe(GENERIC_SERVER_ERROR_MESSAGE);
+    });
+
+    it("escape hatch: a markSafeError'd Error travels intact", async () => {
+      registerServerFunction("prod-safe-0", async () => {
+        const err = new Error("Insufficient funds");
+        err.balance = 10;
+        throw markSafeError(err);
+      });
+      const response = await dispatch(errorRequest("prod-safe-0"));
+
+      expect(decodeErrorHeaderValue(response.headers.get(ERROR_HEADER))).toBe("Insufficient funds");
+      const decoded = await decodeResponse(response);
+      expect(decoded).toBeInstanceOf(Error);
+      expect(decoded.message).toBe("Insufficient funds");
+      // intentional own-property survives...
+      expect(decoded.balance).toBe(10);
+      // ...but the safe brand itself never rides the wire as an own-prop
+      expect(Object.getOwnPropertySymbols(decoded)).not.toContain(SAFE_ERROR);
+      expect(decoded[SAFE_ERROR]).toBeUndefined();
+    });
+
+    it("thrown control-flow Responses are intentional and untouched", async () => {
+      registerServerFunction("prod-redirect-0", async () => {
+        throw redirect("/login");
+      });
+      const response = await dispatch(errorRequest("prod-redirect-0"));
+      // redirect metadata is forwarded verbatim; sanitization never applies
+      expect(response.headers.get("Location")).toBe("/login");
+    });
+
+    it("respond() envelopes thrown as errors keep their value", async () => {
+      registerServerFunction("prod-envelope-0", async () => {
+        throw respond({ reason: "quota" }, { status: 402 });
+      });
+      const response = await dispatch(errorRequest("prod-envelope-0"));
+      expect(response.headers.get(ERROR_HEADER)).not.toBeNull();
+      expect(await decodeResponse(response)).toEqual({ reason: "quota" });
+    });
+
+    it("override seam: wrapInvocation may brand its mapped error to pass through", async () => {
+      registerServerFunction("prod-wrap-0", async () => {
+        throw new Error("raw internal");
+      });
+      // A framework onError-style policy: map the raw error to a curated one
+      // and brand it intentional so core does not sanitize on top.
+      const wrapInvocation = async run => {
+        try {
+          return await run();
+        } catch {
+          throw markSafeError(new Error("Something went wrong (ref 42)"));
+        }
+      };
+      const response = await dispatch(errorRequest("prod-wrap-0"), { wrapInvocation });
+      const decoded = await decodeResponse(response);
+      expect(decoded.message).toBe("Something went wrong (ref 42)");
+    });
+
+    it("override seam: an unbranded mapped error is still sanitized (no leak)", async () => {
+      registerServerFunction("prod-wrap-1", async () => {
+        throw new Error("raw internal");
+      });
+      const wrapInvocation = async run => {
+        try {
+          return await run();
+        } catch {
+          // forgets to brand — core's default still contains it
+          throw new Error("mapped but unbranded");
+        }
+      };
+      const response = await dispatch(errorRequest("prod-wrap-1"), { wrapInvocation });
+      const decoded = await decodeResponse(response);
+      expect(decoded.message).toBe(GENERIC_SERVER_ERROR_MESSAGE);
+    });
+  });
+
+  describe("sanitizeServerError policy", () => {
+    let prevNodeEnv;
+    beforeEach(() => (prevNodeEnv = process.env.NODE_ENV));
+    afterEach(() => (process.env.NODE_ENV = prevNodeEnv));
+
+    it("dev keeps the thrown value verbatim (full fidelity)", () => {
+      process.env.NODE_ENV = "development";
+      const err = new Error("full detail");
+      err.query = "SELECT 1";
+      expect(sanitizeServerError(err)).toBe(err);
+    });
+
+    it("non-development replaces a plain Error with a generic one", () => {
+      process.env.NODE_ENV = "production";
+      const out = sanitizeServerError(new Error("leaky"));
+      expect(out).toBeInstanceOf(Error);
+      expect(out.message).toBe(GENERIC_SERVER_ERROR_MESSAGE);
+    });
+
+    it("fails safe when NODE_ENV is unset (sanitizes)", () => {
+      delete process.env.NODE_ENV;
+      expect(sanitizeServerError(new Error("leaky")).message).toBe(GENERIC_SERVER_ERROR_MESSAGE);
+    });
+
+    it("passes a branded error through in production", () => {
+      process.env.NODE_ENV = "production";
+      const err = markSafeError(new Error("intentional"));
+      expect(isSafeError(err)).toBe(true);
+      expect(sanitizeServerError(err)).toBe(err);
+    });
+
+    it("markSafeError brands without an enumerable own-property", () => {
+      const err = markSafeError(new Error("x"));
+      expect(Object.keys(err)).not.toContain(SAFE_ERROR.toString());
+      expect(Object.getOwnPropertyDescriptor(err, SAFE_ERROR).enumerable).toBe(false);
+    });
+  });
+
+  it("provides the request event and invocation during handling", async () => {
     const seen = {};
     registerServerFunction("meta-1", async () => {
-      seen.meta = getServerFunctionMeta();
+      seen.invocation = getServerFunctionInvocation();
       return null;
     });
-    const restore = connectTransport();
+    const restore = connectTransport({
+      createEvent: request => (seen.event = { request, locals: {} })
+    });
     try {
       await createClientReference("meta-1")();
-      expect(seen.meta).toEqual({ id: "meta-1" });
+      expect(seen.invocation).toEqual({ id: "meta-1" });
+      // The invocation rides a WeakMap keyed by the handler's event, never
+      // its locals bag.
+      expect(Object.keys(seen.event.locals)).toEqual([]);
     } finally {
       restore();
     }
@@ -592,6 +862,71 @@ describe("handler", () => {
     );
     const decoded = await extractBody(response);
     expect(decoded).toBe("inner+wrapped");
+  });
+
+  it("hands transformResult the call's identity (id, parsed args) over either transport", async () => {
+    // The HTTP context mirrors transformDirectResult's: a policy keying
+    // state by the call (deriving a wire address, capturing a prerender
+    // artifact) reads the same id + args over either dispatch path.
+    const contexts = [];
+    const transformResult = (event, result, context) => {
+      contexts.push(context);
+      return result;
+    };
+
+    registerServerFunction("ctx-id-0", async (a, b) => a + b);
+    await dispatch(
+      new Request("http://localhost/_server", {
+        method: "POST",
+        headers: {
+          "X-Server-Function-Id": "ctx-id-0",
+          "X-Server-Function-Instance": "server-function:test",
+          "Content-Type": "application/json",
+          [BODY_FORMAT_HEADER]: BodyFormat.Json
+        },
+        body: JSON.stringify([1, 2])
+      }),
+      { transformResult }
+    );
+
+    serverGET(createServerReference(registerServerReference("ctx-id-1", async n => n * 2)));
+    await dispatch(
+      new Request(`http://localhost/_server?id=ctx-id-1&args=${encodeURIComponent("[7]")}`, {
+        method: "GET",
+        headers: { "X-Server-Function-Instance": "server-function:test" }
+      }),
+      { transformResult }
+    );
+
+    expect(contexts[0].id).toBe("ctx-id-0");
+    expect(contexts[0].args).toEqual([1, 2]);
+    expect(contexts[1].id).toBe("ctx-id-1");
+    expect(contexts[1].args).toEqual([7]);
+  });
+
+  it("hands transformResult the call's identity on the thrown path", async () => {
+    registerServerFunction("ctx-id-2", async () => {
+      throw redirect("/next");
+    });
+    let seen;
+    await dispatch(
+      new Request(`http://localhost/_server?args=${encodeURIComponent("[3]")}`, {
+        method: "POST",
+        headers: {
+          "X-Server-Function-Id": "ctx-id-2",
+          "X-Server-Function-Instance": "server-function:test"
+        }
+      }),
+      {
+        transformResult: (event, result, context) => {
+          seen = context;
+          return result;
+        }
+      }
+    );
+    expect(seen.id).toBe("ctx-id-2");
+    expect(seen.args).toEqual([3]);
+    expect(seen.thrown).toBe(true);
   });
 
   it("applies a configured transformResult when the dispatcher passes no options (#546)", async () => {
@@ -737,6 +1072,188 @@ describe("handler", () => {
     );
     expect(response.status).toBe(302);
     expect(response.headers.get("Location")).toBe("/?flash=value");
+  });
+});
+
+describe("cookie folding", () => {
+  const req = cookie => new Headers(cookie ? { cookie } : {});
+
+  it("passes the request cookies through when nothing was set", () => {
+    expect(foldSetCookies(req("a=1; b=2"), []).get("cookie")).toBe("a=1; b=2");
+  });
+
+  it("adds new cookies and overrides existing ones, later entries winning", () => {
+    const folded = foldSetCookies(req("session=old; keep=1"), [
+      "session=mid; Path=/",
+      "session=new; Path=/; HttpOnly",
+      "added=2; Path=/"
+    ]);
+    expect(folded.get("cookie")).toBe("session=new; keep=1; added=2");
+  });
+
+  it("honors deletions by Max-Age and by a past Expires", () => {
+    const folded = foldSetCookies(req("a=1; b=2; c=3"), [
+      "a=; Max-Age=0; Path=/",
+      "b=; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/"
+    ]);
+    expect(folded.get("cookie")).toBe("c=3");
+  });
+
+  it("drops the header entirely when every cookie is deleted", () => {
+    expect(foldSetCookies(req("a=1"), ["a=; Max-Age=0"]).get("cookie")).toBe(null);
+  });
+
+  it("leaves the input headers untouched", () => {
+    const original = req("a=1");
+    foldSetCookies(original, ["a=2", "b=3"]);
+    expect(original.get("cookie")).toBe("a=1");
+  });
+});
+
+describe("flash cookie", () => {
+  const cookieOf = setCookie => setCookie.slice(0, setCookie.indexOf(";"));
+
+  it("round-trips a returned outcome", () => {
+    const setCookie = encodeFlashCookie("/_server?id=save", "saved", ["note"]);
+    expect(setCookie).toContain("HttpOnly");
+    expect(decodeFlashCookie(cookieOf(setCookie))).toEqual({
+      url: "/_server?id=save",
+      result: "saved",
+      error: undefined,
+      input: ["note"]
+    });
+  });
+
+  it("separates a thrown error from a returned one", () => {
+    const thrown = decodeFlashCookie(
+      cookieOf(encodeFlashCookie("/_server?id=x", new Error("nope"), [], true))
+    );
+    expect(thrown.result).toBeUndefined();
+    expect(thrown.error).toBeInstanceOf(Error);
+    expect(thrown.error.message).toBe("nope");
+
+    const returned = decodeFlashCookie(
+      cookieOf(encodeFlashCookie("/_server?id=x", new Error("nope"), []))
+    );
+    expect(returned.error).toBeUndefined();
+    expect(returned.result).toBeInstanceOf(Error);
+  });
+
+  it("revives FormData and URLSearchParams arguments, dropping files", () => {
+    const form = new FormData();
+    form.append("title", "hello");
+    form.append("upload", new Blob(["x"]), "x.txt");
+    const decoded = decodeFlashCookie(
+      cookieOf(encodeFlashCookie("/_server?id=x", "ok", [form, new URLSearchParams({ page: "2" })]))
+    );
+    expect(decoded.input[0]).toBeInstanceOf(FormData);
+    expect(decoded.input[0].get("title")).toBe("hello");
+    expect(decoded.input[0].get("upload")).toBe(null);
+    expect(decoded.input[1]).toBeInstanceOf(URLSearchParams);
+    expect(decoded.input[1].get("page")).toBe("2");
+  });
+
+  it("detects and clears without decoding", () => {
+    const header = cookieOf(encodeFlashCookie("/_server?id=x", "ok", []));
+    expect(hasFlashCookie(header)).toBe(true);
+    expect(hasFlashCookie("other=1")).toBe(false);
+    expect(hasFlashCookie(null)).toBe(false);
+    expect(clearFlashCookie()).toBe(`${FLASH_COOKIE}=; Max-Age=0; Path=/`);
+  });
+
+  it("survives a malformed cookie instead of taking down the render", () => {
+    const error = jest.spyOn(console, "error").mockImplementation(() => {});
+    expect(decodeFlashCookie(`${FLASH_COOKIE}=not-json`)).toBeUndefined();
+    expect(decodeFlashCookie("unrelated=1")).toBeUndefined();
+    error.mockRestore();
+  });
+});
+
+describe("no-JS form convention", () => {
+  const formPost = (id, init = {}) =>
+    new Request(`http://localhost/_server?id=${id}`, {
+      method: "POST",
+      body: "title=hello",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        referer: "http://localhost/notes",
+        ...init.headers
+      }
+    });
+
+  it("redirects a browser form post back with the outcome flashed", async () => {
+    registerServerFunction("nojs-form", async () => "saved");
+    const response = await handleServerFunctionRequest(formPost("nojs-form"));
+    expect(response.status).toBe(303);
+    expect(response.headers.get("Location")).toBe("http://localhost/notes");
+    const flashed = decodeFlashCookie(response.headers.get("Set-Cookie").split(";")[0]);
+    expect(flashed.result).toBe("saved");
+    expect(flashed.url).toBe("/_server?id=nojs-form");
+  });
+
+  it("falls back to the app root when there is no usable referer", async () => {
+    registerServerFunction("nojs-noref", async () => "saved");
+    const request = new Request("http://localhost/_server?id=nojs-noref", {
+      method: "POST",
+      body: "a=1",
+      headers: { "content-type": "application/x-www-form-urlencoded" }
+    });
+    const response = await handleServerFunctionRequest(request);
+    expect(response.headers.get("Location")).toBe("http://localhost/");
+  });
+
+  it("leaves direct HTTP calls on the plain response", async () => {
+    registerServerFunction("nojs-direct", async () => "value");
+    const response = await handleServerFunctionRequest(
+      new Request("http://localhost/_server?id=nojs-direct", { method: "POST", body: "" })
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Location")).toBe(null);
+    expect(await decodeResponse(response)).toBe("value");
+  });
+
+  it("honors a thrown redirect's Location and status, and does not flash it", async () => {
+    registerServerFunction("nojs-redirect", async () => {
+      throw redirect("/notes/1", 301);
+    });
+    const response = await handleServerFunctionRequest(formPost("nojs-redirect"));
+    expect(response.status).toBe(301);
+    expect(response.headers.get("Location")).toBe("http://localhost/notes/1");
+    expect(response.headers.get("Set-Cookie")).toBe(null);
+  });
+
+  it("falls back to the configured base when there is no usable referer", async () => {
+    const response = createNoJSHandler({ base: "/app" })(
+      "saved",
+      new Request("http://localhost/_server?id=nojs-base", {
+        method: "POST",
+        body: "a=1",
+        headers: { "content-type": "application/x-www-form-urlencoded" }
+      }),
+      []
+    );
+    expect(response.headers.get("Location")).toBe("http://localhost/app");
+  });
+
+  it("applies to every instanceless call once configured server-wide", async () => {
+    registerServerFunction("nojs-configured", async () => "saved");
+    configureServerFunctionsServer({ handleNoJS: createNoJSHandler() });
+    try {
+      const response = await handleServerFunctionRequest(
+        new Request("http://localhost/_server?id=nojs-configured", { method: "POST", body: "" })
+      );
+      expect(response.status).toBe(303);
+    } finally {
+      configureServerFunctionsServer({ handleNoJS: null });
+    }
+  });
+
+  it("null opts out of the convention entirely", async () => {
+    registerServerFunction("nojs-optout", async () => "saved");
+    configureServerFunctionsServer({ handleNoJS: null });
+    const response = await handleServerFunctionRequest(formPost("nojs-optout"));
+    expect(response.status).toBe(200);
+    expect(await decodeResponse(response)).toBe("saved");
   });
 });
 
@@ -886,14 +1403,132 @@ describe("single-flight", () => {
   });
 
   it("never collects for plain thrown errors", async () => {
+    // Pinned to development so the message assertion reads real content; the
+    // point of the test is that the flight hook is skipped and the response
+    // is still error-flagged. (Sanitization is covered in "production error
+    // sanitization".)
+    const prev = process.env.NODE_ENV;
+    process.env.NODE_ENV = "development";
     registerServerFunction("sf-error-0", async () => {
       throw new Error("kaboom");
     });
     const hook = jest.fn(() => ({ data: true }));
-    const response = await dispatch(flightRequest("sf-error-0"), { collectFlightData: hook });
+    try {
+      const response = await dispatch(flightRequest("sf-error-0"), { collectFlightData: hook });
+      expect(hook).not.toHaveBeenCalled();
+      expect(response.headers.has(SINGLE_FLIGHT_HEADER)).toBe(false);
+      expect(response.headers.get("X-Server-Function-Error")).toBe("kaboom");
+    } finally {
+      process.env.NODE_ENV = prev;
+    }
+  });
+
+  it("never collects for raw body-carrying Response values (verbatim payload)", async () => {
+    registerServerFunction(
+      "sf-raw-0",
+      async () => new Response(JSON.stringify({ raw: true }), { status: 201 })
+    );
+    const hook = jest.fn(() => ({ data: true }));
+    const response = await dispatch(flightRequest("sf-raw-0"), { collectFlightData: hook });
     expect(hook).not.toHaveBeenCalled();
     expect(response.headers.has(SINGLE_FLIGHT_HEADER)).toBe(false);
-    expect(response.headers.get("X-Server-Function-Error")).toBe("kaboom");
+    expect(response.status).toBe(201);
+  });
+
+  describe("outcome pre-digestion", () => {
+    async function digest(id, fn, requestHeaders, options) {
+      registerServerFunction(id, fn);
+      const seen = {};
+      await dispatch(flightRequest(id, requestHeaders), {
+        ...options,
+        collectFlightData: (event, outcome) => {
+          seen.outcome = outcome;
+          return undefined;
+        }
+      });
+      return seen.outcome;
+    }
+
+    it("targets the referring page for plain results", async () => {
+      const outcome = await digest("sf-digest-0", async () => "ok", {
+        referer: "http://localhost/notes?tab=all"
+      });
+      expect(outcome.targetUrl).toBe("http://localhost/notes?tab=all");
+      expect(outcome.revalidateKeys).toBeUndefined();
+    });
+
+    it("targets the redirect Location, resolved against the request URL", async () => {
+      const outcome = await digest(
+        "sf-digest-1",
+        async () => {
+          throw redirect("/dashboard", { revalidate: ["notes", "session"] });
+        },
+        { referer: "http://localhost/notes" }
+      );
+      expect(outcome.targetUrl).toBe("http://localhost/dashboard");
+      expect(outcome.revalidateKeys).toEqual(["notes", "session"]);
+    });
+
+    it("has no target without a referer, with a garbage referer, or off-origin", async () => {
+      expect((await digest("sf-digest-2", async () => "ok")).targetUrl).toBeUndefined();
+      expect(
+        (await digest("sf-digest-3", async () => "ok", { referer: "not a url" })).targetUrl
+      ).toBeUndefined();
+      const offOrigin = await digest(
+        "sf-digest-4",
+        async () => {
+          throw redirect("https://elsewhere.example/login");
+        },
+        { referer: "http://localhost/notes" }
+      );
+      expect(offOrigin.targetUrl).toBeUndefined();
+    });
+
+    it("folds the event's and the outcome's cookies into foldedHeaders, outcome winning", async () => {
+      const outcome = await digest(
+        "sf-digest-5",
+        async () => {
+          throw redirect("/notes", {
+            headers: { "Set-Cookie": "session=outcome" }
+          });
+        },
+        { referer: "http://localhost/notes", cookie: "session=old; theme=dark" },
+        {
+          createEvent: request => ({
+            request,
+            locals: {},
+            response: { headers: new Headers({ "Set-Cookie": "session=event" }) }
+          })
+        }
+      );
+      expect(outcome.foldedHeaders.get("cookie")).toBe("session=outcome; theme=dark");
+      // the original request is untouched
+      expect(outcome.request.headers.get("cookie")).toBe("session=old; theme=dark");
+    });
+  });
+
+  describe("decodeResponsePayload", () => {
+    it("splits the single-flight envelope for manually opted-in callers", async () => {
+      registerServerFunction("sf-payload-0", async () => "mutated");
+      const folded = await dispatch(flightRequest("sf-payload-0"), {
+        collectFlightData: () => ({ "/notes": ["fresh"] })
+      });
+      expect(await decodeResponsePayload(folded)).toEqual({
+        value: "mutated",
+        flightData: { "/notes": ["fresh"] }
+      });
+
+      const plain = await dispatch(flightRequest("sf-payload-0"), {
+        collectFlightData: () => undefined
+      });
+      expect(await decodeResponsePayload(plain)).toEqual({ value: "mutated" });
+    });
+
+    it("treats body-less responses as undefined values", async () => {
+      expect(await decodeResponsePayload(new Response(null, { status: 302 }))).toEqual({
+        value: undefined
+      });
+    });
   });
 
   it("registers through configureServerFunctionsServer with per-handler override", async () => {

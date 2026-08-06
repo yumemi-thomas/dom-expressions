@@ -1,5 +1,53 @@
 # @dom-expressions/compiler
 
+## 0.50.0-next.37
+
+### Patch Changes
+
+- 6c6e2c7: Directive DCE removes an import whose surviving specifiers are all type-only. Pruning the last value specifier out of a mixed import left `import { type Session } from "./server-module"` behind — no runtime binding, but still a module load of server code in the client bundle, exactly the leak the shake guards against. The whole-declaration decision now counts value specifiers (default and namespace specifiers count; declaration-level `import type` counts none), mirroring the Babel implementation's fix in solid-start #2273. Imports the shake never touched stay untouched, and a mixed import keeping a live value specifier survives with its type specifiers intact.
+
+## 0.50.0-next.36
+
+## 0.50.0-next.35
+
+### Patch Changes
+
+- 851ef22: Fix hydration id drift from asymmetric condition memos (#2959)
+
+  Two positions emitted a condition memo on one generate but not the other,
+  so the client consumed hydration ids the server never allocated and every
+  id after the conditional drifted (unclaimed `<For>` rows, mismatched
+  serialized async lookups):
+  - Element spread conditional attributes: the dom generate memo-wrapped
+    `{...spread} attr={cond ? a : b}` getters while ssr emitted the bare
+    expression. The memo is now dropped on the dom side — attribute values
+    are primitives and the spread assign pass already dedupes writes against
+    previous values, so the memo only added per-read churn. The universal
+    generate keeps its memo: no hydration ids exist there and
+    custom-renderer prop values can be arbitrarily expensive.
+  - Component conditional props: the dom generate memo-wrapped
+    `<Comp prop={cond ? a : b} />` getters while ssr emitted the bare
+    expression. The memo is now emitted on the ssr side too — the server
+    sync memo allocates an owner id exactly like the client's, and the wrap
+    keeps its truthiness insulation (prop values can be expensive). Matches
+    the children-conditional wrap, which was already symmetric.
+
+  Both fixes land identically in the Babel plugin and the Rust compiler.
+
+- 7b8b417: Extend the `lazy()` module-URL pass (`transformLazy`) to also recognize `clientOnly(() => import("specifier"))` calls where `clientOnly` is a named import from `@solidjs/web`, so the server half can emit early modulepreload hints for browser-only modules. Because `clientOnly` takes an options bag in second position, the placeholder is appended as a third argument, padding the options slot with `void 0` when the call site omits it. Same placeholder format and plugin resolution contract as `lazy()`; already-annotated calls and other import sources are left untouched.
+
+## 0.50.0-next.34
+
+## 0.50.0-next.33
+
+## 0.50.0-next.32
+
+### Patch Changes
+
+- 7c7aa08: Fix exponential compile time in deeply nested component trees. A file whose JSX nested function scopes 14 levels deep took 3.6 seconds to compile, 16 levels took 32 seconds, and anything deeper effectively hung the build — the cost grew as 3^depth in nesting, so a single deep component tree could stall a whole project's build.
+
+  The deferred JSX pass handed every nested function expression back to the transform's own traversal, which re-entered statement processing for that body. Because `process_statements` runs the deferred lowerer twice per statement, each level processed its children three times. Bodies are now marked as they finish and skipped when the deferred pass meets them again, which visits every body exactly once and makes the transform linear: depth 14 goes from 3.6s to 0.1ms, and depth 800 compiles in 2.4ms. Generated output is unchanged in all three modes (`dom`, `ssr`, `universal`).
+
 ## 0.50.0-next.31
 
 ### Patch Changes

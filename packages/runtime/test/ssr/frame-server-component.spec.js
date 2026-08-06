@@ -327,12 +327,14 @@ describe("renderServerComponent (slot emission)", () => {
     expect(after[1].textContent).toBe("a");
   });
 
-  it("documented limitation: a server element wrapping each occurrence defeats reorder identity", async () => {
-    // Keyed occurrences must be SIBLINGS for reorder to follow $key — ranges
-    // relocate within one parent only. Wrapping each call site in its own
-    // server element puts ranges in different parents: content still
-    // converges, but client state does not follow the entity. Let the CLIENT
-    // own the per-item wrapper instead (the slot callback returns it).
+  it("reorder identity holds even with a server element wrapping each occurrence", async () => {
+    // Occurrence ids are unique within a frame's content, and the morph
+    // indexes the frame's slot ranges frame-WIDE — so a keyed occurrence
+    // relocates with its client interior even when each call site sits in
+    // its own server wrapper element (ranges in different parents). This
+    // was a documented limitation of sibling-scoped range matching; it also
+    // silently emptied a keyed LIST's surviving items when a deletion
+    // shifted every range into a different <li>.
     const makeComp = order => props =>
       r.ssr`<section>${order.map(
         id => r.ssr`<div class="row">${props.comment({ $key: id, label: id })}</div>`
@@ -361,9 +363,10 @@ describe("renderServerComponent (slot emission)", () => {
     );
     // Content converges…
     expect([...boundary.querySelectorAll("b")].map(b => b.textContent)).toEqual(["b", "a"]);
-    // …but entity "a"'s node did not travel: its state is gone.
+    // …and entity "a"'s node traveled with its range: state intact.
     const aNode = [...boundary.querySelectorAll("b")].find(b => b.textContent === "a");
-    expect(aNode.dataset.mine).toBeUndefined();
+    expect(aNode).toBe(first);
+    expect(aNode.dataset.mine).toBe("yes");
   });
 
   it("a changed primitive arg on the same key re-calls the occurrence", async () => {
@@ -561,23 +564,69 @@ describe("server-component hydration reference", () => {
       onDone: () => {
         const payload = scripts.join(";");
         // The reference, not the function: resolution is invocation-time
-        // through the bootstrap's memoized placeholder.
-        expect(payload).toContain('self._$SC.r("hn/story-0")');
+        // through the registry's memoized placeholder. It carries the
+        // call's address so the client can register which call the
+        // document is showing (an argless call's address is the id).
+        // The script's FIRST reference self-bootstraps the registry — the
+        // document shell needs no `_$SC` script of its own, so nothing sits
+        // ahead of the authored <head> elements to drift positional
+        // hydration claims.
+        expect(payload).toContain("(self._$SC||(self._$SC={");
+        expect(payload).toContain('.r("hn/story-0","hn/story-0")');
         expect(payload).not.toContain("createDocumentSlotProps");
-        // The bootstrap evaluates and memoizes stable identities.
+        // The payload evaluates with only the document's own preludes (the
+        // cross-reference header and `_$HY`) — no prior `_$SC` bootstrap —
+        // and memoizes stable identities.
+        const { getLocalHeaderScript } = require("../../src/serializer");
+        globalThis._$HY = { r: {} };
+        // eslint-disable-next-line no-eval
+        (0, eval)(getLocalHeaderScript() + payload);
+        const first = globalThis._$SC.r("hn/story-0", "hn/story-0");
+        expect(typeof first).toBe("function");
+        expect(globalThis._$SC.r("hn/story-0")).toBe(first);
+        // The address -> id record is kept for the client to register with
+        // the frame transport once it installs.
+        expect(globalThis._$SC.a["hn/story-0"]).toBe("hn/story-0");
+        // The registry is first-definition-wins: a shell that still emits
+        // the statement-form bootstrap (older integrations) must not wipe
+        // the records filed since.
         // eslint-disable-next-line no-eval
         (0, eval)(SERVER_COMPONENT_BOOTSTRAP);
-        const first = globalThis._$SC.r("hn/story-0");
-        expect(typeof first).toBe("function");
+        expect(globalThis._$SC.a["hn/story-0"]).toBe("hn/story-0");
         expect(globalThis._$SC.r("hn/story-0")).toBe(first);
         // The placeholder delegates to the installed implementation.
         globalThis._$SC.impl = (id, props) => `${id}:${props.x}`;
         expect(first({ x: 1 })).toBe("hn/story-0:1");
         delete globalThis._$SC;
+        delete globalThis._$HY;
         done();
       }
     });
     serializer.write("0", Inline);
+    serializer.flush();
+  });
+
+  it("only the first reference in a script carries the registry", done => {
+    const { frameTransformDirectResult, ServerComponentPlugin } = require("../../src/frame-sink");
+    const { createHydrationSerializer } = require("../../src/serializer");
+
+    const A = frameTransformDirectResult(() => r.ssr`<b>a</b>`, { id: "sc/a" });
+    const B = frameTransformDirectResult(() => r.ssr`<b>b</b>`, { id: "sc/b" });
+    const scripts = [];
+    const serializer = createHydrationSerializer({
+      plugins: [ServerComponentPlugin],
+      onData: s => scripts.push(s),
+      onDone: () => {
+        const payload = scripts.join(";");
+        expect(payload).toContain('.r("sc/a","sc/a")');
+        expect(payload).toContain('.r("sc/b","sc/b")');
+        // One bootstrap serves both: later references are bare registry
+        // reads (the definition is ~150 bytes; the reads are 9).
+        expect(payload.match(/self\._\$SC=\{/g)).toHaveLength(1);
+        done();
+      }
+    });
+    serializer.write("0", { a: A, b: B });
     serializer.flush();
   });
 });
@@ -630,6 +679,10 @@ describe("document-mode occlusion flip (case 3)", () => {
         expect(html).toContain('"sc:slot:occ-0:comment#c2"');
         expect(html).toContain('cid:"c2"');
         expect(html).toContain('title:"visible-text"');
+        // One record shape (A5): the USED region rides in the record too, as
+        // its address ref — same shape a stream would send. The ref is
+        // addressing only; the content stays page markup.
+        expect(html).toContain('$frame:"occ-0.comment#c2.children"');
         // Region content renders inline once; the coinciding scalar arg is the
         // second occurrence.
         expect(html.split("visible-text").length).toBe(3);
@@ -665,8 +718,32 @@ describe("document-mode t=0 arming: primitive args always ship", () => {
         expect(html).toContain("_hk=sc-hk-0-comment#c1-");
         expect(html).toContain('"sc:slot:hk-0:comment#c1"');
         expect(html).toContain('cid:"c1"');
+        // One record shape (A5): the used region's address ref rides along.
+        expect(html).toContain('$frame:"hk-0.comment#c1.children"');
         // body-text is region CONTENT (not an arg), so it ships once as markup.
         expect(html.split("body-text").length).toBe(2);
+        done();
+      }
+    });
+  });
+});
+
+describe("document-mode t=0 records: every invoked occurrence gets one (A5)", () => {
+  it("an argless render-prop call still emits its slot record", done => {
+    const { frameTransformDirectResult, ServerComponentPlugin } = require("../../src/frame-sink");
+    // The stream face emits a slot chunk for every invocation, args or not —
+    // that is what lets the consumer classify "render-prop call" vs
+    // "direct-insert position" without guessing. The document face must
+    // match: an argless call's record is `{}`, not absence.
+    const serverComponent = props => r.ssr`<article>${[props.badge({ $key: "b1" })]}</article>`;
+    const Inline = frameTransformDirectResult(serverComponent, { id: "argless-0" });
+    const clientProps = { badge: () => r.ssr`<span class="badge">new</span>` };
+    const chunks = [];
+    r.renderToStream(() => Inline(clientProps), { plugins: [ServerComponentPlugin] }).pipe({
+      write: c => chunks.push(c),
+      end: () => {
+        const html = chunks.join("");
+        expect(html).toContain('"sc:slot:argless-0:badge#b1"');
         done();
       }
     });

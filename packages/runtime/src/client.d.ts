@@ -109,9 +109,9 @@ export function style(
 export function getOwner(): unknown;
 export function mergeProps(...sources: unknown[]): unknown;
 export function dynamicProperty(props: unknown, key: string): unknown;
-export function applyRef(
-  r: ((element: Element) => void) | ((element: Element) => void)[],
-  element: Element
+export function applyRef<T extends Element = Element>(
+  r: ((element: NoInfer<T>) => void) | ((element: NoInfer<T>) => void)[],
+  element: T
 ): void;
 export function ref(
   fn: () => ((element: Element) => void) | ((element: Element) => void)[],
@@ -127,8 +127,30 @@ export function getHydrationKey(): string | undefined;
 export function getNextElement(template?: () => Element): Element;
 export function getNextMatch(start: Node, elementName: string): Element;
 export function getNextMarker(start: Node): [Node, Array<Node>];
+/** @deprecated Use `useHead` — removed before `0.50.0` stable. */
 export function useAssets(fn: () => JSX.Element): void;
+/** @deprecated Use `useHead` — removed before `0.50.0` stable. */
 export function getAssets(): string;
+/**
+ * A head tag descriptor. Props values may be getters (reactive on the
+ * client); `children` is the text body. `key` overrides the built-in dedupe
+ * identity (`title` is a hard singleton that `key` cannot fork).
+ */
+export type HeadTag = {
+  tag: "title" | "meta" | "link" | "style" | "script" | "base";
+  props: Record<string, any>;
+  key?: string | (() => string);
+};
+/**
+ * Registers head tags with the ambient head registry under the current
+ * owner. An array is a group — one replacement set; a function is a
+ * reactive group whose membership is tracked and re-read on change.
+ * Resolution is last-committed group per identity (reactive updates keep
+ * the registration's original commit position); disposal restores the
+ * previous winner. During hydration the server-flushed head state stays
+ * authoritative until hydration completes. See docs/head-management-rfc.md.
+ */
+export function useHead(tag: HeadTag | HeadTag[] | (() => HeadTag | HeadTag[])): void;
 export type AssetDescriptor =
   | { type: "style"; href: string; attrs?: Record<string, string> }
   | { type: "inline-style"; id: string; content?: string; attrs?: Record<string, string> }
@@ -148,6 +170,21 @@ export function generateHydrationScript(options?: {
   eventNames?: string[];
 }): string;
 export function Assets(props: { children?: JSX.Element }): JSX.Element;
+/**
+ * See the server entry's `ResponseStub` — the shape of the mutable response
+ * head integrations expose as `event.response` via module augmentation.
+ */
+export interface ResponseStub {
+  status?: number;
+  statusText?: string;
+  headers: Headers;
+  /**
+   * Set by the integration once the response head has been derived/sent
+   * from this stub (status/headers can no longer change); consumers must
+   * treat later writes and cleanup-time retractions as no-ops.
+   */
+  committed?: boolean;
+}
 export interface RequestEvent {
   request: Request;
   locals: Record<string | number | symbol, any>;

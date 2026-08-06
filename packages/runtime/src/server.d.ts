@@ -66,6 +66,17 @@ export function renderToString<T>(
     plugins?: SerializerPlugin[];
     manifest?: AssetManifest | AssetResolver | AssetResolverFn;
     onError?: (err: any) => void;
+    /**
+     * Embedded-render contract for hosts that own the document. When the
+     * render output contains no `</head>`, everything head-bound (resolved
+     * `useHead` winners, eager resources, tracked asset links, inline
+     * styles) is delivered here as one HTML string — prelude (charset/base)
+     * first — for the host to splice into its own `<head>` template, instead
+     * of being dropped. Called synchronously before `renderToString`
+     * returns; not called when the output has a `</head>` (splicing is
+     * automatic then).
+     */
+    onHead?: (head: string) => void;
   }
 ): string;
 /** @deprecated use renderToStream which also returns a promise */
@@ -92,11 +103,33 @@ export function renderToStream<T>(
     onCompleteShell?: (info: { write: (v: string) => void }) => void;
     onCompleteAll?: (info: { write: (v: string) => void }) => void;
     onError?: (err: any) => void;
+    /**
+     * Embedded-render contract for hosts that own the document. When the
+     * shell contains no `</head>`, everything head-bound at first flush
+     * (resolved `useHead` winners, eager resources, tracked asset links,
+     * inline styles) is delivered here as one HTML string — prelude first —
+     * before the shell chunk is emitted, so the host can write its own
+     * `<head>` ahead of piping the stream. Post-shell head updates flow
+     * through the stream itself and apply in the browser. Not called when
+     * the shell has a `</head>` (splicing is automatic then).
+     */
+    onHead?: (head: string) => void;
   }
 ): {
   then: (fn: (html: string) => void) => void;
   pipe: (writable: { write: (v: string) => void; end: () => void }) => void;
   pipeTo: (writable: WritableStream) => Promise<void>;
+  /**
+   * Lazy `ReadableStream<Uint8Array>` view of the render — hand it straight
+   * to `new Response(stream.readable)`. First access starts the render
+   * piping through an internal `TransformStream` (chunks are UTF-8 encoded
+   * bytes, the same as `pipeTo` writes) and the stream is cached, so
+   * repeated access returns the same instance. Like `pipe`/`pipeTo`, this
+   * consumes the render: use exactly one of the three — mixing distinct
+   * consumers (`readable` after `pipe`/`pipeTo`, or vice versa) throws an
+   * error naming the conflict.
+   */
+  readonly readable: ReadableStream<Uint8Array>;
 };
 
 export function HydrationScript(props: { nonce?: string; eventNames?: string[] }): JSX.Element;
@@ -120,8 +153,38 @@ export function applyRef(
   r: ((element: any) => void) | ((element: any) => void)[],
   element: any
 ): void;
+/** @deprecated Use `useHead` — removed before `0.50.0` stable. */
 export function useAssets(fn: () => JSX.Element): void;
+/**
+ * @deprecated Use the `onHead` render option — removed before `0.50.0`
+ * stable. Reads ambient render state, so it is unsafe across concurrent
+ * renders; `onHead` is closure-bound to its render and also carries
+ * `useHead` output, which this does not.
+ */
 export function getAssets(): string;
+/**
+ * A head tag descriptor. Props values may be getters (evaluated lazily on
+ * the server — at the owning flush boundary — and reactively on the client);
+ * `children` is the text body (title text, inline style/script content).
+ * `key` overrides the built-in dedupe identity (`title` is a hard singleton
+ * that `key` cannot fork).
+ */
+export type HeadTag = {
+  tag: "title" | "meta" | "link" | "style" | "script" | "base";
+  props: Record<string, any>;
+  key?: string | (() => string);
+};
+/**
+ * Registers head tags with the render's head registry. An array is a group —
+ * one replacement set; a single tag is a group of one; a function is a
+ * reactive group whose membership resolves at the owning flush boundary
+ * (resource tags inside it emit at that flush rather than eagerly).
+ * Replaceable tags (title/meta/canonical/…) resolve by last-committed group
+ * and stream as patches with their suspense boundary's reveal; resource tags
+ * (preload and friends, stylesheets, `script[src]`) emit eagerly and dedupe
+ * by identity. See docs/head-management-rfc.md.
+ */
+export function useHead(tag: HeadTag | HeadTag[] | (() => HeadTag | HeadTag[])): void;
 export function getHydrationKey(): string | undefined;
 export function effect<T>(fn: (prev?: T) => T, effect: (value: T, prev?: T) => void): void;
 export function memo<T>(fn: () => T, equal: boolean): () => T;
@@ -141,9 +204,36 @@ export function generateHydrationScript(options?: {
  */
 export declare const RequestContext: unique symbol;
 /**
+ * The mutable response head an integration's handler exposes on the request
+ * event as `event.response`: status/statusText/headers it will apply when
+ * sending the response. A scaffold, not a `Response` — application code
+ * (e.g. JSX response components) writes to it during render, and the
+ * handler reads it when the head goes out. Core does not declare the
+ * `response` property on `RequestEvent` itself: integrations that provide
+ * one declare it through module augmentation (as `@solidjs/router` does),
+ * and this type names the shape they agree on. Core's server-function
+ * handler reads its `Set-Cookie` headers when folding single-flight
+ * cookies but never requires it.
+ */
+export interface ResponseStub {
+  status?: number;
+  statusText?: string;
+  headers: Headers;
+  /**
+   * Set by the integration once the response head has been derived/sent
+   * from this stub — status and headers can no longer change. Consumers
+   * that write response metadata during render (e.g. JSX response
+   * components) must treat later status/header writes and cleanup-time
+   * retractions as no-ops.
+   */
+  committed?: boolean;
+}
+
+/**
  * The per-request context available on the server: the incoming `Request`
  * and a `locals` bag integrations and middleware can hang state on.
- * Frameworks typically extend this shape with richer fields.
+ * Frameworks typically extend this shape with richer fields (e.g. a
+ * `response` head — see `ResponseStub`).
  */
 export interface RequestEvent {
   request: Request;
@@ -156,6 +246,77 @@ export interface RequestEvent {
  * Read it above `await` boundaries in partially-polyfilled environments.
  */
 export function getRequestEvent(): RequestEvent | undefined;
+
+/** A fresh, uncommitted response head. */
+export function createResponseStub(): ResponseStub;
+
+/**
+ * The canonical request event for HTTP handlers: the incoming `Request`, a
+ * `locals` bag, and a `response` head stub the render writes to. `init`
+ * spreads over the defaults so frameworks can extend the shape.
+ */
+export function createRequestEvent<T extends object = {}>(
+  request: Request,
+  init?: T
+): RequestEvent & { response: ResponseStub } & T;
+
+/**
+ * The status an outgoing redirect should use for a response head carrying
+ * a `Location`: the stub's own status when it is a redirect status, 302
+ * otherwise.
+ */
+export function getExpectedRedirectStatus(response: ResponseStub): number;
+
+export interface SSRResponseOptions {
+  /** Base head; the stub's status/headers win over it. */
+  responseInit?: ResponseInit;
+  /** Nonce carried by the post-flush `<script>` redirect fallback. */
+  nonce?: string;
+  /** Rewrites each outgoing HTML chunk (entry script injection, ...). */
+  transformChunk?: (chunk: string) => string;
+}
+
+/**
+ * Derives the outgoing `Response` for an SSR render result, running the
+ * response-head lifecycle against `event.response`: commit at shell flush,
+ * pre-flush `Location` becomes a real redirect, post-flush `Location`
+ * appends a client-side script redirect before the stream closes.
+ * Synchronous for string results; resolves at shell flush for stream
+ * results.
+ */
+export function createSSRResponse(
+  result: string,
+  event: RequestEvent | undefined,
+  options?: SSRResponseOptions
+): Response;
+export function createSSRResponse(
+  result: { pipe(writable: { write: (v: string) => void; end: () => void }): void },
+  event: RequestEvent | undefined,
+  options?: SSRResponseOptions
+): Promise<Response>;
+
+/**
+ * Fetch-style middleware: return a `Response` to answer the request, or
+ * call `next()` (optionally with a substitute `Request`) to advance the
+ * chain and observe/replace the eventual response.
+ */
+export type FetchMiddleware = (
+  request: Request,
+  next: (request?: Request) => Promise<Response>
+) => Response | Promise<Response>;
+
+/**
+ * Composes fetch-style middleware into one function of the same shape;
+ * the terminal `next` dispatches to the actual handler. Runs in whatever
+ * scope the caller established (`provideRequestEvent`), so
+ * `getRequestEvent()` works exactly as in application code.
+ */
+export function composeMiddleware(
+  middlewares: FetchMiddleware[]
+): (
+  request: Request,
+  next: (request?: Request) => Response | Promise<Response>
+) => Promise<Response>;
 
 export function Assets(props: { children?: JSX.Element }): JSX.Element;
 export function untrack<T>(fn: () => T): T;

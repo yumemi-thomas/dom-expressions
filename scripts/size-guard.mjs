@@ -31,7 +31,19 @@ const SCENARIOS = {
     "{ render, template, insert, delegateEvents, className, style, setAttribute, addEvent, spread }",
     4480
   ],
-  "client: full surface": ["*", 7950],
+  // Ceiling history: guarded 7950 at landing; 7958 after the boundary-driven
+  // reveal round (+60: the revealed fragment's parent on the _$HY.fe hook);
+  // 9749 after useHead landed (+1791: the streaming-correct head manager —
+  // RFC stage 1's client half: registry, dedupe/diff, hydration adoption).
+  // Deliberate feature weight both times — and the compiled-JSX core scenario
+  // above stayed byte-stable, so apps using neither pay 0 — re-guarded at
+  // 9950. Ratcheted to actual+20 (9749 measured): headroom is where slippage
+  // hides, so every future addition re-argues its bytes here. Then +12 net
+  // for the head identity/grouping round (reactive group membership,
+  // media-qualified meta identity, replaceable icons — initially +95, shaved
+  // back by extracting the duplicated attribute-apply loop) — ratcheted to
+  // actual+20 (9761 measured).
+  "client: full surface": ["*", 9781],
   // The whole server-components consumer: store/versioning, host routing,
   // reveal machinery, slot model, morph, transport, codec glue (seroval
   // external, like everything here). Apps not importing it pay 0 — the two
@@ -73,11 +85,53 @@ const SCENARIOS = {
   // them — the root's, for a nested occurrence — so a navigate-away-and-back
   // can't dedupe a re-introduced `{$frame}` region against a stranded t=0
   // record and drop a doubly-nested reply's body) — re-guarded at 6330.
+  // Then +12 for linear document-boot absorption + stripping error stacks from
+  // serialized output outside development — re-guarded at 6350. Then three
+  // deliberate feature rounds: +1545 for single-flight with frames (the
+  // flight response path: outcome-chunk envelope replay through the codec,
+  // ServerComponentPlugin + flightCodec, per-args intrinsic addressing with
+  // frameAddress/stableString realm-stable hashing, boundary retention
+  // across unmounts, keyed-range cross-parent relocation in the morph);
+  // +403 for the call-site handoff (COMPONENT_HANDOFF branding, take/rebind
+  // with forward tracking, frame rebind/rebase); +78 for live slot props
+  // (ctx.onUpdate: args changes update the mounted binding instead of
+  // re-calling); +40 for fetch-metadata stylesheet attribution on reveal —
+  // re-guarded at 8600, then ratcheted to actual+20 (8432 measured after a
+  // consolidation survey found no removable duplication at the current
+  // architecture — the remaining reduction lever is unifying the document
+  // reveal scripts with the frame store's reveal machinery, a designed
+  // round of its own). Then +53 for the end-of-morph displaced-range sweep
+  // (restoreDisplacedRanges: a range whose new position lives inside a
+  // wholesale-inserted parent was orphaned in the index while its occurrence
+  // stayed "mounted" — the notes search-clear empty-slot bug) — re-guarded
+  // at actual+20 (8505 measured). Then +105 for the adopt-time record-race
+  // deferral (solidjs/solid#2968: a recordless occurrence waits one
+  // macrotask + re-drain while document records may still arrive, instead of
+  // misclassifying an invoked slot as argless content) — guarded at 8630
+  // (8610 measured). Then Stage 2 of the principles redesign
+  // (docs/server-components-principles.md): A5 one-record-shape deleted the
+  // consumer's region-threading patches and #547 leniency (−98); the B1
+  // resident-store host subsumed the chunk buffer, retention snapshots, and
+  // sibling seeding (−88); the DR-1 identity split deleted the handoff
+  // protocol outright (COMPONENT_HANDOFF brand/take, forwards map,
+  // route-map, documentComponent seam) in favor of per-function components
+  // + per-address bindings (−216 net of the binding wrapper). Re-guarded at
+  // actual+20 (8208 measured). The #2968 deferral stays until DR-4 (one
+  // reveal owner) makes record delivery ordered by construction. Then +20
+  // for Stage 4, DR-5 identity-first grafting: the end-of-morph
+  // displaced-range sweep (an O(frame) rescan via collectSlots after every
+  // apply with leftovers) is replaced by graft sites recorded at insertion —
+  // the reconcile pushes each wholesale-inserted root, and one walk over
+  // those roots swaps bare pairs for live ranges. Recording-at-insert is
+  // the mechanism: every place a range could be owed is on the list by
+  // construction, so "a live range was detached because its parent didn't
+  // match" stops being a reachable state. Re-guarded at actual+20 (8228
+  // measured).
   "frames: full consumer (runtime + transport + codec glue)": [
     `export * from ${JSON.stringify(FRAME_CLIENT)};
      export * from ${JSON.stringify(FRAME_TRANSPORT)};
      export { createJSONDataTable } from ${JSON.stringify(SERIALIZER)};`,
-    6330
+    8248
   ]
 };
 
@@ -136,9 +190,14 @@ for (const [name, [imp, ceiling]] of Object.entries(SCENARIOS)) {
 }
 await check(
   // 873 -> 945 gz after the live-state deny-list (`open` preservation +
-  // `data-preserve`); still ~360 under micromorph, so the public claim holds.
+  // `data-preserve`); -> 1067 after keyed slot ranges learned to relocate
+  // across parents during a morph (the single-flight round); -> 1097 after
+  // DR-5 identity-first grafting (graft sites recorded at insertion replace
+  // the O(frame) end-of-morph rescan — see the full-consumer history above).
+  // Still ~200 under micromorph, so the public claim holds — margin re-set
+  // to match (actual+20).
   `frames: morph slice (must undercut micromorph's ${MICROMORPH_GZ} gz)`,
   await morphSliceScenario(),
-  MICROMORPH_GZ - 320
+  MICROMORPH_GZ - 184
 );
 process.exit(failed ? 1 : 0);

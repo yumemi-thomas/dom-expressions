@@ -68,6 +68,7 @@ pub(crate) struct AstSsrTransform<'a, 'source> {
     pub(crate) current_this_capture: Option<String>,
     pub(crate) function_parent_stack: std::vec::Vec<crate::shared::transform::FunctionParentKind>,
     pub(crate) next_function_class_method: bool,
+    pub(crate) lowered_function_bodies: std::collections::HashSet<usize>,
     this_index: usize,
     value_index: usize,
     ref_index: usize,
@@ -208,6 +209,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             current_this_capture: None,
             function_parent_stack: std::vec::Vec::new(),
             next_function_class_method: false,
+            lowered_function_bodies: std::collections::HashSet::new(),
             this_index: 0,
             value_index: 0,
             ref_index: 0,
@@ -896,7 +898,17 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                         }
                         self.push_var_scope(VarScopeKind::Collector);
                         let pending_before = self.pending_statements.len();
-                        let value = self.transform_component_expression(&container.expression);
+                        let mut value = self.transform_component_expression(&container.expression);
+                        // Condition memo parity with the dom generate: the
+                        // server sync memo allocates an owner id just like the
+                        // client's, so skipping the wrap here drifts every
+                        // hydration id the prop's branch content allocates
+                        // (#2959, component flavor — mirrors Babel
+                        // shared/component.ts).
+                        if self.wrap_conditionals && is_condition_shape(&value) {
+                            let span = value.span();
+                            value = transform_condition_inline(self, span, value);
+                        }
                         let bare_vars = self.pop_var_scope();
                         let mut setup: std::vec::Vec<Statement<'a>> =
                             self.bare_var_declaration(&bare_vars).into_iter().collect();

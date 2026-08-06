@@ -2,6 +2,7 @@
 // calls `createServerReference(id)` where a server function was referenced;
 // the function body never reaches this bundle. Hoisted from SolidStart's
 // fns/client.ts with neutral header names and a configurable endpoint.
+import { REVALIDATE_HEADER } from "../response.js";
 import {
   BODY_FORMAT_HEADER,
   BodyFormat,
@@ -19,19 +20,39 @@ import {
   withMeta
 } from "./shared.js";
 
+// The flash cookie's name, detection and clearing are re-exported here so
+// isomorphic integration code imports them from one specifier; the codec
+// that fills the cookie is server-only and stays behind the server entry.
 export {
+  // Wire-protocol utilities re-exported for the frame transport: an
+  // integration whose bundling would otherwise give the transport a private
+  // copy of this module (solid-web's frames client) resolves its shared.js
+  // import HERE instead — one copy of the framing/addressing code in the
+  // app, and the codec/flight-consumer config the transport reads is the
+  // shared built instance by construction.
+  ChunkReader,
   ERROR_HEADER,
+  FLASH_COOKIE,
   FUNCTION_HEADER,
   INSTANCE_HEADER,
   SINGLE_FLIGHT_HEADER,
+  clearFlashCookie,
+  createChunk,
   decodeErrorHeaderValue,
   decodeResponse,
+  decodeResponsePayload,
+  deserializeStream,
   encodeErrorHeaderValue,
+  frameAddress,
+  getFlightDataConsumer,
   getServerFunctionMetadata,
+  getServerFunctionsCodec,
+  hasFlashCookie,
   isServerFunction,
   subscribeFlightData,
   withMeta
 } from "./shared.js";
+export { REVALIDATE_HEADER } from "../response.js";
 
 const config = {
   endpoint: "/_server",
@@ -181,6 +202,38 @@ async function initializeResponse(base, id, instance, options, args, meta) {
       meta
     );
   }
+  // Bound calls ending in a natural HTTP encoding — `action.with(id)`
+  // posting FormData/URLSearchParams — reuse the server-rendered form-post
+  // convention: JSON-safe leading arguments ride the url's `?args` (the
+  // handler prepends url arguments before natural-encoding bodies) and the
+  // trailing argument IS the body. The same wire shape the no-JS fallback
+  // produces, so bound form actions need no codec. `undefined` coerces to
+  // null exactly as it does in a rendered action url (JSON has none).
+  if (args.length > 1) {
+    const trailing = getHeadersAndBody(args[args.length - 1]);
+    const leading = args.slice(0, -1).map(arg => (arg === undefined ? null : arg));
+    if (trailing && isJSONSafe(leading)) {
+      const target =
+        base +
+        (base.includes("?") ? "&" : "?") +
+        "args=" +
+        encodeURIComponent(JSON.stringify(leading));
+      return createRequest(
+        target,
+        id,
+        instance,
+        {
+          ...options,
+          body: trailing.body,
+          headers: {
+            ...options.headers,
+            ...trailing.headers
+          }
+        },
+        meta
+      );
+    }
+  }
   // Everything else needs the codec, which is opt-in (enableRichArguments).
   return createRequest(
     base,
@@ -199,7 +252,11 @@ async function initializeResponse(base, id, instance, options, args, meta) {
   );
 }
 
-async function fetchServerFunction(base, id, options, args, meta) {
+// `args` is the wire encoding's argument list; `callArgs` is the call's REAL
+// arguments for the handler's context. They differ for GET calls, whose
+// arguments ride pre-encoded in the url (wire args empty) — a handler keying
+// state by the call (function + arguments) must still see the real ones.
+async function fetchServerFunction(base, id, options, args, meta, callArgs = args) {
   const instance = `server-function:${INSTANCE++}`;
   // Captured synchronously at the call site (an async function body runs
   // sync up to its first await), so ambient call context is still live.
@@ -211,7 +268,7 @@ async function fetchServerFunction(base, id, options, args, meta) {
   // The integration seam sees the response first: a handler that claims it
   // (returns non-undefined) owns the call's result.
   if (handler) {
-    const handled = handler.handle(response, { id, meta, args, context });
+    const handled = handler.handle(response, { id, meta, args: callArgs, context });
     if (handled !== undefined) return handled;
   }
 
@@ -231,7 +288,7 @@ async function fetchServerFunction(base, id, options, args, meta) {
       if (
         response.headers.has(ERROR_HEADER) &&
         !response.headers.has("Location") &&
-        !response.headers.has("X-Revalidate")
+        !response.headers.has(REVALIDATE_HEADER)
       ) {
         throw payload.value;
       }
@@ -245,7 +302,7 @@ async function fetchServerFunction(base, id, options, args, meta) {
   // `decodeResponse`.
   if (
     response.headers.has("Location") ||
-    response.headers.has("X-Revalidate") ||
+    response.headers.has(REVALIDATE_HEADER) ||
     response.headers.has(SINGLE_FLIGHT_HEADER)
   ) {
     return response;
@@ -342,7 +399,7 @@ export function GET(fn) {
       const encoded = isJSONSafe(args) ? JSON.stringify(args) : await serializeArguments(args);
       base += `&args=${encodeURIComponent(encoded)}`;
     }
-    return fetchServerFunction(base, id, { method: "GET" }, [], metadata);
+    return fetchServerFunction(base, id, { method: "GET" }, [], metadata, args);
   };
   wrapped[SERVER_FUNCTION_METADATA] = metadata;
   wrapped.id = id;
@@ -360,4 +417,12 @@ export function GET(fn) {
 // misconfigured build fails loudly instead of with a missing-export error.
 export function registerServerReference() {
   throw new Error("registerServerReference must not be called in the client build");
+}
+
+// Client no-op mirror of the server entry's accessor: there is never a
+// server function call in flight on the client, so this answers undefined.
+// Present so `"use server"` modules that import it stay import-stable in
+// client builds before dead-code elimination.
+export function getServerFunctionInvocation() {
+  return undefined;
 }

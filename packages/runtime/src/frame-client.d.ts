@@ -72,10 +72,27 @@ export interface SlotContext {
    */
   adopted?: boolean;
   /**
+   * Whether this occurrence is a render-prop CALL (the producer placed it
+   * with arguments — possibly empty — via a slot record) as opposed to a
+   * direct-insert position. Consumers cannot tell from the resolved props
+   * alone: an argless render prop and a direct insert both arrive as `{}`,
+   * but one is a function to invoke and the other a value to place.
+   */
+  invoked?: boolean;
+  /**
    * Register cleanup for when this occurrence's range is removed from the
    * server content, or the owning frame is disposed.
    */
   onCleanup(fn: () => void): void;
+  /**
+   * Live-props opt-in: a binding that registers here receives the
+   * re-resolved props when a re-sent record's args CHANGE in value, instead
+   * of the occurrence being re-called — the invocation's instance (and its
+   * client state) survives the change. Register synchronously during the
+   * invocation; one updater per occurrence (last registration wins). A
+   * genuine re-call or unmount clears it before/with the binding it served.
+   */
+  onUpdate(fn: (props: Record<string, unknown>) => void): void;
   /**
    * The range's current interior — server-rendered client content on an
    * adopted document-SSR boot, or the previous output on a re-call. A
@@ -83,6 +100,15 @@ export interface SlotContext {
    * in place (zero DOM mutation).
    */
   existing: ChildNode[];
+  /**
+   * The range's own marker comments, when the occurrence has a placed range.
+   * A framework binding whose slot content is reactive at the top level (a
+   * boundary accessor, changing route children) owns the interior instead of
+   * returning nodes: bind before `end` with the framework's insert primitive
+   * and return `undefined` — the frame leaves the range alone (server morphs
+   * already protect slot ranges).
+   */
+  range?: { start: Comment; end: Comment };
 }
 
 /**
@@ -105,6 +131,22 @@ export interface Frame {
   readonly error: unknown;
   /** Whether the named fragment has been revealed into the boundary. */
   isRevealed(segment: string): boolean;
+  /**
+   * Re-key this live frame to a different boundary id (the mount-preserving
+   * half of a call-site handoff): nothing tears down — the element, store,
+   * and slot state stay — while leaving the old id stashes a retention
+   * snapshot under it and joining the new id seeds/drains its retained
+   * store and buffered chunks. Version affinity resets: histories are per
+   * boundary id.
+   */
+  rebind(id: string): void;
+  /**
+   * Forget the version baseline without touching content — the next write
+   * is accepted whatever its number. Called by the host after seeding a
+   * registration from a retained snapshot, whose numbering belongs to a
+   * different stream space.
+   */
+  rebase(): void;
   /** Tear down: slot cleanups cascade, later chunks are ignored. Idempotent. */
   dispose(): void;
 }
@@ -197,6 +239,18 @@ export interface FrameOptions {
    * for the framework-agnostic imperative swap (no reactive reveal).
    */
   reveal?(seam: { before: Node; fallback: Node[]; content: () => Node | DocumentFragment }): void;
+  /**
+   * Document-face record-race guard (adopt path only — solidjs/solid#2968).
+   * Nothing on the wire formally orders an occurrence's args-record data
+   * script before the event that triggers adoption, so a recordless
+   * occurrence is ambiguous while this returns true: the frame defers its
+   * mount one macrotask (all currently parsed scripts run first), calls
+   * `drainRecords`, and classifies with whatever is then resolvable. Return
+   * false once the document can run no further data scripts.
+   */
+  recordsPending?(): boolean;
+  /** Re-absorb the document's arrived-by-now records (idempotent per key). */
+  drainRecords?(): void;
 }
 
 /**

@@ -1,5 +1,196 @@
 # dom-expressions
 
+## 0.50.0-next.37
+
+### Patch Changes
+
+- f26d0fa: Restore a stream's render context before re-pulling pending root holes. An async root hole can resume after another render has replaced `sharedConfig.context` (module-global, shared across interleaved renders); re-pulling the hole first rendered the markup but silently dropped hydration records emitted during the retry — they serialized into the other render's completed context instead of the response that owns the resumed markup. (From #561.)
+- a297f34: Serialized server-component references self-bootstrap the `_$SC` registry. The registry previously had to be installed by the document shell ahead of every data script, and the integration doing that (vite-plugin-solid) spliced it directly after `<head>` — where the hydration walk claims it as the first walked child and drifts every positional claim in the head by one (metas claimed as title, title as link), silently in production where the dev structure warnings don't exist. Now the FIRST reference each hydration script serializes carries the registry as an idempotent expression (`(self._$SC||(self._$SC={...}))`), so ordering is correct by construction — every script that reads the registry contains or follows its definition — and nothing sits ahead of the authored head elements. Demand-driven: documents that never serialize a server component ship nothing. The bootstrap text and first-use tracking live in the server-only document-SSR module (installed into the shared transport at load), so client bundles don't grow; `SERVER_COMPONENT_BOOTSTRAP` stays exported (now idempotent, first definition wins) for integrations still installing it document-wide.
+
+## 0.50.0-next.36
+
+### Minor Changes
+
+- 139f21c: Server components Stage 2 (identity split + one record shape, per docs/server-components-principles.md):
+  - **A5 — one record shape.** The t=0 document emits the same slot/region records a stream would: every invoked occurrence gets a record, and every region arg rides as its `{$frame}` address ref (used or occluded). The consumer's region-threading patches and the #547 `$frame`-addition leniency delete with the skew.
+  - **Resident-store host.** The frame host owns per-id stores as first-class residents: chunk writes land whether or not anything is mounted, and registering frames seed from the store. The unregistered-chunk buffer, retention snapshots, and sibling seeding all delete into that one shape; preloads warm stores by construction.
+  - **DR-1 — the identity split.** `createServerComponentHandler` mints ONE mount component per server function and resolves calls with per-address **bindings** (`COMPONENT_BINDING: { component, address }`, the address delivered as a second-argument accessor). An equals-gated reader keeps its instance across argument changes and delivers the new address; the instance re-binds its frame's pull to the new address's store. The `COMPONENT_HANDOFF` protocol, `forwards` map, `documentComponent` seam, and the flight `route` map are deleted.
+  - Region discovery membership is structural (dotted id inside this interior) instead of producer-prefix-matched, so address-keyed mounts adopt function-id-prefixed markup.
+  - Guards against a recycled occurrence name's up-threaded record removal deleting a newer stream's live record.
+
+  Net −402 B on the frames consumer bundle (8,610 → 8,208 min+gzip); size guard ratcheted to 8,228.
+
+### Patch Changes
+
+- 6e1f2d8: Treat a throwing stream sink or a cancelled readable as client disconnect. A `pipe` sink whose `write`/`end` throws (e.g. a web-stream adapter enqueueing after close) previously let the throw escape from deferred write machinery (`writeTasks`, late fragment flushes run from the microtask queue) as an unhandled error that could take the host process down. Sink invocations are now guarded: a throw stops all further sink calls, marks the render completed so pending fragment resolutions stop emitting and serializing, and disposes in-flight reactive work. `pipeTo` write rejections and a rejected writer `closed` (which is how cancelling `renderToStream(...).readable` surfaces) trigger the same teardown and settle the `pipeTo` promise, so an aborted request winds the render down instead of computing fragments for a dead stream.
+- 1b63135: Defer adopt-time classification of a recordless slot occurrence while document records may still arrive (solidjs/solid#2968). An invoked occurrence's args record rides the document as a data script, and nothing on the wire formally orders that script before the event that triggers adoption; when adoption won the race the occurrence resolved no record, classification fell through to "direct content", and the wrapper's render-prop callback was evaluated as a zero-argument accessor — a callback reading `props.x` halted the reactive system. Adopt frames now accept a `recordsPending`/`drainRecords` seam from the document integration: a recordless occurrence defers one macrotask (all currently parsed scripts run first), records are re-drained, and classification happens with the record present. Server-rendered DOM stays in place across the deferral. Interim by design — the unified record shape (principles doc A5, stage 2) removes the timing skew and this machinery with it.
+- 944f08e: Defer a recordless adopted occurrence while document records may still arrive, not one macrotask. A streamed document held open on async content (or slow dev-mode module timing) delivers records across many macrotasks; the previous one-shot defer classified the tail of them as direct content, evaluating render-prop callbacks as zero-arg accessors. The re-check now re-arms until `recordsPending` flips false — the same settlement contract the fragment ledger guarantees — and the wait is invisible on screen because an adopted occurrence's server-rendered interior is already in the DOM. (From #559; its remount seed-merge half is superseded by the identity split's resident stores, now pinned by a regression test.)
+- e7ddc12: Record streamed-fragment reveals in the hydration ledger: `$dfr` marks
+  `_$HY.v[id]` when it swaps content in, so the runtime can answer "which
+  declared fragments are still outstanding" from records — across the
+  pre-boot window — instead of scanning the document for `pl-*` templates.
+  Recording only; reveal policy stays with the hydration runtime's `_$HY.f`.
+- f875aa8: Head management: reactive group membership and identity refinements for `useHead`.
+  - `useHead` now accepts `() => HeadTag | HeadTag[]` — a reactive group whose
+    membership is re-read on change (client) or resolved at the owning
+    boundary's flush (server). This is the primitive component-level grouping
+    (Solid Meta's `<Head>`) builds on: a group can compose its tag list after
+    registration. Membership changes keep the registration's original commit
+    position. Resource tags inside a function-form group emit at their
+    boundary's flush rather than eagerly.
+  - `media` now qualifies replaceable meta identity: metas sharing a
+    `name`/`property`/`http-equiv` but differing by media query (e.g.
+    `theme-color` light/dark) coexist instead of colliding last-wins.
+  - `link[rel=icon]` and `link[rel=apple-touch-icon]` are now replaceable
+    instead of resource-class, with identity `rel + sizes + type` — deliberately
+    excluding `href`, so a swapped icon (per-route favicons, notification
+    badges) replaces its predecessor and disposal restores the previous one,
+    while size/type variants coexist as separate identities.
+
+- 7953cdc: Identity-first morph (server-components principles DR-5): the reconcile
+  records each wholesale-inserted subtree root as a graft site, and one
+  post-reconcile walk swaps bare slot marker pairs inside those subtrees for
+  the occurrence's live client-owned range from the frame-wide index —
+  interior, and the client state mounted in it, intact. Replaces the
+  end-of-morph `restoreDisplacedRanges` repair pass, which rescanned the whole
+  frame with `collectSlots` after every apply that left displaced entries.
+  Recording at insertion makes "a live range was detached because its parent
+  didn't match" unreachable by construction: every place a range could be owed
+  is on the list, at O(inserted) instead of O(frame). Range placement (stashed
+  fragment vs attached start marker) is unified in a single `placeRange`
+  helper shared by the reconcile's marker branch and the graft walk.
+- f61a07c: Move undefined into ref type
+
+## 0.50.0-next.35
+
+### Patch Changes
+
+- c4edd61: Fix cached server-component frame handoffs so nested document boundaries are not adopted as parent regions, and every live sibling is seeded from rebased retained state during cache-only rebinds.
+- a0674d4: Streamed fragments that settle after hydration completes are held for their claimant instead of discarded: `$df` now consults a claimant flag (`_$HY.fk`) when `_$HY.done` is set, and parks unclaimed swaps in a hold queue (`_$HY.hq`) that a late-registering boundary replays. Fixes server-component boundaries that resolve after the shell flush never mounting (solidjs/solid#2964).
+- 4b125e3: Restore displaced slot ranges into wholesale-inserted parents at end of morph. The frame-wide displaced-range index only applied where the reconcile descended into a matched parent; a new parent with no old counterpart is inserted wholesale from the parsed source, carrying bare marker pairs, so a live range for the same occurrence stayed orphaned in the index while the occurrence remained "mounted" over detached nodes — the slot rendered empty and no later sync could recover it (the record dedupe sees an already-mounted occurrence). An end-of-morph sweep now swaps each remaining indexed range into its bare marker pair in the final content. Fixes the notes-demo search shape: filtering a server-rendered list down and back up (typing then clearing a search) left the regrown rows blank.
+- 96a04d3: Add a call-site handoff to server component boundaries so a live mount survives argument changes
+
+  Per-args boundary identity resolves each `(function, arguments)` call to its own component, which made a live call site switching arguments (a search box filtering a server-rendered list) swap boundaries and destroy client slot state. Components minted by `createServerComponentHandler` are now branded with a `COMPONENT_HANDOFF` contract: when a reader offers its previous value and the incoming component is the same function under new arguments, `take()` rebinds the mounted frame to the new call — the element and its keyed slot ranges stay while the new call's stream morphs in place. Frames gained `rebind`/`rebase` for this, slot regions are keyed by argument name so wire renames follow without re-calling occurrences, and preloads — which have no reader — never take a mount, preserving isolation.
+
+- 779488f: Add live slot props to frames: a binding can register `ctx.onUpdate(fn)` during its invocation to receive re-resolved props when a re-sent slot record's args change in value, instead of the occurrence being re-called. The invocation's instance, client state, and DOM identity survive the change; cached `{$frame}` regions are reused/renamed through the existing machinery. Unregistered consumers keep the re-call behavior.
+- 1f601f6: Split streamed-fragment reveals into inline mechanics and runtime policy. The stream's inline script keeps only the parse-time swap mechanics (`$dfr`, so streaming still reveals with no JS at all); `$df` now routes through `_$HY.f` when the hydration runtime has installed it — the same one-owner handoff the head-patch runtime uses via `_$HY.h`. The `_$HY.fk`/`_$HY.hq` claimant flag tables and the inline `_$HY.done` policy branch are deleted: late-arrival holds and boundary claims are decided in one place (the runtime), which owns them by construction instead of negotiating through globals.
+- d27884c: Add `useHead`, a streaming-correct head-management primitive (stage 1 of the
+  head management RFC, `docs/head-management-rfc.md`).
+
+  ```ts
+  type HeadTag = {
+    tag: "title" | "meta" | "link" | "style" | "script" | "base";
+    props: Record<string, any>; // values may be getters (lazy on the server, reactive on the client)
+    key?: string | (() => string); // explicit identity override
+  };
+  function useHead(tag: HeadTag | HeadTag[]): void;
+  ```
+
+  - An array is a group — one replacement set; a single tag is a group of one.
+  - Replaceable tags (title, meta, canonical links, inline style/script bodies)
+    resolve by last-committed group per identity. On the server they render into
+    `<head>` at shell flush and stream as patch ops that apply atomically with
+    their suspense boundary's reveal (riding the `$df` activation, including
+    style gates). Props getters evaluate exactly once, at the owning boundary's
+    flush — the migration path for deferred CSS collectors.
+  - Resource tags (`link rel=preload/preconnect/…`, stylesheets, `script[src]`)
+    emit eagerly with identity dedupe (URL + qualifying attributes), sharing one
+    identity set with manifest-driven asset tracking. Stylesheets whose extra
+    attributes are pure fetch metadata (`crossorigin`, `integrity`,
+    `referrerpolicy`, `fetchpriority`) — and query-stringed dev-server CSS URLs
+    — gate their suspense boundary's reveal like tracked boundary CSS;
+    condition-changing attributes (`media`, alternate, `disabled`) emit ungated.
+    On the client, stylesheets ride the ref-counted asset registry (removal
+    follows the owner); hints are never retracted.
+  - `title` is a hard singleton with stack semantics: disposal restores the
+    previous winner, then the static shell title.
+  - `meta[charset]` and `base` splice into a head prelude immediately after the
+    `<head>` open tag and are shell-only.
+  - Client registrations are reactive, keep their commit position across
+    updates, and own their DOM via `data-dh` markers — static head content and
+    third-party tags are never clobbered. Hydration claims server-rendered
+    winners in place; streamed patches route through the registry once it is
+    live, so head state never flickers regardless of chunk/bundle timing.
+
+  Embedded renders (host-owned documents) get a first-class contract: the new
+  `onHead(head: string)` option on `renderToString`/`renderToStream`. When the
+  render output contains no `</head>`, everything head-bound (resolved `useHead`
+  winners, eager resources, tracked asset links, inline styles) is delivered to
+  the callback — prelude first — for the host to splice into its own template,
+  instead of being silently dropped. For streams it fires before the first chunk;
+  post-shell head updates ride the stream and apply in the browser. Unlike
+  `getAssets()`, it is closure-bound to its render, so concurrent renders cannot
+  leak head content across requests.
+
+  `useAssets`, `getAssets`, and `Assets` are now deprecated and will be removed
+  before `0.50.0` stable; migrate head injection to `useHead` and embedded head
+  extraction to `onHead`.
+
+## 0.50.0-next.34
+
+### Patch Changes
+
+- 2885c4f: Frame morphs now relocate keyed slot ranges across parents. Occurrence ids are unique within a frame's content, but range preservation was sibling-scoped: deleting an item from a keyed list shifted every range below it into a different parent element, where the morph saw only "new id here", adopted the incoming empty marker pair, and destroyed the live interior — which the slot-record dedupe then never re-invoked (surviving list items rendered blank). The morph indexes the frame's slot ranges frame-wide before reconciling and moves a displaced range — interior intact — into its new position; ranges whose old parent reconciles first are stashed whole instead of removed node-by-node. This also lifts the documented limitation that a server element wrapping each keyed occurrence defeated reorder identity.
+- 2885c4f: Server-component boundary identity is now the call's intrinsic `(function, arguments)` address end to end — the same per-args rule an integration's query cache keys values by, so cached components and boundaries stay one-to-one. A repeat call for the same args resolves the identical component (refetches morph the showing boundary in place, cache hits pass the reader's equals-gate); different args resolve a different boundary, so a hover preload for other arguments streams off-screen (buffered until mounted) instead of morphing what the page is showing, and a call site switching arguments swaps boundaries rather than carrying one boundary's client state across calls. This replaces the context-capture (`capture`) keying, whose one-boundary-per-site model let a fresh cache hit for one args-variant resolve a component already mounted showing another — the equals-gate held and the page silently kept the wrong content.
+
+  The frame host now retains an unmounted boundary's store (element boundaries whose markup arrived as document HTML snapshot their interior at unregister), and a remount seeds from it: a cache hit that resolves with no new stream re-materializes the boundary instantly instead of rendering blank, and a stale-cache refetch morphs over the re-materialized state. This fixes intermittently blank pages when navigating back and forth between two views inside the cache freshness window.
+
+- 7bb60aa: Spread parity for nullish input values (#2957): `value`/`defaultValue` on input/textarea assigned through `spread()` now normalize `undefined`/`null` to an empty string, matching the compiled direct-binding output (`el.value = v ?? ""`) instead of stringifying to "undefined".
+- 2885c4f: Client size pass on the frames runtime: the frame client's slot-range and placeholder discovery walk through shared bounded sibling walkers, dead range helpers are gone, and the server-function client entry re-exports the wire-layer framing/addressing utilities (`ChunkReader`, `createChunk`, `deserializeStream`, `frameAddress`, `REVALIDATE_HEADER`) so an integration's transport bundle can resolve them from the shared built instance instead of carrying a private copy.
+- 2885c4f: Frame sink runs the server component's own render inside the core's context barrier (`runInServerComponentScope`, when the core provides one) at both render entries — document-mode inline rendering (`frameTransformDirectResult`) and standalone streams (`renderServerComponent`). User context never crosses a server-component root, so t=0 inline renders agree with standalone refetches by construction. Slot props are created outside the barrier so client positions re-enter the caller's zone with full app context. Cores without the export fall back to plain evaluation.
+- 2885c4f: Single-flight mutations with server-component regions: when part of what a mutation invalidates is markup, the frame stream carries the whole payload in one round trip.
+  - `frameTransformFlightResult` (install as `transformFlightResult` on the server-function handler): a component-valued flight-data entry stays in the `{ value, data }` envelope like any other value — serialized as a flight reference — while its content rides the same response as a region addressed by the call (`frameAddress(id, args)`, the one name both peers derive independently). Markup ships as html exactly once; the envelope carries a pointer to it. With no markup in the payload the response stays the plain single-flight envelope, byte for byte.
+  - `createServerComponentHandler` consumes it: regions route to the boundaries showing the calls they refresh (including boundaries answered locally at t=0 through `intercept`, which now records its address), per-frame versions rotate response-scoped state, and the envelope decodes progressively from `outcome` chunks — the caller gets the mutation's value, the flight consumer gets the data, exactly like a data-only response. A region nothing is showing buffers in the host and a boundary is minted for it on reference resolution, so the content mounts wherever the seeded value is eventually read.
+  - `ServerComponentPlugin` moved to `frame-transport.js` (re-exported from `frame-sink.js`) so client bundles can carry it; its JSON-codec `deserialize` resolves flight references through the live transport registry by call address, returning the very component the reading call site already holds — seeding an integration cache with it never fails an equals-gate. Document (eval-style) references stay per-function-id, t=0 adoption untouched. The protocol injects the plugin itself on both legs (`flightCodec`) — nothing to register.
+  - `createServerComponentHandler` accepts `consumer`/`codec` getters for bundlers that give the transport a private module copy (the flight consumer and codec are module state in the server-function client's shared instance); `getFlightDataConsumer`/`getServerFunctionsCodec` are re-exported from the client entry for the same reason.
+  - `frameAddress` argument hashing is realm-stable for `Date`/`Map`/`Set` (the client and the server's collection pass hash independently; `String(value)` for these is implementation-defined and a diverging digest silently degrades single-flight to a refetch).
+
+- d1d31ae: `renderToStream(...).pipeTo(w)` now awaits in-flight writes before releasing the writer and closing. `buffer.write` issued `writer.write()` without awaiting the returned promise, and `writable.end()` then called `writer.releaseLock()` synchronously, so whether a chunk still in flight survived was left to the host's stream implementation — Node queues it anyway, workerd drops it. The chunk at risk is always the last one written, which for a streamed `<Loading>` boundary is its `<id>_fr` resolution script. Losing that leaves the client's boundary waiting on a promise that never resolves: it renders its fallback into detached DOM, the server's streamed content is never claimed, and every binding inside the boundary is dead after hydration — including plain signals with no async involvement, and with no error anywhere.
+- 86ed7fc: Rename `getServerFunctionMeta` → `getServerFunctionInvocation` (and its `ServerFunctionMeta` result type → `ServerFunctionInvocation`), resolving the near-collision with `getServerFunctionMetadata(fn)`: the latter reads a reference's static declaration metadata, while this accessor returns info about the call in flight (today `{ id }`). The invocation state also moves out of `event.locals` (user/integration space — and derived events share locals with their outer event, so nested or concurrent calls leaked and overwrote each other's state) into a module-private WeakMap keyed by the per-call request event; no `serverFunctionMeta`/`serverFunctionInvocation` key ever appears in locals. The server-functions client entry gains a no-op `getServerFunctionInvocation` (always `undefined`) and the `ServerFunctionInvocation` type, so `"use server"` modules importing the accessor stay type- and import-stable in client builds before dead-code elimination. No back-compat alias — beta line, clean rename.
+- 2bbd46d: Export `ResponseStub` — the named shape of the mutable `{ status, statusText, headers }` response head integrations expose as `event.response` via module augmentation (as `@solidjs/router` does; core deliberately does not declare the property on `RequestEvent` itself so augmentations stay conflict-free, but its server-function handler already reads the head's `Set-Cookie` headers when folding single-flight cookies). The stub carries a `committed?: boolean` flag, set by the integration once the response head has been derived/sent from it — consumers that write response metadata during render (e.g. JSX response components) must treat later status/header writes and cleanup-time retractions as no-ops. It is a placeholder the real `Response` is derived from, which is why the head commits while the body may still be streaming. Types + docs only — no runtime behavior change.
+- 716ff3a: Add a lazy, cached `readable` getter to the `renderToStream` result — a `ReadableStream<Uint8Array>` view of the render for web-standard responses: `new Response(renderToStream(fn).readable)`. First access creates an internal `TransformStream` and starts piping into its writable side (deliberately not awaited — the pipe settles only after the whole render is written, and nothing drains the readable until it is handed back); the readable side is cached so repeated access returns the same stream. Chunks are UTF-8 encoded bytes, exactly what `pipeTo` writes. Like `pipe`/`pipeTo`, accessing `readable` consumes the render — the result tracks which consumer claimed it, and mixing distinct consumers (`readable` then `pipe`/`pipeTo`, or the reverse) throws a deterministic error naming the conflict.
+- 467279f: `transformResult` (both the server-wide config and the per-request handler option) now receives the call's identity on its context: the function `id` and the parsed `args` the implementation was invoked with, on returned and thrown results alike. This matches the context `transformDirectResult` already receives for in-process SSR calls, so a result policy that keys state by the call — deriving a wire address, capturing a prerender artifact — works uniformly over either dispatch path. Type declarations for both transforms were updated to match (`transformDirectResult`'s previously understated its context, which also carries `args` and `event`).
+- faa19ac: Type the `transformFlightResult` seam. The single-flight fold policy hook was accepted by `configureServerFunctionsServer` and honored as a per-handler override, but never declared in `server.d.ts` — integrations wiring it (the frames policy's `frameTransformFlightResult`) only worked through untyped generated code. Both option surfaces now declare it, with the handler JSDoc updated to match.
+
+## 0.50.0-next.33
+
+### Patch Changes
+
+- b3c64b8: Pre-digest the single-flight outcome so `collectFlightData` hooks only supply the data strategy. The handler now computes the generic halves of collection before invoking the hook and hands them over on the outcome: `targetUrl` (the URL the client will show after the mutation — the redirect `Location` resolved against the request URL, or the referring page; undefined without a usable referer or for off-origin redirects), `revalidateKeys` (the outcome's `X-Revalidate` keys, split), and `foldedHeaders` (the request headers with the event's and the outcome's `Set-Cookie` effects applied, later winning). Raw body-carrying `Response` values no longer invoke the hook at all — they are the caller's verbatim payload, with no envelope to fold data into. Existing hooks keep working unchanged; the new fields are additive.
+
+  Adds `decodeResponsePayload` beside `decodeResponse`: decodes a transport response and splits the single-flight envelope into `{ value, flightData }`, so integrations handling manually opted-in calls stop reimplementing the payload shape.
+
+- 675c5c7: Warn loudly on the server when the asset manifest returns no client assets for a requested module. When `context.resolveAssets` answers null/undefined or with no js entries for a module the render asked about, server-side `lazy()` cannot file the module's hydration asset map entry, the client is unable to preload it, and hydration fails with a cryptic `lazy() module "…" was not preloaded before hydration` error far from the actual cause (an environmental manifest miss, e.g. a dev-manifest bridge that failed to answer). The resolution seam now emits a `console.error` naming the module key and what to check, deduped per module per render. `noScripts` renders (which ship no hydration data) and the `resolveAssetsSync` probe path (which has graceful fallbacks) are excluded.
+
+## 0.50.0-next.32
+
+### Patch Changes
+
+- e445c8c: Make `applyRef` generic so callbacks typed for a concrete element (e.g. `HTMLInputElement`) type-check when forwarding `props.ref`.
+- f356047: Frames: make document-boot absorption linear instead of quadratic
+
+  Three costs in the frame client scaled superlinearly with content size on an adopted document boot (measured on a 1,365-comment page, ~4x CPU throttle):
+  - The host's pending-chunk buffer rescanned the whole buffer per chunk (`reduce` for the max version plus a `filter` copy). Every t=0 slot record funnels through it before the boundary binds, so buffering N records was O(N²) — ~1.9M closure calls on the test page. The buffer now tracks its version explicitly and each chunk is O(1).
+  - The adopt constructor ran a second full `#syncSlots` walk even when the registration flush had already synced (every apply ends in `#flush` → `#syncSlots`). It now only syncs when no buffered chunk arrived.
+  - `#syncSlots` re-ran `#discoverRegions` after an invoke that claimed the adopted DOM in place, where the pre-invoke discovery had already seen the untouched interior. The rescan now only runs when the callback actually rendered.
+
+  Together with the claim-registry fix in `@solidjs/web/frames`, this cut the frames demo's absorption JS roughly in half and its Lighthouse Total Blocking Time from 140ms to 66ms.
+
+- e71f02c: Hoist the router-agnostic wire protocols out of Solid Router into the server function runtime — the pieces both peers of the transport must agree on, none of which contained a routing decision:
+  - `REVALIDATE_HEADER` (`response.js`): the `X-Revalidate` header finally gets a named export next to the helpers that write it (`redirect`/`reload`/`respond`'s `revalidate` option). The client transport's control-flow checks now read the constant instead of spelling the literal; integrations should too. Key semantics are unchanged: opaque strings core never inspects — how they are matched (prefixes, exact names) stays the integration's business.
+  - Flash cookie (`shared.js` + `flash.js`): the no-JS form convention's cookie, previously private to Solid Router. A form posted without the client runtime has no channel to receive a value, so the handler redirects back with the outcome riding a one-shot `flash` cookie for the next render to pick up. The split follows bundle reality: the name, detection (`hasFlashCookie`) and one-shot clearing (`clearFlashCookie`) are isomorphic in `shared.js` — integrations consume the cookie eagerly from code that also ships to the browser, where the clear must be queued before streaming flushes the response headers — while the codec (`encodeFlashCookie`/`decodeFlashCookie`, the `FlashSubmission` shape) is server-only behind the server entry. The payload stays plain JSON with `$f`/`$u` markers reviving `FormData`/`URLSearchParams` (files dropped): it has to survive a 4 KB cookie, and both halves are synchronous while the wire codec is not.
+  - `foldSetCookies(headers, setCookies)` (`server.js`): request headers with `Set-Cookie` deltas folded into the `Cookie` header, as the browser would have applied them before its next request — later entries win, `Max-Age <= 0` and past `Expires` delete. Work re-run on the server after a mutation (single-flight collection) starts from the request that triggered it, whose cookies are pre-mutation by definition; which responses contribute is the caller's decision.
+  - `createNoJSHandler({ base })` (`server.js`): the redirect-back-with-flash-cookie policy itself, also hoisted — it reads the `Referer`, picks `303 See Other` for the POST→GET turn (honoring a result Response's own redirect status and `Location`), and flashes non-Response outcomes; a result that is already a `Response` carries its meaning in its metadata and is not flashed. Reading the cookie into UI state on the next render remains the integration's half.
+
+  `handleServerFunctionRequest` now applies `createNoJSHandler()` by default to browser form posts — POST with a form content type and no `BODY_FORMAT_HEADER`, which only the client runtime sends — so an unconfigured app gets working progressive enhancement instead of answering a real `<form>` post with a serialized payload. Direct HTTP callers keep the plain response. The resolution chain is per-request `handleNoJS`, then the new `configureServerFunctionsServer({ handleNoJS })` (register `createNoJSHandler({ base })` there to set a mount path or to extend the convention to every instanceless call), then the built-in form-post default; `null` at either level disables the convention entirely.
+
+  Also fixes the thrown leg of the no-JS path: a thrown bodyless `Response` (the common `throw redirect(...)`) was nulled for body encoding before `handleNoJS` ever saw it, silently losing the redirect target and turning it into a 303 back to the referrer. The handler now receives the original Response, matching what the returned path always passed — covered by an end-to-end dispatch test, which the previous unit-only coverage never exercised.
+
+- ac6e809: Pass the revealed fragment's parent to the `_$HY.fe` reveal hook: `$df` now calls `_$HY.fe(id, parent)`. The hook already fired on every swap but carried only the fragment id, so a consumer that needs to look at what just landed — server-component boundaries adopt their element there — had no choice but to rescan the document. The parent scopes that work to the fragment that just arrived. Purely additive: the emitted stub ignores the argument, and consumers that only read the id are unaffected.
+- 5f5241d: Simplify the recursive `JSX.Ref` definition to an equivalent form that's easier for TypeScript to expand.
+- f8f47ae: Assemble the SSR document in a single pass. `renderToString` and the streaming shell each ran four sequential injection passes (assets, preload links, inline styles, hydration scripts), every one of which searched the document for its anchor and rebuilt it — four full copies of the shell, or of a multi-hundred-KB SSR body. Head content is now concatenated once and spliced with the script tag in one construction, byte-for-byte identical to the previous output. Anchor searches stay demand-driven, so a body-only render (no assets, no preloads, no inline styles) never scans the document at all: a missing-needle `indexOf` flattens the string and walks every character, which on a 400KB body costs more than the render's own string work.
+- a845f66: Don't serialize `Error.prototype.stack` outside development. Seroval includes it by default, so a thrown server function error — and any error landing in SSR hydration payloads — shipped server file paths and internal function names to the client in production. The stack feature is now disabled on every serialize path (hydration serializer, JSON codec) whenever `NODE_ENV` isn't `development`, on top of any `disabledFeatures` override so compat tuning can't silently reopen the leak. Decoding stays permissive: payloads that do carry a stack (e.g. from a development peer) still round-trip. (The core-side counterpart of solid-start#2241, which only patched start's legacy serializer.)
+
 ## 0.50.0-next.31
 
 ### Patch Changes

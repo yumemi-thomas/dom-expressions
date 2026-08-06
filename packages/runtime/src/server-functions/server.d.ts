@@ -4,13 +4,17 @@ import { RequestEvent } from "../server.js";
 
 export {
   ERROR_HEADER,
+  FLASH_COOKIE,
   FUNCTION_HEADER,
   INSTANCE_HEADER,
   SINGLE_FLIGHT_HEADER,
+  clearFlashCookie,
   decodeErrorHeaderValue,
   decodeResponse,
+  decodeResponsePayload,
   encodeErrorHeaderValue,
   getServerFunctionMetadata,
+  hasFlashCookie,
   isServerFunction,
   subscribeFlightData,
   withMeta
@@ -22,12 +26,15 @@ export type {
   ServerFunctionMetadata,
   SingleFlightPayload
 } from "./shared.js";
+export { decodeFlashCookie, encodeFlashCookie } from "./flash.js";
+export type { FlashSubmission } from "./flash.js";
 import { ServerFunction } from "./shared.js";
 
 /**
  * The request event a server function call runs under: the base
- * `RequestEvent` (request + locals) plus `serverOnly`, set when the call is
- * an in-process SSR invocation whose result never serializes to a client.
+ * `RequestEvent` (request + locals) with `serverOnly` added, set when the
+ * call is an in-process SSR invocation whose result never serializes to a
+ * client.
  */
 export interface ServerFunctionEvent extends RequestEvent {
   serverOnly?: boolean;
@@ -63,6 +70,29 @@ export interface ServerFunctionOutcome {
   request: Request;
   /** Whether the result was thrown rather than returned. */
   thrown: boolean;
+  /**
+   * The URL the client will show after the mutation — the redirect
+   * `Location` when the outcome carries one (resolved against the request
+   * URL, as a browser would), the referring page otherwise. Undefined
+   * without a usable referer (a non-browser caller has no page to produce
+   * data for) and for redirects leaving the app's origin: produce no data
+   * when this is undefined.
+   */
+  targetUrl: string | undefined;
+  /**
+   * The outcome's `X-Revalidate` keys, split — the invalidation scope the
+   * mutation declared. Undefined when the outcome carries none (integrations
+   * typically collect everything for the target in that case).
+   */
+  revalidateKeys: string[] | undefined;
+  /**
+   * The request headers with the mutation's cookie effects applied: the
+   * event response's `Set-Cookie`s (set during the call), then the
+   * outcome's own (e.g. `redirect(to, { headers })`), later winning on
+   * conflict, deletions honored. Build the data-collection request from
+   * these so re-run reads observe post-mutation cookie state.
+   */
+  foldedHeaders: Headers;
 }
 
 /**
@@ -77,13 +107,95 @@ export interface ServerFunctionOutcome {
  * Runs after `transformResult`, only for scripted calls that sent
  * `SINGLE_FLIGHT_HEADER` on the request, on returned results and thrown
  * `Response`/`ResponseEnvelope` control-flow signals alike (plain thrown
- * errors never collect). The handler owns the enveloping: contributed data
- * ships as `{ value, data }` under the single-flight response header.
+ * errors never collect, and neither do raw body-carrying `Response` values
+ * — those are the caller's verbatim payload). The handler owns the
+ * enveloping: contributed data ships as `{ value, data }` under the
+ * single-flight response header. The generic halves of collection arrive
+ * pre-digested on the outcome (`targetUrl`, `revalidateKeys`,
+ * `foldedHeaders`); the hook supplies only the data strategy.
  */
 export type CollectFlightDataHook = (
   event: ServerFunctionEvent,
   outcome: ServerFunctionOutcome
 ) => unknown | Promise<unknown>;
+
+/**
+ * Wraps a server function execution — the per-invocation seam for
+ * framework policies (per-function middleware, auth, logging, error
+ * mapping). Called inside the call's event scope with the invocation
+ * identity already established: `getServerFunctionInvocation()` answers
+ * before, during and after `run()`. Must return (or resolve to) `run()`'s
+ * result — replacing it replaces the function's result; throwing routes
+ * through the handler's normal error encoding.
+ *
+ * The context carries the call's identity (`id`, parsed `args`), its
+ * `event`, and how it arrived: `direct` is `true` for in-process SSR calls
+ * (where `request` is absent) and `false` for HTTP dispatch. On the direct
+ * path the wrapper must stay transparent for synchronous functions —
+ * return `run()`'s value, not an unconditional promise, unless it needs to
+ * be async.
+ */
+export type WrapInvocationHook = (
+  run: () => unknown,
+  context: {
+    id: string;
+    args: unknown[];
+    event: ServerFunctionEvent;
+    request?: Request;
+    direct: boolean;
+  }
+) => unknown;
+
+/**
+ * Request headers with `setCookies` folded into the `Cookie` header, as the
+ * browser would have applied them before its next request. Later entries
+ * win on conflict, and deletions are honored (`Max-Age` at or below zero,
+ * `Expires` in the past). The input headers are not modified.
+ *
+ * For work re-run on the server after a mutation — a
+ * `CollectFlightDataHook` gathering fresh data, typically. That pass starts
+ * from the request that triggered the mutation, whose cookies are
+ * pre-mutation by definition, so a read depending on a session the mutation
+ * just established would otherwise see the old state. Which responses
+ * contribute their `Set-Cookie`s, and in what order, is the caller's
+ * decision.
+ *
+ * @example
+ * ```ts
+ * const headers = foldSetCookies(event.request.headers, [
+ *   ...(event.response?.headers?.getSetCookie() ?? []),
+ *   ...(outcome.response?.headers?.getSetCookie() ?? [])
+ * ]);
+ * ```
+ */
+export function foldSetCookies(headers: Headers, setCookies: readonly string[]): Headers;
+
+/** Options for `createNoJSHandler`. */
+export interface NoJSHandlerOptions {
+  /** The app's mount path, for resolving a relative redirect `Location`. */
+  base?: string;
+}
+
+/**
+ * Builds the `handleNoJS` implementation for the no-JS form convention: a
+ * form posted without the client runtime has no way to receive a value, so
+ * the call redirects back to the referring page (or to the result's own
+ * `Location`, resolved against `base`) with the outcome riding a one-shot
+ * flash cookie. `303 See Other` turns the POST into a GET unless the result
+ * names a redirect status of its own. A result that is already a `Response`
+ * carries its meaning in its metadata and is not flashed.
+ *
+ * The render that follows reads the cookie with `decodeFlashCookie` and
+ * surfaces the outcome however it likes — that half is the integration's.
+ *
+ * The handler applies to every call it receives. `handleServerFunctionRequest`
+ * already uses it for browser form posts, so wire it explicitly only to set
+ * a `base`, or to extend the convention to direct HTTP calls by registering
+ * it through `configureServerFunctionsServer`.
+ */
+export function createNoJSHandler(
+  options?: NoJSHandlerOptions
+): (result: unknown, request: Request, args: unknown[], thrown?: boolean) => Response;
 
 /** Options for `configureServerFunctionsServer`. */
 export interface ServerFunctionsServerConfig {
@@ -95,6 +207,14 @@ export interface ServerFunctionsServerConfig {
    * an established request scope parks on the global.
    */
   provideEvent?: <T>(event: ServerFunctionEvent, fn: () => T) => T;
+  /**
+   * Wraps every server function execution — HTTP dispatch and direct SSR
+   * calls alike — with the invocation identity already established (see
+   * `WrapInvocationHook`). The per-invocation seam for framework policies:
+   * per-function middleware, auth, logging, error mapping. A per-request
+   * option overrides it for HTTP dispatch.
+   */
+  wrapInvocation?: WrapInvocationHook;
   /**
    * The single-flight hook: produces the data payload folded into
    * responses of calls that opted in (see `CollectFlightDataHook`).
@@ -112,13 +232,53 @@ export interface ServerFunctionsServerConfig {
   transformResult?(
     event: ServerFunctionEvent,
     result: unknown,
-    context: { instance: string | null; request: Request; thrown?: boolean }
+    context: {
+      id: string;
+      args: unknown[];
+      instance: string | null;
+      request: Request;
+      thrown?: boolean;
+    }
   ): unknown | ResponseEnvelope | Promise<unknown | ResponseEnvelope>;
+  /**
+   * `transformResult`'s counterpart for the single-flight fold: when a
+   * call's flight payload needs a body only a policy knows how to build
+   * (frames' `frameTransformFlightResult` — an invalidated entry is
+   * markup), this gets first refusal on the `{ value, data }` outcome.
+   * Return a `Response` to carry the outcome (call headers and cookies are
+   * copied onto it), or `undefined` to decline and keep the plain
+   * serialized envelope. A per-request option overrides it.
+   */
+  transformFlightResult?(
+    event: ServerFunctionEvent,
+    outcome: { value: unknown; data: unknown },
+    context: { id: string; args: unknown[]; instance: string | null; request: Request }
+  ): Response | undefined | Promise<Response | undefined>;
   /**
    * The in-process mirror of `transformResult` for direct (same-server)
    * calls during document SSR — e.g. frames' `frameTransformDirectResult`.
    */
-  transformDirectResult?(value: unknown, options: { id: string }): unknown;
+  transformDirectResult?(
+    value: unknown,
+    options: { id: string; args: unknown[]; event: ServerFunctionEvent }
+  ): unknown;
+  /**
+   * Server-wide response builder for calls made without the client runtime
+   * (see `handleNoJS` in `HandleServerFunctionRequestOptions`); a
+   * per-request option overrides it. Set it to `createNoJSHandler({ base })`
+   * to apply the convention to every non-scripted call rather than only to
+   * browser form posts, to a handler of your own to replace it, or to
+   * `null` to disable the built-in convention and answer form posts with
+   * the plain serialized response.
+   */
+  handleNoJS?:
+    | ((
+        result: unknown,
+        request: Request,
+        args: unknown[],
+        thrown?: boolean
+      ) => Response | Promise<Response>)
+    | null;
   /**
    * Endpoint the HTTP handler is mounted on, used for the `url` of SSR'd
    * references (e.g. form actions) — must match the client configuration.
@@ -232,17 +392,33 @@ export function GET<A extends readonly any[], R>(
   fn: (...args: A) => R
 ): ServerFunction<A, Awaited<R>>;
 
-/** Identity of the currently executing server function. */
-export interface ServerFunctionMeta {
+/** Identity of the currently executing server function call. */
+export interface ServerFunctionInvocation {
   id: string;
 }
 
 /**
- * Reads the calling server function's meta (its id) off the current request
- * event — usable inside a server function body, e.g. to key caches or logs
- * by function. Returns undefined outside a server function call.
+ * Reads the in-flight server function invocation (its id) for the current
+ * request event — usable inside a server function body, e.g. to key caches
+ * or logs by function. Returns undefined outside a server function call.
+ * The state lives in a module-private WeakMap keyed by the per-call request
+ * event (never in `event.locals`, which derived events share with their
+ * outer event). Distinct from `getServerFunctionMetadata(fn)`, which reads
+ * a reference's static declaration metadata; this describes the call
+ * currently executing.
  */
-export function getServerFunctionMeta(): ServerFunctionMeta | undefined;
+export function getServerFunctionInvocation(): ServerFunctionInvocation | undefined;
+
+/**
+ * The event-keyed half of `getServerFunctionInvocation`, for callers handed
+ * an event outside its provideEvent scope (the handler's result transforms
+ * run after the scope has exited). Integration plumbing — application code
+ * reads the ambient accessor instead.
+ * @internal
+ */
+export function getEventServerFunctionInvocation(
+  event: RequestEvent | undefined
+): ServerFunctionInvocation | undefined;
 
 /**
  * Hooks layering framework policy onto `handleServerFunctionRequest`.
@@ -262,20 +438,37 @@ export interface HandleServerFunctionOptions {
    */
   provideEvent?<T>(event: ServerFunctionEvent, fn: () => T): T;
   /**
+   * Overrides the configured per-invocation wrap for this handler — same
+   * contract as the `wrapInvocation` config option (see
+   * `WrapInvocationHook`), except it only applies to HTTP dispatch (a
+   * per-request option can't see direct SSR calls).
+   */
+  wrapInvocation?: WrapInvocationHook;
+  /**
    * Observes or replaces the function's result before encoding — the
    * extension point for response metadata policies (headers, statuses,
    * substituted results). Runs for returned and thrown results alike
    * (`context.thrown` distinguishes); `context.instance` is null for no-JS
-   * calls. Return the result unchanged to pass through, or a
-   * `ResponseEnvelope` (exposed through the core entry) to send HTTP
-   * metadata plus a structured payload. Runs before `collectFlightData`,
-   * so the flight hook sees the transformed outcome — use
-   * `collectFlightData`, not this, to fold data into the response.
+   * calls. The context carries the call's identity — the function `id` and
+   * the parsed `args` the implementation was invoked with — matching the
+   * direct-call mirror (`transformDirectResult`), so a policy keying state
+   * by the call works over either dispatch path. Return the result
+   * unchanged to pass through, or a `ResponseEnvelope` (exposed through
+   * the core entry) to send HTTP metadata plus a structured payload. Runs
+   * before `collectFlightData`, so the flight hook sees the transformed
+   * outcome — use `collectFlightData`, not this, to fold data into the
+   * response.
    */
   transformResult?(
     event: ServerFunctionEvent,
     result: unknown,
-    context: { instance: string | null; request: Request; thrown?: boolean }
+    context: {
+      id: string;
+      args: unknown[];
+      instance: string | null;
+      request: Request;
+      thrown?: boolean;
+    }
   ): unknown | ResponseEnvelope | Promise<unknown | ResponseEnvelope>;
   /**
    * Overrides the configured single-flight hook for this handler — same
@@ -284,12 +477,23 @@ export interface HandleServerFunctionOptions {
    */
   collectFlightData?: CollectFlightDataHook;
   /**
+   * Overrides the configured single-flight fold policy for this handler —
+   * same contract as the `transformFlightResult` config option.
+   */
+  transformFlightResult?(
+    event: ServerFunctionEvent,
+    outcome: { value: unknown; data: unknown },
+    context: { id: string; args: unknown[]; instance: string | null; request: Request }
+  ): Response | undefined | Promise<Response | undefined>;
+  /**
    * Builds the response for calls made without the client runtime (no
-   * instance header — no-JS form posts, direct HTTP) — the extension
-   * point for conventions like redirect-with-flash-cookie. Receives the
+   * instance header — no-JS form posts, direct HTTP). Receives the
    * (transformed) result, the request, and the decoded arguments; `thrown`
-   * is set when the result was thrown rather than returned. Defaults to
-   * the normal serialized response.
+   * is set when the result was thrown rather than returned.
+   *
+   * Overrides the configured hook, which in turn overrides the built-in
+   * `createNoJSHandler()` applied to browser form posts. Other
+   * no-instance callers get the normal serialized response.
    */
   handleNoJS?(
     result: unknown,
@@ -311,6 +515,27 @@ export interface HandleServerFunctionOptions {
  * (default `/_server`); platform adapters (h3, express, ...) convert their
  * request shape to a web `Request` around it.
  *
+ * ## Thrown-error sanitization (security default)
+ *
+ * A thrown `Response`/envelope (`redirect`/`reload`/`respond`) is intentional
+ * control flow and is forwarded untouched. A *plain* thrown value (a bare
+ * `Error`, string, or object) is different: serialized verbatim it would ship
+ * its `message` and every own-property to the client — a driver/ORM error's
+ * failing query, connection string, or bound parameters included. So outside
+ * development (`process.env.NODE_ENV !== "development"`) a plain thrown value
+ * is replaced with a generic `Error` before serialization; the client still
+ * receives *an* `Error` (the shape `submission.error` etc. expect), just with
+ * no leaked content. Development keeps full fidelity (message, stack,
+ * own-props) for DX and the dev toolbar inspector.
+ *
+ * Escape hatch: brand the value with `markSafeError` (`Symbol.for(
+ * "solid.SafeError")`) to send its content intact in every environment.
+ * A `wrapInvocation`/`transformResult` override that maps errors expresses
+ * intent the same way — throw a `Response`/envelope, or brand the mapped
+ * error safe; an unbranded plain error it lets propagate is sanitized like
+ * any other, so a framework onError policy must brand its result to keep a
+ * custom client-facing message in production.
+ *
  * @example
  * ```ts
  * import { handleServerFunctionRequest } from "@solidjs/web/server-functions";
@@ -326,3 +551,15 @@ export function handleServerFunctionRequest(
   request: Request,
   options?: HandleServerFunctionOptions
 ): Promise<Response>;
+
+/** Message a sanitized (production) server error carries on the wire. */
+export const GENERIC_SERVER_ERROR_MESSAGE: string;
+
+/**
+ * The production error-sanitization policy `handleServerFunctionRequest`
+ * applies to a plain thrown value before serialization. Returns `value`
+ * unchanged in development or when it is branded safe (`markSafeError`);
+ * otherwise returns a generic `Error` carrying `GENERIC_SERVER_ERROR_MESSAGE`.
+ * Exposed for frameworks composing their own dispatch around the same policy.
+ */
+export function sanitizeServerError(value: unknown): unknown;
