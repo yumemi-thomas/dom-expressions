@@ -239,17 +239,16 @@ impl<'a, 'source> AstDomTransform<'a, 'source> {
         // property write. Judging the raw AST here instead promoted the value
         // AND left the attribute plan alive — the same value emitted twice,
         // and two trace decisions colliding over one censused site.
-        let attribute_child = (!is_void_element(&tag_name)
-            && !has_spread
-            && element.children.is_empty())
-        .then(|| children_attribute_container(element))
-        .flatten()
-        .filter(|container| {
-            container
-                .expression
-                .as_expression()
-                .is_none_or(|expression| self.evaluate_confident(expression).is_none())
-        });
+        let attribute_child =
+            (!is_void_element(&tag_name) && !has_spread && element.children.is_empty())
+                .then(|| children_attribute_container(element))
+                .flatten()
+                .filter(|container| {
+                    container
+                        .expression
+                        .as_expression()
+                        .is_none_or(|expression| self.evaluate_confident(expression).is_none())
+                });
         let children_from_attribute = attribute_child.is_some();
         let element: &JSXElement<'a> = if let Some(container) = attribute_child {
             let mut clone = element.clone_in(self.allocator);

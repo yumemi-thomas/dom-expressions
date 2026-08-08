@@ -465,9 +465,11 @@ mod tests {
         .expect("tracing was requested");
 
         assert!(
-            trace.sites.iter().any(|site| site.kind
-                == ExecutionSiteKind::EventHandler
-                && site.decision == TerminalDecision::Callback(CallbackDecision::LaterEvent)),
+            trace
+                .sites
+                .iter()
+                .any(|site| site.kind == ExecutionSiteKind::EventHandler
+                    && site.decision == TerminalDecision::Callback(CallbackDecision::LaterEvent)),
             "an unfoldable handler is a later-event callback: {:?}",
             trace.sites
         );
@@ -527,8 +529,11 @@ mod tests {
         .semantic_trace
         .expect("tracing was requested");
         assert!(
-            trace.sites.iter().any(|site| site.kind == ExecutionSiteKind::Ref
-                && site.decision == TerminalDecision::Callback(CallbackDecision::RefApply)),
+            trace
+                .sites
+                .iter()
+                .any(|site| site.kind == ExecutionSiteKind::Ref
+                    && site.decision == TerminalDecision::Callback(CallbackDecision::RefApply)),
             "an unfoldable ref is a ref-apply callback: {:?}",
             trace.sites
         );

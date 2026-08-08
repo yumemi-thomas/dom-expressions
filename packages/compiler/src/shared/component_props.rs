@@ -7,7 +7,9 @@ use oxc_span::Span;
 
 use crate::dom::element::AstDomTransform;
 
-pub(crate) trait ComponentPropContext<'a>: crate::shared::condition::ConditionBuilder<'a> {
+pub(crate) trait ComponentPropContext<'a>:
+    crate::shared::condition::ConditionBuilder<'a>
+{
     fn allocator(&self) -> &'a Allocator;
     fn ast(&self) -> AstBuilder<'a>;
     fn mark_merge_props(&mut self);

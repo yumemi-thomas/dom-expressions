@@ -62,7 +62,6 @@ fn returns_owned_source_maps_and_typed_errors() {
     assert_eq!(configuration.kind(), CompileErrorKind::Configuration);
 }
 
-
 fn traced(source: &str, inline_styles: bool) -> dom_expressions_compiler::SemanticTrace {
     compile(
         source,

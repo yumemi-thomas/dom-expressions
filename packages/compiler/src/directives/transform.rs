@@ -622,8 +622,7 @@ impl<'a> DirectivesTransform<'a> {
                 if let Some(name_argument) = self.dev_name_argument(name) {
                     create_args.push(name_argument);
                 }
-                let replaced =
-                    std::mem::replace(expression, self.call(&create_local, create_args));
+                let replaced = std::mem::replace(expression, self.call(&create_local, create_args));
                 // The function subtree is discarded on the client: whatever
                 // it referenced may now be orphaned, and only those bindings
                 // are eligible for the post-transform shake.

@@ -62,8 +62,8 @@ impl<'c> Classify<'c> {
         expression: &Expression<'_>,
         check_tags: bool,
     ) -> bool {
-        let marker_static = leading_from
-            .is_some_and(|from| self.marker_between(from, expression.span().start));
+        let marker_static =
+            leading_from.is_some_and(|from| self.marker_between(from, expression.span().start));
         let dynamic =
             !marker_static && is_dynamic_with_namespaces(expression, check_tags, self.bindings);
         #[cfg(all(test, feature = "node"))]
@@ -78,11 +78,12 @@ impl<'c> Classify<'c> {
     /// classify the same source identically.
     pub(crate) fn is_dynamic_child_slot(&self, child: &JSXChild<'_>) -> bool {
         match child {
-            JSXChild::ExpressionContainer(container) => {
-                container.expression.as_expression().is_some_and(|expression| {
+            JSXChild::ExpressionContainer(container) => container
+                .expression
+                .as_expression()
+                .is_some_and(|expression| {
                     self.is_dynamic(Some(container.span.start), expression, false)
-                })
-            }
+                }),
             JSXChild::Spread(spread) => self.is_dynamic(None, &spread.expression, false),
             _ => false,
         }
