@@ -21,13 +21,23 @@ const ENVELOPE = Symbol.for("solid.ResponseEnvelope");
  * (non-redirect) status and encodes `value` as the body through the codec,
  * while client-only integrations read `value` directly — no reparse.
  */
-export class ResponseEnvelope {
-  constructor(response, value) {
-    this.response = response;
-    this.value = value;
+// PURE-annotated factory (same convention as solid's MockPromise): the brand
+// lives on the prototype, but a bare top-level `C.prototype[X] = true` is a
+// module side effect that pins the class into every bundle including this
+// module — client bundles that never construct or brand-check an envelope
+// were retaining it. Wrapping the declaration and the brand assignment in one
+// pure expression lets the whole thing shake when unreferenced. (A `static {}`
+// block would NOT work: bundlers treat static blocks as side-effectful.)
+export const ResponseEnvelope = /* @__PURE__ */ (() => {
+  class ResponseEnvelope {
+    constructor(response, value) {
+      this.response = response;
+      this.value = value;
+    }
   }
-}
-ResponseEnvelope.prototype[ENVELOPE] = true;
+  ResponseEnvelope.prototype[ENVELOPE] = true;
+  return ResponseEnvelope;
+})();
 
 /** Whether `value` is a `ResponseEnvelope` (robust across module copies). */
 export function isResponseEnvelope(value) {
@@ -96,7 +106,22 @@ export const REVALIDATE_HEADER = "X-Revalidate";
 
 function initWithRevalidate(init) {
   const { revalidate, ...responseInit } = init;
-  const headers = new Headers(responseInit.headers);
+  // Copy preserving multiple Set-Cookie values: Headers-to-Headers copying
+  // through the constructor folds them into one comma-joined entry on some
+  // runtimes (a folded Set-Cookie is corrupt). Plain-object inits cannot
+  // carry duplicates and pass through as-is.
+  let headers;
+  if (responseInit.headers && responseInit.headers.getSetCookie) {
+    headers = new Headers();
+    responseInit.headers.forEach((value, key) => {
+      if (key !== "set-cookie") headers.append(key, value);
+    });
+    for (const cookie of responseInit.headers.getSetCookie()) {
+      headers.append("Set-Cookie", cookie);
+    }
+  } else {
+    headers = new Headers(responseInit.headers);
+  }
   revalidate !== undefined && headers.set(REVALIDATE_HEADER, revalidate.toString());
   return { responseInit, headers };
 }

@@ -39,8 +39,21 @@ import {
   runWithOwner,
   NoHydration,
   Hydration,
-  runInServerComponentScope
+  runInServerComponentScope,
+  ssrHandleError,
+  ssrAsyncValue,
+  creationStamp
 } from "rxcore";
+
+// The reactive-scope creation stamp (same gate the live-holes engine uses,
+// see server.js): an arg expression whose evaluation CREATES reactive scopes
+// (a projection, a memo minted inline) is not idempotently re-runnable —
+// each ledger sweep would mint a fresh scope with a fresh identity and
+// re-emit forever (a per-eval projection re-ships a new trace per commit and
+// its pump never ends: the hung-stream disease). Such args latch: they ship
+// their first value and the scope they minted carries its own liveness.
+// Cores without the stamp fall back to "never moved" (bindings stay open).
+const scopeStamp = typeof creationStamp === "function" ? creationStamp : () => 0;
 
 /**
  * Render server-owned output under NoHydration semantics (mimicking solid's
@@ -78,8 +91,9 @@ function serverOwned(render) {
 function serverComponentScope(render) {
   return runInServerComponentScope ? runInServerComponentScope(render) : render();
 }
-import { renderToStream } from "./server.js";
+import { renderToStream, createLiveHoles } from "./server.js";
 import { createJSONSerializer } from "./serializer.js";
+import { envelopeContainerTraces, isContainerTraced } from "./frame-container-plugin.js";
 import {
   ChunkReader,
   SINGLE_FLIGHT_HEADER,
@@ -163,6 +177,54 @@ export function createFrameSink(emit, frame) {
   // Fragments that streamed styles ahead of a grouped reveal; the group's
   // reveal chunk must tell the consumer to wait on them.
   const styledKeys = new Set();
+  // The binding ledger (DR-2 case 1): open bindings for re-runnable slot
+  // args — compiled getters, thunks, memos passed whole — re-evaluated at
+  // every commit the response observes. A commit is any settlement the sink
+  // sees flow through it: a data flush (a serialized promise resolving, an
+  // iterator yielding), a fragment resolving, a pending arg's retry
+  // succeeding. Sweeps coalesce per microtask and are equality-gated inside
+  // each binding, so a quiet ledger costs one comparison per binding per
+  // commit. Refs MINTED by sweeps are excluded from the funnel — their own
+  // flushes must not re-trigger the sweep that produced them, or a getter
+  // returning fresh object identities would loop the response forever; each
+  // real commit then drives at most one re-emit per binding.
+  //
+  // Keyed by `(occurrence, arg)`, replace-on-reopen: one live binding per
+  // arg position. A re-render of the same occurrence within one response —
+  // the same `$key` rendered twice, or (designed, not yet built) a
+  // generator component's next yield — SUPERSEDES the previous render's
+  // binding: the stale closure stops sweeping the moment the fresh one
+  // opens, instead of both re-emitting per commit.
+  const bindings = new Map();
+  const sweepMinted = new Set();
+  const argRefVersions = new Map();
+  let sweepScheduled = false;
+  let closed = false;
+  // The commit epoch: bumped once per sweep batch, exposed so the reactive
+  // core can cache sync derivations per epoch (a memo pulled twice in one
+  // sweep computes once; a memo pulled across commits recomputes — the
+  // client contract applied to the server, without a subscriber graph).
+  let epoch = 0;
+  const sweep = () => {
+    epoch++;
+    for (const b of [...bindings.values()]) {
+      try {
+        b.sweep();
+      } catch (_) {
+        // A sweep failure (a serializer already closed at the end-of-response
+        // latch) must not take the stream down: the binding's last emitted
+        // value stands.
+      }
+    }
+  };
+  const scheduleSweep = () => {
+    if (closed || sweepScheduled || !bindings.size) return;
+    sweepScheduled = true;
+    queueMicrotask(() => {
+      sweepScheduled = false;
+      if (!closed) sweep();
+    });
+  };
   // Fragment keys registered while a REGION (a `{$frame}` slot arg) resolves,
   // mapped to that region's childId. A region is a nested frame the client
   // owns end-to-end, so its Suspense fragment/reveal must route to the region,
@@ -181,9 +243,7 @@ export function createFrameSink(emit, frame) {
     shell(html, meta = {}) {
       // Pre-flush assets (entry modules, hoisted boundary styles) are head
       // splices in the document sink; a frame carries them as an assets chunk
-      // ahead of the shell html. `meta.assets` (evaluated useAssets HTML) is
-      // document-head material with no frame representation — frames are
-      // boundary content, not documents — so it is dropped.
+      // ahead of the shell html.
       if (meta.preloads && meta.preloads.size) {
         const styles = [];
         const modules = [];
@@ -219,6 +279,7 @@ export function createFrameSink(emit, frame) {
       }
       if (typeof record === "string") {
         emit({ type: "data", id, version, payload: record });
+        scheduleSweep();
       } else {
         emit({
           type: "data",
@@ -228,6 +289,7 @@ export function createFrameSink(emit, frame) {
           node: record.node,
           initial: record.initial
         });
+        if (!sweepMinted.has(record.key)) scheduleSweep();
       }
     },
     fragment(key, value, meta = {}) {
@@ -254,6 +316,9 @@ export function createFrameSink(emit, frame) {
         emit(chunk);
       }
       emit({ type: "fragment", id: fid, version, key, html: value });
+      // A fragment resolving is a settlement: values its async work produced
+      // are now visible to watched args.
+      scheduleSweep();
       // A fragment that ERRORED still reveals (its html is the fallback /
       // error template), but the failure is surfaced as a keyed error chunk
       // — the frame protocol has no `<key>_fr` rejection to ride.
@@ -301,6 +366,12 @@ export function createFrameSink(emit, frame) {
       emit({ type: "assets", id, version, key: "", modules: [url] });
     },
     end() {
+      // The end-of-response latch: one final synchronous sweep so a commit
+      // that landed in the last flush still ships before `complete` (the
+      // scheduled microtask would lose that race). Completion latches every
+      // binding's last value as final.
+      if (bindings.size) sweep();
+      closed = true;
       emit({ type: "complete", id, version });
     },
     error(errorId, error) {
@@ -317,6 +388,54 @@ export function createFrameSink(emit, frame) {
     // frame to the arg's marker range and the host routes/buffers by id.
     region(childId, html) {
       emit({ type: "html", id: childId, version, html });
+    },
+    // A live-hole re-emission (Stage 3): the hole's re-resolved HTML, keyed
+    // by its marker id — the consumer morphs the marked range in place.
+    hole(key, html) {
+      emit({ type: "hole", id, version, key, html });
+    },
+    // A live attr-hole re-emission: the addressed element's rebuilt
+    // attribute text, plus the names that vanished since the last emission
+    // (the server holds the previous text — the client never tracks name
+    // history).
+    attr(key, attrs, removed) {
+      const chunk = { type: "attr", id, version, key, attrs };
+      if (removed && removed.length) chunk.removed = removed;
+      emit(chunk);
+    },
+    // ---- the binding ledger (DR-2 case 1) ----
+    /**
+     * Open a watched-arg binding under its `(occurrence, arg)` key; it
+     * sweeps until the response completes or a re-render of the same
+     * position supersedes it.
+     */
+    openBinding(key, b) {
+      bindings.set(key, b);
+    },
+    /** A real error is terminal for its binding — same as the retry loop. */
+    closeBinding(key) {
+      bindings.delete(key);
+    },
+    /** Exclude a sweep-minted data ref's flushes from the commit funnel. */
+    mintRef(ref) {
+      sweepMinted.add(ref);
+    },
+    /**
+     * Allocate the next versioned-ref number for an arg position. Owned by
+     * the sink (not the binding) because data refs are write-once in the
+     * codec and positions outlive bindings: a superseding render's fresh
+     * binding must continue the position's sequence, never restart it.
+     */
+    nextArgRef(ledgerKey) {
+      const n = (argRefVersions.get(ledgerKey) || 0) + 1;
+      argRefVersions.set(ledgerKey, n);
+      return n;
+    },
+    /** An out-of-band commit signal (a pending arg's retry settling). */
+    commit: scheduleSweep,
+    /** The current commit epoch (see the ledger comment above). */
+    get epoch() {
+      return epoch;
     }
   };
 }
@@ -363,7 +482,29 @@ export function renderToFrameStream(code, options = {}) {
 export function renderServerComponent(component, options = {}) {
   return frameStream((sink, frame) => {
     const props = createSlotProps(sink, frame);
-    return () => serverComponentScope(() => component(props));
+    return () => {
+      // The out-of-band commit hook for the binding ledger. A server-owned
+      // render serializes nothing (the HTML is the data), so an async value
+      // settling INSIDE it — a promise memo resolving, an iterator memo
+      // yielding — produces no sink flush for the commit funnel to see. The
+      // reactive core pokes this hook at those settles (and pumps iterator
+      // memos only while it exists), so watched slot args reading them stay
+      // live for the response window.
+      const ctx = sharedConfig.context;
+      if (ctx) {
+        ctx.commit = sink.commit;
+        // Per-epoch memo caching (the ledger's derivation story): the core
+        // compares this at memo reads so sync derivations recompute across
+        // commits and stay cached within one.
+        ctx.commitEpoch = () => sink.epoch;
+        // Live markup holes (Stage 3): thunk content holes in this render
+        // mark their ranges and open ledger bindings — the call-driven face
+        // is live for the response window. The document face never sets
+        // this (t=0 latches to the V1 snapshot).
+        ctx.liveHoles = createLiveHoles(sink);
+      }
+      return serverComponentScope(() => component(props));
+    };
   }, options);
 }
 
@@ -425,9 +566,12 @@ function frameStream(makeCode, options) {
   };
 }
 
-/** The slot marker range for an occurrence, as a pre-rendered SSR value. */
+/** The slot marker range for an occurrence, as a pre-rendered SSR value.
+ * `$slot` opts the range out of live-hole marking: a slot is a client-owned
+ * position — the server can never re-render it, so a live binding over one
+ * would be permanently inert and its markers pure tax. */
 function slotRange(occurrence) {
-  return { t: `<!--slot:${occurrence}:start--><!--slot:${occurrence}:end-->` };
+  return { t: `<!--slot:${occurrence}:start--><!--slot:${occurrence}:end-->`, $slot: true };
 }
 
 // Occurrence ids embed user data (`$key`), and they land in contexts with
@@ -465,6 +609,49 @@ function occurrenceId(prop, raw, counts) {
   return `${prop}#${n}`;
 }
 
+/** An async value in the DR-2 value-tier sense: passed whole, rides the data
+ *  channel, and the consumer's READ settles. */
+function isAsyncValue(v) {
+  return (
+    !!v &&
+    typeof v === "object" &&
+    (typeof v.then === "function" || typeof v[Symbol.asyncIterator] === "function")
+  );
+}
+
+/**
+ * One cursor, two consumers (document face): pull the iterable's first step
+ * for the inline read, and mint a replay wrapper for the record — it
+ * re-yields that step before delegating to the live cursor, so the adopted
+ * client sees the complete sequence. The same tap shape the reactive core
+ * uses to share an iterator between a memo's value and its serialization.
+ */
+function tapFirstYield(iterable) {
+  const iter = iterable[Symbol.asyncIterator]();
+  // Normalized: protocol-loose producers may return a bare IteratorResult
+  // when a value is already buffered (seroval's deserialized streams do).
+  const firstStep = Promise.resolve(iter.next());
+  return {
+    first: firstStep.then(r => (r.done ? undefined : r.value)),
+    rest: {
+      [Symbol.asyncIterator]() {
+        let replayed = false;
+        return {
+          next: () => {
+            if (!replayed) {
+              replayed = true;
+              return firstStep;
+            }
+            return iter.next();
+          },
+          return: v => (iter.return ? iter.return(v) : Promise.resolve({ done: true, value: v })),
+          throw: e => (iter.throw ? iter.throw(e) : Promise.reject(e))
+        };
+      }
+    }
+  };
+}
+
 /**
  * Document-mode slot props — the t = 0 counterpart of
  * `createSlotProps`. During initial document SSR a server component
@@ -477,14 +664,49 @@ function occurrenceId(prop, raw, counts) {
  * in place. Occurrence identity (`$key`/positional) matches the chunk
  * producer exactly; nothing here is serialized — the page IS the payload.
  */
+/**
+ * Mint-suppress a slot FILL's render (document face): fill content is
+ * client-owned DOM the adopting frame claims, so nothing inside it may
+ * grow live-hole markers, `data-lha` addresses, or bindings — a server op
+ * morphing inside a claimed fill would replace nodes the client's reactive
+ * bindings hold. Compiled templates resolve their holes AT RENDER (`ssr()`
+ * call time), so the window wraps the render itself; async escalations
+ * inside it stay suppressed through `buildAsyncWrap`'s tag propagation,
+ * and walk-time holes (bare-thunk fills) are covered by the `$slot` tag on
+ * the range. Fill liveness is the RECORD's story: arg re-emissions update
+ * the adopted occurrence's props.
+ */
+function suppressedFill(render) {
+  const live = sharedConfig.context && sharedConfig.context.liveHoles;
+  if (!live) return render();
+  live.suppressed++;
+  try {
+    return render();
+  } finally {
+    live.suppressed--;
+  }
+}
+
 export function createDocumentSlotProps(clientProps, frameId) {
   const counts = Object.create(null);
   const getters = new Map();
-  const range = (occurrence, content) => [
-    { t: `<!--slot:${occurrence}:start-->` },
-    content,
-    { t: `<!--slot:${occurrence}:end-->` }
-  ];
+  // `$slot`-tagged like the stream face's slotRange: the engine resolves a
+  // slot-tagged value MINT-SUPPRESSED, so fill content — client-owned DOM
+  // the adopting frame claims — never grows live-hole markers or bindings.
+  // (A server hole op morphing inside a claimed fill would replace nodes
+  // the client's reactive bindings hold.) Fill liveness is the RECORD's
+  // story: arg re-emissions update the adopted occurrence's props. One
+  // known coarsening: a region (server JSX arg) placed by the fill resolves
+  // inside this suppressed span, so its interior holes keep the t=0 latch.
+  const range = (occurrence, content) => {
+    const r = [
+      { t: `<!--slot:${occurrence}:start-->` },
+      content,
+      { t: `<!--slot:${occurrence}:end-->` }
+    ];
+    r.$slot = true;
+    return r;
+  };
   // Client content renders under a per-occurrence hydration-key OWNER
   // scope, so the adopting client re-renders each slot under the SAME
   // scope and solid's registry claims the server-rendered nodes by key —
@@ -534,10 +756,12 @@ export function createDocumentSlotProps(clientProps, frameId) {
             // INSIDE scoped(): compiled component props are getters, so the
             // client's JSX evaluates lazily at access under the same keys —
             // plain JSX, no thunk convention.
-            return scoped(prop, () => {
-              const value = clientProps[prop];
-              return range(prop, typeof value === "function" ? value() : value);
-            });
+            return suppressedFill(() =>
+              scoped(prop, () => {
+                const value = clientProps[prop];
+                return range(prop, typeof value === "function" ? value() : value);
+              })
+            );
           }
           const raw = callArgs[0];
           const occurrence = occurrenceId(prop, raw, counts);
@@ -552,23 +776,90 @@ export function createDocumentSlotProps(clientProps, frameId) {
           // serialized once as hydration-data records (the occurrence's args
           // + the region html, keyed for the adopting frame's store) and the
           // client mounts it from there when the wrapper finally renders it.
-          // Unwrap function-valued args once (a function can't be serialized,
-          // so it is a thunk producing content or a scalar): resolve one-shot,
-          // then both the region-detection here and the t=0 arming below see
-          // the same classified value. This is how top-level one-shot reactive
-          // control flow (<For>/<Show>) reaches the region path when it arrives
-          // as a thunk/memo. Bounded against a pathological self-returning fn.
+          // Unwrap function-valued args (a function can't be serialized, so
+          // it is a thunk producing content or a getter producing data),
+          // then classify the result — region detection and the t=0 arming
+          // below see the same classified value. This is how top-level
+          // one-shot reactive control flow (<For>/<Show>) reaches the region
+          // path when it arrives as a thunk/memo.
+          //
+          // The evaluator is captured from the property DESCRIPTOR exactly
+          // as on the stream face (createSlotProps): compiled JSX props are
+          // getters — the SAME authored shape as a markup hole — and that
+          // re-runnable handle is what the case-1 ledger sweeps, so an
+          // expression arg stays as live at t=0 as it is on a call-driven
+          // stream. A NOT-READY first evaluation is pending per-arg, never
+          // a hold on the whole occurrence: the retry-loop promise takes
+          // the value's place and flows down the value-tier path — the
+          // inline fill's read suspends into the fill's OWN boundary (the
+          // client read's semantics exactly), the record ships the promise
+          // (the hydration serializer patches it on settle), and the
+          // binding opens unsettled, re-armed by the retry's onSettle.
+          const liveArgs =
+            sharedConfig.context && sharedConfig.context.live && sharedConfig.context.live.args;
           const vals = {};
+          const evals = {};
+          // Per-key ledger state: `settled` + the equality baseline. Kept
+          // as the PRE-TAP value — `vals` entries get replaced for tapped
+          // iterables (the rest-wrapper below), and comparing a
+          // re-evaluation against the wrapper would re-emit spuriously.
+          const states = {};
+          // Keys whose evaluation minted reactive scopes (scopeStamp moved):
+          // not re-runnable, so no watched binding opens for them below.
+          const minted = {};
           for (const key of Object.keys(raw)) {
             if (key === "$key") continue;
-            let value = raw[key];
-            for (let d = 0; typeof value === "function" && d < 16; d++) value = value();
+            const desc = Object.getOwnPropertyDescriptor(raw, key);
+            let evaluate = null;
+            let value;
+            if (desc.get) {
+              const get = desc.get;
+              evaluate = () => unwrapThunks(get.call(raw));
+            } else {
+              value = desc.value;
+              if (typeof value === "function") {
+                const fn = value;
+                evaluate = () => unwrapThunks(fn);
+              }
+            }
+            if (evaluate) {
+              evals[key] = evaluate;
+              const stampBefore = scopeStamp();
+              try {
+                value = evaluate();
+                states[key] = { settled: true, last: value };
+              } catch (err) {
+                const blocked = ssrHandleError && ssrHandleError(err);
+                if (!blocked) throw err;
+                const state = (states[key] = { settled: false, last: undefined });
+                value = retryArgUntilSettled(evaluate, blocked, key, occurrence, v => {
+                  state.settled = true;
+                  state.last = v;
+                  // The settle is a commit: other bindings may read the
+                  // same source. (This binding's own re-emission stays
+                  // gated on inequality with the value just recorded.)
+                  if (liveArgs) liveArgs.commit();
+                });
+              }
+              if (scopeStamp() !== stampBefore) minted[key] = true;
+            }
             vals[key] = value;
           }
           const regions = [];
           for (const key of Object.keys(vals)) {
             const value = vals[key];
-            if (isServerContent(value)) {
+            if (isContainerTraced(value)) {
+              // Container tier (DR-2 case 3): a traced container is DATA
+              // however object-shaped it is, and the check comes FIRST — the
+              // classifiers below read properties, and a pending projection
+              // proxy throws not-ready at any string-key get (isAsyncValue's
+              // `.then` probe would detonate here). The fill reads the proxy
+              // itself: settled reads pass through; a pending read throws
+              // not-ready into the hole machinery — a per-arg suspend, the
+              // value tier's own behavior. The record ships the proxy, which
+              // the serializer's trace plugin carries as snapshot + patches.
+              resolved[key] = value;
+            } else if (isServerContent(value)) {
               const childId = `${frameId}.${occurrence}.${key}`;
               const region = { key, childId, value, used: false, locked: false };
               regions.push(region);
@@ -589,11 +880,43 @@ export function createDocumentSlotProps(clientProps, frameId) {
                 // the same DOM contract as the boundary, one level down.
                 return [{ t: frameElementOpen(childId) }, value, { t: FRAME_ELEMENT_CLOSE }];
               };
+            } else if (ssrAsyncValue && isAsyncValue(value)) {
+              // DR-2 value tier, document face: the inline fill's read of an
+              // async arg must SUSPEND (throw not-ready into the engine's
+              // hole machinery, which re-pulls on settle), not read the raw
+              // promise — a raw read renders empty markup the adopted client
+              // then contradicts (it reads the record's settled value): a
+              // hydration mismatch instead of a covered pending state. The
+              // record is untouched — the async value itself still ships
+              // there and the document's data scripts stream its resolution,
+              // exactly as before.
+              //
+              // An async ITERABLE has one cursor and two consumers (this
+              // read wants the first yield; the record's serialization wants
+              // every yield), so it is tapped: the read settles on the first
+              // yield — markup is the V1 snapshot, later yields are the
+              // adopted client's story — and the record ships a replay
+              // wrapper that re-yields it before delegating, so the client
+              // still sees the full sequence.
+              let readable = value;
+              if (typeof value.then !== "function") {
+                const { first, rest } = tapFirstYield(value);
+                readable = first;
+                vals[key] = rest;
+              }
+              const read = ssrAsyncValue(readable);
+              Object.defineProperty(resolved, key, {
+                get: read,
+                enumerable: true,
+                configurable: true
+              });
             } else {
               resolved[key] = value;
             }
           }
-          const out = scoped(occurrence, () => range(occurrence, slot(resolved)));
+          const out = suppressedFill(() =>
+            scoped(occurrence, () => range(occurrence, slot(resolved)))
+          );
           const unused = regions.filter(r => !r.used);
           if (sharedConfig.context) {
             // One record shape (A5, server-components-principles.md): the
@@ -616,10 +939,17 @@ export function createDocumentSlotProps(clientProps, frameId) {
                 args[key] = { $frame: region.childId };
                 continue;
               }
-              if (isServerContent(value)) continue;
-              args[key] = value;
+              // Container check first for exactness: a store whose STATE has
+              // a `t` key would satisfy isServerContent's shape probe.
+              if (!isContainerTraced(value) && isServerContent(value)) continue;
+              // Containers (at any depth) ride the record as trace envelopes;
+              // everything else passes through by reference.
+              args[key] = envelopeContainerTraces(value);
             }
-            sharedConfig.context.serialize(`sc:slot:${frameId}:${occurrence}`, args);
+            // A CLONE serializes; `args` stays canonical for the ledger
+            // below — re-emissions mutate it and clone again, so the
+            // initial record can never change under a consumer.
+            sharedConfig.context.serialize(`sc:slot:${frameId}:${occurrence}`, { ...args });
             for (const region of unused) {
               // Lock BEFORE returning: the content is now committed to the data
               // channel, so any later async placement of this region must
@@ -637,9 +967,39 @@ export function createDocumentSlotProps(clientProps, frameId) {
                 resolveRegionHtml(sharedConfig.context, region.value)
               );
             }
+            // The document arg ledger (DR-2 case 1 at t=0): every
+            // re-runnable arg that classified as DATA opens a watched
+            // binding AFTER its record emitted, mirroring the stream face —
+            // the same authored getter shape stays live on both faces. Only
+            // on an armed document (live.args): the hostless fallback
+            // latches, like everything else at t=0.
+            if (liveArgs) {
+              for (const key of Object.keys(evals)) {
+                if (regions.some(r => r.key === key)) continue;
+                if (minted[key]) continue; // scope-minting eval: latched
+                const ledgerKey = `${frameId}:${occurrence}:${key}`;
+                openArgBinding(
+                  liveArgs,
+                  ledgerKey,
+                  occurrence,
+                  key,
+                  evals[key],
+                  states[key],
+                  value => {
+                    args[key] = envelopeContainerTraces(value);
+                    liveArgs.slot(frameId, occurrence, { ...args });
+                  }
+                );
+              }
+            }
           }
           return out;
         };
+        // A slot getter placed directly as a child (`{props.children}`) is a
+        // function-shaped hole; the tag opts it out of live-hole marking the
+        // same way it does on the stream face (the impurity gates would
+        // latch it anyway — this makes it exact rather than incidental).
+        fn.$lhSkip = true;
         getters.set(prop, fn);
       }
       return fn;
@@ -666,6 +1026,158 @@ function frameElementOpen(id) {
 const FRAME_ELEMENT_CLOSE = `</${FRAME_TAG}>`;
 
 /**
+ * The document face's live-hole plumbing (Stage 4): one engine per document
+ * render, armed lazily by the first server component that renders inline.
+ *
+ * The engine is the same Stage 3 ledger the stream face runs — what changes
+ * is the sink (ops ride ONE `sc:live` hydration record whose value is a
+ * ReadableStream the data scripts keep feeding) and the arming scope (the
+ * engine gates minting on the server-component context barrier, so plain
+ * document content keeps its t=0 latch and its exact bytes). The record
+ * serializes EAGERLY at arming: nothing re-notifies an adopted boundary
+ * about a late `_$HY.r` key, so the channel must exist in the data scripts
+ * before adoption drains — an empty closed stream costs a few bytes on
+ * documents whose holes never re-emit.
+ *
+ * The commit funnel is the adapter's own microtask sweep: the reactive core
+ * pokes `ctx.commit` at async settles (and pumps iterator memos only while
+ * it exists), exactly as on the stream face. `ctx.live.end` is the response
+ * latch — `flushEnd` runs it before the serializer flush: one final sweep
+ * ships last values, then the channel closes (an open stream would hold the
+ * response forever).
+ *
+ * CONTEXT GEOMETRY: components render under per-component context CLONES,
+ * so the ctx a server component arms under is usually not the root object
+ * the renderer's flush loop reads. Everything read DOWNWARD (`liveHoles`,
+ * `commit` — consumed by the subtree under the arm point) rides the clone:
+ * descendants spread-copy it. Everything read at the ROOT (the end latch,
+ * and the once-per-document arming dedupe — a second component elsewhere
+ * arms under a sibling clone that never saw the first) rides `ctx.live`,
+ * the shared slot the root context creates and every clone carries by
+ * reference.
+ */
+function armDocumentLiveHoles(ctx) {
+  if (!ctx || ctx.liveHoles !== undefined) return;
+  const live = ctx.live;
+  // A second server component under a fresh clone: adopt the document's
+  // already-armed engine (or its already-decided latch).
+  if (live && live.holes !== undefined) {
+    ctx.liveHoles = live.holes;
+    if (live.holes) {
+      ctx.commit = live.commit;
+      ctx.commitEpoch = live.commitEpoch;
+    }
+    return;
+  }
+  // Sync renders (no streaming serializer / no shared slot), noScripts
+  // documents (no data channel), and hostless environments latch at t=0:
+  // mark nothing. `null` records the decision (the arming checks are
+  // `!== undefined`).
+  if (
+    !live ||
+    !ctx.async ||
+    ctx.noHydrate ||
+    !ctx.serialize ||
+    typeof ReadableStream !== "function"
+  ) {
+    ctx.liveHoles = null;
+    if (live) live.holes = null;
+    return;
+  }
+  const bindings = new Map();
+  let epoch = 0;
+  let sweepScheduled = false;
+  let closed = false;
+  const sweep = () => {
+    epoch++;
+    for (const b of [...bindings.values()]) {
+      try {
+        b.sweep();
+      } catch (_) {
+        // A sweep failure must not take the document down: the binding's
+        // last emitted value stands.
+      }
+    }
+  };
+  const scheduleSweep = () => {
+    if (closed || sweepScheduled || !bindings.size) return;
+    sweepScheduled = true;
+    queueMicrotask(() => {
+      sweepScheduled = false;
+      if (!closed) sweep();
+    });
+  };
+  let channel;
+  ctx.serialize(
+    "sc:live",
+    new ReadableStream({
+      start(c) {
+        channel = c;
+      }
+    })
+  );
+  const push = op => {
+    if (!closed) channel.enqueue(op);
+  };
+  ctx.liveHoles = live.holes = createLiveHoles(
+    {
+      openBinding(key, b) {
+        bindings.set(key, b);
+      },
+      closeBinding(key) {
+        bindings.delete(key);
+      },
+      hole(key, html) {
+        push({ type: "hole", key, html });
+      },
+      attr(key, attrs, removed) {
+        const op = { type: "attr", key, attrs };
+        if (removed && removed.length) op.removed = removed;
+        push(op);
+      },
+      error(key, error) {
+        push({ type: "error", key, error });
+      },
+      commit: scheduleSweep,
+      get epoch() {
+        return epoch;
+      }
+    },
+    /* scoped */ true
+  );
+  ctx.commit = live.commit = scheduleSweep;
+  ctx.commitEpoch = live.commitEpoch = () => epoch;
+  // The document ARG ledger (DR-2 case 1 at t=0): slot-props invocations
+  // open watched-arg bindings into the same sweep set as the holes, and a
+  // re-emission ships the occurrence's whole record as a `slot` op on the
+  // same channel — values ride inline (the hydration serializer carries
+  // objects and promises natively; no versioned-ref indirection like the
+  // codec's). Store-keyed rather than geometry-routed, so ops carry the
+  // producing frame's id and only the owning boundary applies them.
+  // The arg-binding sink for the document face: same `openBinding`/
+  // `closeBinding`/`commit` surface as the stream sink, so `openArgBinding`
+  // serves both faces (only the emit strategy differs at the call sites).
+  live.args = {
+    openBinding(key, b) {
+      bindings.set(key, b);
+    },
+    closeBinding(key) {
+      bindings.delete(key);
+    },
+    slot(fid, occurrence, args) {
+      push({ type: "slot", fid, key: occurrence, args });
+    },
+    commit: scheduleSweep
+  };
+  live.end = () => {
+    if (closed) return;
+    if (bindings.size) sweep();
+    closed = true;
+    channel.close();
+  };
+}
+
+/**
  * The in-process mirror of `frameTransformResult`, for DOCUMENT SSR:
  * install as `configureServerFunctionsServer({ transformDirectResult })`
  * and a server function whose direct (same-process) call resolves to a
@@ -683,6 +1195,7 @@ export function frameTransformDirectResult(value, { id, args }) {
     // the client's content keeps full app context while the component's
     // own render is context-isolated.
     serverOwned(() => {
+      armDocumentLiveHoles(sharedConfig.context);
       const slotProps = createDocumentSlotProps(props, id);
       return serverComponentScope(() => component(slotProps));
     }),
@@ -758,6 +1271,151 @@ function isServerContent(value) {
   return false;
 }
 
+/** Bounded thunk unwrap: resolve nested thunks/memos to their value. */
+function unwrapThunks(value) {
+  for (let d = 0; typeof value === "function" && d < 16; d++) value = value();
+  return value;
+}
+
+/** The DR-3 rule-1 rejection: async slot args are data-only. */
+function contentArgError(key, occurrence) {
+  return new Error(
+    "Async slot arg resolved to JSX (arg '" +
+      key +
+      "' of " +
+      occurrence +
+      "). Async args must resolve to serializable values; render async content through a boundary instead."
+  );
+}
+
+/**
+ * The arg-level markup-hole retry loop (DR-2 value tier): a slot arg whose
+ * evaluation threw not-ready ships as this pending promise, re-evaluated
+ * each time the blocking async settles until an evaluation succeeds — then
+ * the promise resolves with that value and seroval's streaming
+ * serialization patches the record's data ref. A retry that throws a real
+ * error rejects the promise (the client `Loading` covering the consumption
+ * read errors instead of hanging). Retries run under the evaluation's
+ * owner, like `buildAsyncWrap`'s markup holes, so context reads inside the
+ * getter keep resolving. `onSettle` fires before the resolve — the watched
+ * binding (case 1) syncs its last-value there, and the settle doubles as a
+ * commit for the rest of the ledger.
+ */
+function retryArgUntilSettled(evaluate, blocked, key, occurrence, onSettle) {
+  const owner = getOwner();
+  return new Promise((resolve, reject) => {
+    const retry = () => {
+      try {
+        const value = owner ? runWithOwner(owner, evaluate) : evaluate();
+        if (isServerContent(value)) {
+          // DR-3 rule 1: markup emission is long past by the time this
+          // settles — there is no placeholder to fill retroactively.
+          reject(contentArgError(key, occurrence));
+          return;
+        }
+        if (onSettle) onSettle(value);
+        resolve(value);
+      } catch (err) {
+        const next = ssrHandleError && ssrHandleError(err);
+        if (next) next.then(retry, retry);
+        else reject(err);
+      }
+    };
+    blocked.then(retry, retry);
+  });
+}
+
+/**
+ * A watched-arg binding (DR-2 case 1): the ledger entry for one re-runnable
+ * slot arg, shared by BOTH faces. Opened after the occurrence's record
+ * emits; the sink sweeps it at every commit until the response completes. A
+ * sweep re-evaluates the arg under its render owner and, reference-equality
+ * gated, re-emits the occurrence's record through `emit` — the per-face
+ * transport strategy:
+ *
+ *   - stream face: scalars ride the record literally; objects mint a
+ *     VERSIONED ref (`arg:<occ>:<key>@<n>` — data refs are write-once in
+ *     the codec) and serialize the new value;
+ *   - document face: values ride INLINE in a fid-tagged `slot` op on the
+ *     `sc:live` channel — the hydration serializer carries objects and
+ *     promises natively per chunk, so there is no ref indirection.
+ *
+ * Shared semantics regardless of face:
+ *
+ *   - settled -> not-ready re-enters pending-with-previous: the emitted
+ *     pending promise is settled by the retry loop while the client's read
+ *     suspends holding its latest value;
+ *   - a real error is terminal: the arg re-ships rejected (the client read
+ *     throws into its covering boundary, diagnosably) and the binding
+ *     closes, mirroring the retry loop's rejection semantics;
+ *   - a re-evaluation producing JSX is the DR-3 rule-1 violation, rejected
+ *     with the same diagnostic as the retry loop.
+ *   - a re-evaluation that CREATES reactive scopes (scopeStamp moved —
+ *     e.g. a projection minted inline in the arg expression) closes the
+ *     binding and discards the minted duplicate: the expression is not
+ *     idempotently re-runnable, and the scope its first render shipped
+ *     carries its own liveness. The same latch the live-holes engine
+ *     applies to owner-creating holes.
+ *
+ * Pending bindings don't sweep — the retry loop owns their progress and its
+ * settle re-arms the ledger (`state` is shared with the retry's onSettle).
+ * Record re-emissions clone the canonical args object so in-process
+ * consumers (tests, same-tab transports) never see later mutations through
+ * an already-delivered chunk.
+ */
+function openArgBinding(sink, ledgerKey, occurrence, key, evaluate, state, emit) {
+  const owner = getOwner();
+  sink.openBinding(ledgerKey, {
+    sweep() {
+      if (!state.settled) return;
+      let value;
+      const stampBefore = scopeStamp();
+      try {
+        value = owner ? runWithOwner(owner, evaluate) : evaluate();
+      } catch (err) {
+        const blocked = ssrHandleError && ssrHandleError(err);
+        if (!blocked) {
+          sink.closeBinding(ledgerKey);
+          emit(Promise.reject(err instanceof Error ? err : new Error(String(err))));
+          return;
+        }
+        if (scopeStamp() !== stampBefore) {
+          // The re-evaluation minted reactive scopes before blocking: arming
+          // the retry loop would mint MORE per retry. Latch on the value
+          // already shipped instead.
+          sink.closeBinding(ledgerKey);
+          return;
+        }
+        state.settled = false;
+        emit(
+          retryArgUntilSettled(evaluate, blocked, key, occurrence, v => {
+            state.settled = true;
+            state.last = v;
+            sink.commit();
+          })
+        );
+        return;
+      }
+      if (scopeStamp() !== stampBefore) {
+        // Scope-minting evaluation (first render pre-dated the gate, or the
+        // expression turned impure): the minted value is a DUPLICATE scope,
+        // not an update — discard it and latch, exactly as the live-holes
+        // engine latches owner-creating holes.
+        sink.closeBinding(ledgerKey);
+        return;
+      }
+      if (value === state.last) return;
+      state.last = value;
+      if (isServerContent(value)) {
+        sink.closeBinding(ledgerKey);
+        emit(Promise.reject(contentArgError(key, occurrence)));
+        return;
+      }
+      emit(value);
+    }
+  });
+}
+
 export function createSlotProps(sink, frame) {
   const counts = Object.create(null);
   const getters = new Map();
@@ -784,6 +1442,20 @@ export function createSlotProps(sink, frame) {
           if (callArgs.length === 0 || callArgs[0] === undefined) {
             return slotRange(prop);
           }
+          // Slot records are emit-once: occurrence identity is positional
+          // (`counts`), so a live-hole re-evaluation reaching a called slot
+          // would mint new occurrences and re-serialize args — the double-
+          // data disease. First render stamps the engine so the enclosing
+          // hole latches instead of binding; a sweep that gets here anyway
+          // (the escalated-first-render case) aborts and closes the binding.
+          const live = sharedConfig.context && sharedConfig.context.liveHoles;
+          if (live) {
+            if (live.sweeping) {
+              live.gateHit = true;
+              return { t: "", $slot: true };
+            }
+            live.recordStamp++;
+          }
           const raw = callArgs[0];
           // Occurrence identity (RFC open question 1): a primitive `$key` arg
           // names the occurrence, so client state follows the entity across
@@ -795,6 +1467,9 @@ export function createSlotProps(sink, frame) {
           // re-sends dedupe anyway. `$key` matters when a live list reorders.
           const occurrence = occurrenceId(prop, raw, counts);
           const args = {};
+          // Watched-arg bindings to open AFTER the record emits (the ledger
+          // must never re-emit a record ahead of its first emission).
+          const opened = [];
           for (const key of Object.keys(raw)) {
             if (key === "$key") continue; // occurrence identity, not client data
             // Region ids derive from occurrence + arg name — stable across
@@ -821,12 +1496,67 @@ export function createSlotProps(sink, frame) {
               // top-level one-shot reactive control flow (<For>/<Show>) reaches
               // the content path when it arrives as a thunk/memo rather than an
               // eager node. Bounded against a pathological self-returning fn.
-              let value = raw[key];
-              for (let d = 0; typeof value === "function" && d < 16; d++) value = value();
+              //
+              // The evaluator is captured from the property DESCRIPTOR, not
+              // the property read: compiled JSX props are getters (evaluation
+              // happens at the read itself, so a not-ready `raw[key]` inside
+              // the catch would throw again), while author thunks and memos
+              // arrive as function values. Either shape yields a re-runnable
+              // `evaluate` — the handle both the retry loop and the watched
+              // binding (case 1) re-run.
+              const desc = Object.getOwnPropertyDescriptor(raw, key);
+              let evaluate = null;
+              let value;
+              // Shared with the retry loop's onSettle and the binding's
+              // sweeps: whether the arg has a successful value, and which.
+              let state = null;
+              const stampBefore = scopeStamp();
+              try {
+                if (desc.get) {
+                  const get = desc.get;
+                  evaluate = () => unwrapThunks(get.call(raw));
+                  value = evaluate();
+                } else {
+                  value = desc.value;
+                  if (typeof value === "function") {
+                    const fn = value;
+                    evaluate = () => unwrapThunks(fn);
+                    value = evaluate();
+                  }
+                }
+              } catch (err) {
+                // DR-2 value tier: a not-ready evaluation (an async memo, or a
+                // getter reading one) never holds the record and never kills
+                // the stream — the arg ships NOW as a pending promise and the
+                // markup-hole retry loop runs at the arg level: re-evaluate
+                // when the blocking async settles, settle the promise at the
+                // first successful evaluation. The client suspends at the
+                // consumption read, not here.
+                const blocked = ssrHandleError && ssrHandleError(err);
+                if (!blocked) throw err;
+                state = { settled: false, last: undefined };
+                const pendingState = state;
+                value = retryArgUntilSettled(evaluate, blocked, key, occurrence, v => {
+                  pendingState.settled = true;
+                  pendingState.last = v;
+                  // The settle is a commit: other watched args may read the
+                  // same source. (This binding's own re-emission stays gated
+                  // on inequality with the value just recorded.)
+                  sink.commit();
+                });
+              }
+              // Snapshot BEFORE classification: resolve/serialize below may
+              // create scopes of their own, which say nothing about the
+              // expression's re-runnability.
+              const mintedEval = scopeStamp() !== stampBefore;
               const t = typeof value;
               if (value == null || t === "string" || t === "number" || t === "boolean") {
                 args[key] = value;
-              } else if (isServerContent(value)) {
+                if (evaluate) state = { settled: true, last: value };
+              } else if (!isContainerTraced(value) && isServerContent(value)) {
+                // Containers fall through to the data path below (their
+                // serialization is the trace plugin's), and the guard keeps a
+                // store whose state has a `t` key out of the content path.
                 // Server JSX flows as a nested region, never as data — the
                 // no-double-serialize invariant (transport dispatch case 1):
                 // its html is the transfer; the client wraps the range without
@@ -852,16 +1582,50 @@ export function createSlotProps(sink, frame) {
                 args[key] = { $frame: childId };
               } else {
                 const ref = `arg:${occurrence}:${key}`;
-                ctx.serialize(ref, value);
+                // Containers (at any depth) swap for their trace envelopes
+                // before the value meets seroval — see envelopeContainerTraces.
+                ctx.serialize(ref, envelopeContainerTraces(value));
                 args[key] = { $ref: ref };
+                if (evaluate && !state) state = { settled: true, last: value };
               }
+              // A re-runnable arg that classified as DATA (settled or
+              // pending) is a watched binding — case 1's within-response
+              // liveness. Content args stay one-shot: a thunk producing JSX
+              // was the control-flow handoff into the region path, and
+              // regions have their own update story (DR-3). An eval that
+              // minted reactive scopes latches instead (see scopeStamp).
+              if (evaluate && state && !mintedEval) opened.push({ key, evaluate, state });
             } finally {
               ctx.registerFragment = origRegister;
             }
           }
-          sink.slot(occurrence, args);
+          // Deliver a CLONE and keep the canonical object for the ledger:
+          // re-emissions mutate `args` and clone again, so an in-process
+          // consumer's already-applied record never changes under it.
+          sink.slot(occurrence, { ...args });
+          const ctx = sharedConfig.context;
+          for (const b of opened) {
+            const key = b.key;
+            const ledgerKey = `${occurrence}:${key}`;
+            openArgBinding(sink, ledgerKey, occurrence, key, b.evaluate, b.state, value => {
+              const t = typeof value;
+              if (value == null || t === "string" || t === "number" || t === "boolean") {
+                args[key] = value;
+              } else {
+                const ref = `arg:${occurrence}:${key}@${sink.nextArgRef(ledgerKey)}`;
+                sink.mintRef(ref);
+                ctx.serialize(ref, envelopeContainerTraces(value));
+                args[key] = { $ref: ref };
+              }
+              sink.slot(occurrence, { ...args });
+            });
+          }
           return slotRange(occurrence);
         };
+        // A slot getter placed directly as a child (`{props.children}`) is a
+        // function-shaped hole; the tag opts it out of live-hole marking the
+        // same way `$slot` opts out its returned range.
+        fn.$lhSkip = true;
         getters.set(prop, fn);
       }
       return fn;
@@ -878,23 +1642,53 @@ export function createSlotProps(sink, frame) {
  * it. `init` (headers/status, e.g. from a `respond()` envelope) merges in;
  * the frame tags win on conflict.
  */
+// Copy a response-init's headers preserving multiple `Set-Cookie` values:
+// Headers-to-Headers copying through the constructor folds them into one
+// comma-joined entry on some runtimes (a folded Set-Cookie is corrupt).
+// Plain-object inits cannot carry duplicates and pass through as-is.
+function copyInitHeaders(init) {
+  if (!init || !init.getSetCookie) return new Headers(init);
+  const headers = new Headers();
+  init.forEach((value, key) => {
+    if (key !== "set-cookie") headers.append(key, value);
+  });
+  for (const cookie of init.getSetCookie()) headers.append("Set-Cookie", cookie);
+  return headers;
+}
+
 export function serverComponentResponse(component, options = {}, init = {}) {
   const { id = "", version = 1 } = options.frame || {};
-  const headers = new Headers(init.headers);
+  const headers = copyInitHeaders(init.headers);
   headers.set("Content-Type", "application/x-frame-stream");
   headers.set(FRAME_STREAM_HEADER, id);
   headers.set("X-Content-Raw", "1");
   const stream = renderServerComponent(component, { ...options, frame: { id, version } });
+  // A client disconnect closes the Response's controller from the outside
+  // (`cancel`), but the render keeps producing — its in-flight generation
+  // (iterable holds, boundary retries) settles on its own schedule. Writes
+  // after that point must drop, not throw: an ERR_INVALID_STATE escaping
+  // through a serializer flush is an unhandled process-level error.
+  let closed = false;
   const body = new ReadableStream({
     start(controller) {
       stream.pipe({
         write(chunk) {
-          controller.enqueue(createChunk(JSON.stringify(chunk)));
+          if (closed) return;
+          try {
+            controller.enqueue(createChunk(JSON.stringify(chunk)));
+          } catch (_) {
+            closed = true;
+          }
         },
         end() {
+          if (closed) return;
+          closed = true;
           controller.close();
         }
       });
+    },
+    cancel() {
+      closed = true;
     }
   });
   return new Response(body, { status: init.status || 200, headers });
@@ -1015,14 +1809,24 @@ export async function frameTransformFlightResult(event, outcome, context) {
  */
 export function frameFlightResponse({ primary, regions = [], outcome, codec }, init = {}) {
   const frames = primary ? [primary, ...regions] : regions;
-  const headers = new Headers(init.headers);
+  const headers = copyInitHeaders(init.headers);
   headers.set("Content-Type", "application/x-frame-stream");
   headers.set(FRAME_STREAM_HEADER, primary ? primary.id : "");
   headers.set("X-Content-Raw", "1");
   headers.set(SINGLE_FLIGHT_HEADER, "true");
+  // Same disconnect guard as serverComponentResponse: post-cancel writes
+  // drop instead of throwing through a serializer flush.
+  let closed = false;
   const body = new ReadableStream({
     async start(controller) {
-      const write = chunk => controller.enqueue(createChunk(JSON.stringify(chunk)));
+      const write = chunk => {
+        if (closed) return;
+        try {
+          controller.enqueue(createChunk(JSON.stringify(chunk)));
+        } catch (_) {
+          closed = true;
+        }
+      };
       try {
         // Sequential: chunk order matters within a frame, not across them.
         for (const { id, component } of frames) {
@@ -1042,10 +1846,19 @@ export function frameFlightResponse({ primary, regions = [], outcome, codec }, i
             write({ type: "outcome", payload: node.value });
           }
         }
-        controller.close();
+        if (!closed) {
+          closed = true;
+          controller.close();
+        }
       } catch (err) {
-        controller.error(err);
+        if (!closed) {
+          closed = true;
+          controller.error(err);
+        }
       }
+    },
+    cancel() {
+      closed = true;
     }
   });
   return new Response(body, { status: init.status || 200, headers });

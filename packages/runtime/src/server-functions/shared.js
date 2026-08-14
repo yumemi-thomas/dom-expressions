@@ -4,12 +4,46 @@
 //
 // Two layers live here:
 // - body negotiation: single arguments with a natural HTTP encoding (string,
-//   FormData, Blob, ...) skip the serializer entirely; everything else goes
-//   through the JSON codec from ../serializer.js.
+//   FormData, Blob, ...) skip the serializer entirely, and JSON-safe values
+//   ride plain JSON; everything else goes through the JSON codec from
+//   ../serializer.js.
 // - chunk framing: length-prefixed chunks so the receiver knows how much to
 //   buffer before parsing, which lets async values (promises, streams)
 //   arrive incrementally on one connection.
-import { createJSONDeserializer, serializeJSON } from "../serializer.js";
+
+// The codec loads on demand, the moment a Serialized body actually has to
+// be encoded or decoded — never at module scope. This module is in the
+// eager graph of every bundle containing a server function reference (the
+// transport imports it for headers and framing), and a static serializer
+// import made every such bundle ship seroval + the web plugin set
+// (~5.5 KB gz) even when all its calls carry JSON-safe data and the peer
+// answers in kind (the server's JSON fast path in server.js). Plain-data
+// apps never resolve the import; the first rich value — a Date result, a
+// stream, a typed error — pulls the codec in one fetch and it stays
+// (import() is cached per specifier, so there is deliberately no memo
+// variable here — and the bare `await import` + immediate destructure at
+// each use site is what lets the consumer's bundler tree-shake the lazy
+// chunk down to the codec halves actually reached, instead of retaining
+// the whole serializer surface behind an opaque namespace). Bundlers split
+// the import into its own chunk; solid-web's packaging resolves it to the
+// public `@solidjs/web/serialization` entry, the same instance custom
+// codec plugins are authored against.
+
+// The codec-free universal pieces moved out to their own layers so a
+// router's eager graph can read them without this module (whose serializer
+// import IS the codec): the declaration-metadata channel and the late-bound
+// RPC seam live in registry.js, the flash cookie's isomorphic half beside
+// the cookie codec in ../cookies.js. Re-exported here so every existing
+// import site of the shared wire layer keeps working.
+export {
+  SERVER_FUNCTION_METADATA,
+  getServerFunctionMetadata,
+  getServerFunctionRPC,
+  isServerFunction,
+  provideServerFunctionRPC,
+  withMeta
+} from "./registry.js";
+export { FLASH_COOKIE, clearFlashCookie, hasFlashCookie, matchFlashCookie } from "../cookies.js";
 
 // Codec options must match across peers, and decoding happens in more
 // places than the fetch transport (routers decode integration responses
@@ -131,75 +165,6 @@ function stableString(value, seen) {
   return out + "}";
 }
 
-// The declaration-metadata channel. `GET(fn)` (and any future
-// declaration-static capability) brands references with a metadata object
-// under a registered symbol — surviving duplicated module instances, the
-// same trick as the ResponseEnvelope brand — and routers/integrations read
-// it back through the typed accessors instead of property sniffing. The
-// channel lives in the universal layer because detection is universal code:
-// the same accessor works on client proxies and server references alike.
-export const SERVER_FUNCTION_METADATA = Symbol.for("solid.ServerFunctionMetadata");
-
-/**
- * Reads a server function reference's declaration metadata (e.g.
- * `method: "GET"` for `GET(fn)` references). Returns undefined when `fn`
- * is not a server function reference; plain references carry an empty
- * metadata object.
- */
-export function getServerFunctionMetadata(fn) {
-  if (typeof fn !== "function") return undefined;
-  return fn[SERVER_FUNCTION_METADATA] || undefined;
-}
-
-/**
- * Whether `fn` is a server function reference (a client proxy or a
- * server-side registered callable). Detection is by the registered-symbol
- * metadata brand, so it holds across duplicated module instances.
- */
-export function isServerFunction(fn) {
-  return typeof fn === "function" && !!fn[SERVER_FUNCTION_METADATA];
-}
-
-/**
- * Attaches user-declared transport metadata to a server function reference
- * (client proxy or server-registered callable) and returns the reference.
- * Writes ride the same channel `GET` uses: later writes shallow-merge over
- * earlier ones, and `getServerFunctionMetadata(fn)` reads the merged bag —
- * so `withMeta` composes with `GET` in either order.
- *
- * The pattern is declare-on-function, react-in-hook: metadata declared
- * here is what `prepareRequest` receives as `context.meta`, letting
- * session-dynamic transport policy key on declarations instead of
- * comparing function ids:
- *
- * ```ts
- * export const chargeCard = withMeta(async (amount: number) => {
- *   "use server";
- *   // ...
- * }, { requiresAuth: true });
- *
- * configureServerFunctionsClient({
- *   prepareRequest(init, { meta }) {
- *     if (meta?.requiresAuth) {
- *       return {
- *         ...init,
- *         headers: { ...init.headers, Authorization: `Bearer ${session.token()}` }
- *       };
- *     }
- *     return init;
- *   }
- * });
- * ```
- */
-export function withMeta(fn, meta) {
-  const metadata = getServerFunctionMetadata(fn);
-  if (!metadata) {
-    throw new Error("withMeta expects a server function reference");
-  }
-  Object.assign(metadata, meta);
-  return fn;
-}
-
 /** Header carrying the server function id. */
 export const FUNCTION_HEADER = "X-Server-Function-Id";
 
@@ -291,37 +256,6 @@ export const SINGLE_FLIGHT_HEADER = "X-Single-Flight";
 /** FormData key used when a lone File is sent as the argument. */
 export const FILE_FORM_KEY = "__server_function_file__";
 
-/**
- * Cookie carrying the outcome of a call made without the client runtime, so
- * the page rendered after the redirect can show what happened.
- *
- * The name and its one-shot clearing live here rather than beside the codec
- * (flash.js, server-only) because integrations consume the cookie eagerly
- * from isomorphic code — the clear has to be appended before streaming
- * flushes the response headers, and an unread outcome must not haunt a
- * later request — and that must not drag the encode/decode machinery into
- * client bundles.
- */
-export const FLASH_COOKIE = "flash";
-
-const FLASH_MATCHER = new RegExp(`(?:^|;\\s*)${FLASH_COOKIE}=([^;]+)`);
-
-/** Whether a Cookie header carries a flash cookie (readable or not). */
-export function hasFlashCookie(cookieHeader) {
-  return !!cookieHeader && FLASH_MATCHER.test(cookieHeader);
-}
-
-/** The raw encoded flash payload out of a Cookie header, if present. */
-export function matchFlashCookie(cookieHeader) {
-  const match = cookieHeader && cookieHeader.match(FLASH_MATCHER);
-  return match ? match[1] : undefined;
-}
-
-/** The Set-Cookie value clearing the flash cookie after it has been read. */
-export function clearFlashCookie() {
-  return `${FLASH_COOKIE}=; Max-Age=0; Path=/`;
-}
-
 export const BodyFormat = {
   Serialized: "0",
   String: "1",
@@ -331,9 +265,79 @@ export const BodyFormat = {
   File: "5",
   ArrayBuffer: "6",
   Uint8Array: "7",
-  /** Plain `JSON.stringify(args)` — the fast path for JSON-safe arguments. */
+  /**
+   * Plain `JSON.stringify` — the fast path for JSON-safe payloads on both
+   * legs: argument lists on the request, results (single-flight envelopes
+   * included) on the response.
+   */
   Json: "8"
 };
+
+// Nesting deeper than this is not JSON-safe. The guard itself walks an
+// explicit stack so any depth is CHECKABLE, but claiming safety means
+// JSON.stringify must then deliver, and stringify recursion is
+// engine-dependent at extreme depth — past this ceiling the value goes to
+// the codec, whose own depth limit produces a structured error instead of
+// a RangeError that dispatch would misread as the function failing.
+const JSON_SAFE_DEPTH_LIMIT = 10000;
+
+// Sentinel frame on the traversal stack: "all children of the entry below
+// are done — pop it from the ancestor path". Module-private, so it can
+// never collide with user data.
+const EXIT = {};
+
+/**
+ * Whether a value survives a `JSON.stringify` round trip faithfully: JSON
+ * primitives (finite numbers only), arrays, and plain objects. Anything
+ * else — Dates, Maps, typed arrays, undefined (bare or as a property),
+ * NaN, class instances, cyclic structures — needs the codec. Both peers
+ * negotiate with this same guard: the client for argument lists (see
+ * client.js), the server for results (see server.js encodeResult) — so
+ * the codec rides the wire exactly when a value actually needs it.
+ *
+ * Traversal is iterative on an explicit stack with an ancestor set: the
+ * old recursive walk overflowed on cycles (forever) and on deep nesting
+ * stringify itself handles fine (~8k levels — the guard's frames are
+ * heavier than the stringifier's), and that RangeError escaped into
+ * dispatch's catch as a phantom function error. Cycle detection is
+ * ancestor-based on purpose: a value referenced twice WITHOUT a cycle is
+ * still JSON-safe (stringify duplicates it, as the fast path always has)
+ * — a seen-forever set would start waking the codec for plain data that
+ * merely aliases.
+ */
+export function isJSONSafe(value) {
+  const stack = [value];
+  const ancestors = new Set();
+  while (stack.length) {
+    const v = stack.pop();
+    if (v === EXIT) {
+      ancestors.delete(stack.pop());
+      continue;
+    }
+    if (v === null) continue;
+    const t = typeof v;
+    if (t === "string" || t === "boolean") continue;
+    if (t === "number") {
+      if (!Number.isFinite(v)) return false;
+      continue;
+    }
+    if (t !== "object") return false;
+    // a value on its own ancestor path is a cycle — JSON.stringify throws
+    if (ancestors.has(v) || ancestors.size >= JSON_SAFE_DEPTH_LIMIT) return false;
+    ancestors.add(v);
+    stack.push(v, EXIT);
+    if (Array.isArray(v)) {
+      // index iteration on purpose: a sparse array's holes read undefined
+      // (unsafe — stringify corrupts them to null), which for-in would skip
+      for (let i = 0; i < v.length; i++) stack.push(v[i]);
+    } else {
+      const proto = Object.getPrototypeOf(v);
+      if (proto !== Object.prototype && proto !== null) return false;
+      for (const k in v) stack.push(v[k]);
+    }
+  }
+  return true;
+}
 
 /**
  * Picks a direct HTTP encoding for values that have one. Returns undefined
@@ -451,14 +455,11 @@ export async function extractBody(source, codecOptions) {
 // streams frame their chunks identically — see frame-transport.js) so there
 // is exactly one framing implementation.
 export function createChunk(data) {
-  const encodeData = new TextEncoder().encode(data);
+  const encoder = new TextEncoder();
+  const encodeData = encoder.encode(data);
   const bytes = encodeData.length;
-  const baseHex = bytes.toString(16);
-  const totalHex = "00000000".substring(0, 8 - baseHex.length) + baseHex; // 32-bit
-  const head = new TextEncoder().encode(`;0x${totalHex};`);
-
   const chunk = new Uint8Array(12 + bytes);
-  chunk.set(head);
+  chunk.set(encoder.encode(`;0x${bytes.toString(16).padStart(8, "0")};`)); // 32-bit
   chunk.set(encodeData, 12);
   return chunk;
 }
@@ -496,8 +497,8 @@ export class ChunkReader {
       await this.readChunk();
     }
     // `;0x00000000;` — the hex length names how many payload bytes to wait for
-    const head = new TextDecoder().decode(this.buffer.subarray(1, 11));
-    const bytes = Number.parseInt(head, 16);
+    const decoder = new TextDecoder();
+    const bytes = Number.parseInt(decoder.decode(this.buffer.subarray(1, 11)), 16);
     if (Number.isNaN(bytes)) {
       throw new Error("Malformed server function stream.");
     }
@@ -507,7 +508,7 @@ export class ChunkReader {
       }
       await this.readChunk();
     }
-    const partial = new TextDecoder().decode(this.buffer.subarray(12, 12 + bytes));
+    const partial = decoder.decode(this.buffer.subarray(12, 12 + bytes));
     this.buffer = this.buffer.subarray(12 + bytes);
     return { done: false, value: partial };
   }
@@ -530,7 +531,11 @@ export class ChunkReader {
  */
 export function serializeStream(value, codecOptions) {
   return new ReadableStream({
-    start(controller) {
+    // async on purpose: the codec is late-loaded (see the loading notes at
+    // the top of this module), and a ReadableStream start may return a
+    // promise — reads wait for it, so the stream's contract is unchanged
+    async start(controller) {
+      const { serializeJSON } = await import("../serializer.js");
       serializeJSON(value, {
         ...codecOptions,
         onParse(node) {
@@ -565,6 +570,12 @@ export async function deserializeStream(source, codecOptions) {
   const reader = new ChunkReader(source.body);
   const result = await reader.next();
   if (!result.done) {
+    // The codec's decode half loads here — when a Serialized body has
+    // actually arrived — so a client whose responses all ride the JSON fast
+    // path never pays for it (see the loading notes at the top). The
+    // decode-only module: reading a payload never needs the encode half
+    // (that loads separately, when rich arguments serialize).
+    const { createJSONDeserializer } = await import("../serializer-decode.js");
     // Cross-references between chunks resolve through state inside the
     // deserializer, so one instance handles the whole stream.
     const deserializeChunk = createJSONDeserializer(codecOptions);

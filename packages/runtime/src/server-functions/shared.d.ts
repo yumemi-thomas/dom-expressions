@@ -1,4 +1,4 @@
-import { JSONCodecOptions } from "../serializer.js";
+import { JSONCodecOptions } from "../serializer-decode.js";
 
 export type { JSONCodecOptions };
 
@@ -18,6 +18,9 @@ export function configureServerFunctionsCodec(codec: JSONCodecOptions | undefine
  * `configureServerFunctionsCodec` or the client/server `codec` option), or
  * undefined when running on the defaults. Integrations pass this to
  * lower-level codec helpers so custom plugins configured by the app apply.
+ *
+ * Integration plumbing; not meant for hand-written application code.
+ * @internal
  */
 export function getServerFunctionsCodec(): JSONCodecOptions | undefined;
 
@@ -57,6 +60,9 @@ export const ERROR_HEADER: string;
  * travels percent-encoded behind a marker. `decodeErrorHeaderValue`
  * round-trips the message exactly, astral-plane characters included (lone
  * surrogates are replaced with U+FFFD — they cannot survive UTF-8 anyway).
+ *
+ * Transport wire detail; not meant for hand-written code.
+ * @internal
  */
 export function encodeErrorHeaderValue(value: string): string;
 
@@ -64,6 +70,10 @@ export function encodeErrorHeaderValue(value: string): string;
  * Decodes an `ERROR_HEADER` value produced by `encodeErrorHeaderValue`:
  * marked values are percent-decoded, everything else (including values from
  * peers that never encode) passes through untouched.
+ *
+ * Integration plumbing for readers of `ERROR_HEADER`; not meant for
+ * hand-written application code.
+ * @internal
  */
 export function decodeErrorHeaderValue(value: string): string;
 
@@ -274,6 +284,46 @@ export function withMeta<F extends (...args: any[]) => any>(fn: F, meta: ServerF
 export const SERVER_FUNCTION_METADATA: unique symbol;
 
 /**
+ * The transport surface integrations consume through the late-bound RPC
+ * seam (server-functions/registry.js) — filled by the transport halves when
+ * the first server function reference is created (code that only exists in
+ * a bundle when a `"use server"` function was actually compiled in), read
+ * by routers so they never import the transport/codec statically.
+ */
+export interface ServerFunctionRPC {
+  /**
+   * The build's `GET` declaration wrapper (client fetch transport or
+   * server in-process dispatch — see the respective entries).
+   */
+  GET<A extends readonly any[], R>(fn: (...args: A) => R): ServerFunction<A, Awaited<R>>;
+  /**
+   * `decodeResponse` bound to the configured codec: decodes a server
+   * function response body the transport handed over whole (redirects,
+   * revalidation). Resolves undefined for empty bodies and bodies without
+   * a recognized encoding (e.g. a raw user Response).
+   */
+  decodeResponse<T = unknown>(response: Response): Promise<T | undefined>;
+}
+
+/**
+ * Fills the RPC seam. Called by the transport halves when the first server
+ * function reference is created; first write wins.
+ * @internal
+ */
+export function provideServerFunctionRPC(rpc: ServerFunctionRPC): void;
+
+/**
+ * The registered RPC surface, or undefined when no server function exists
+ * in this build's graph. Integration plumbing (routers): gate every use of
+ * the transport/codec behind this read instead of importing it — an app
+ * with no server functions then ships none of it, while a reference in the
+ * bundle guarantees the seam is filled before integration code can hold
+ * that reference (compiled output creates references at module scope).
+ * @internal
+ */
+export function getServerFunctionRPC(): ServerFunctionRPC | undefined;
+
+/**
  * Header carrying the body format tag (a `BodyFormat` value) —
  * `"X-Server-Function-Format"`.
  *
@@ -306,6 +356,11 @@ export const BodyFormat: {
   readonly File: "5";
   readonly ArrayBuffer: "6";
   readonly Uint8Array: "7";
+  /**
+   * Plain `JSON.stringify` — the fast path for JSON-safe payloads on both
+   * legs: argument lists on the request, results on the response.
+   */
+  readonly Json: "8";
 };
 
 /**
@@ -313,6 +368,17 @@ export const BodyFormat: {
  * @internal
  */
 export type BodyFormatValue = (typeof BodyFormat)[keyof typeof BodyFormat];
+
+/**
+ * Whether a value survives a `JSON.stringify` round trip faithfully: JSON
+ * primitives (finite numbers only), arrays, and plain objects. Anything
+ * else — Dates, Maps, typed arrays, undefined (bare or as a property),
+ * NaN, class instances, cyclic structures — needs the codec. Never throws:
+ * cycles and pathological depth answer `false`. Both peers negotiate the
+ * wire format with this guard: the client for argument lists, the server
+ * for results.
+ */
+export function isJSONSafe(value: unknown): boolean;
 
 /**
  * Picks a direct HTTP encoding (headers + BodyInit) for values that have
@@ -412,6 +478,9 @@ export function decodeResponse<T = unknown>(
  * undefined for body-less responses) rides as `{ value }`. Integrations
  * that apply response metadata themselves use this so the payload shape
  * stays core's own.
+ *
+ * Integration plumbing; not meant for hand-written application code.
+ * @internal
  */
 export function decodeResponsePayload<T = unknown, D = unknown>(
   response: Response,
@@ -422,6 +491,9 @@ export function decodeResponsePayload<T = unknown, D = unknown>(
  * Frame one payload for the server-function wire: a `;0x<len32>;` length
  * prefix followed by the utf-8 data. Both transports (server-function
  * responses and frame streams) share this framing.
+ *
+ * Transport wire detail; not meant for hand-written code.
+ * @internal
  */
 export function createChunk(data: string): Uint8Array;
 
@@ -429,6 +501,9 @@ export function createChunk(data: string): Uint8Array;
  * Incremental decoder for `createChunk` framing over a byte stream: `next()`
  * yields one complete payload string per call (async-iterator result shape),
  * buffering partial frames internally until their length prefix is satisfied.
+ *
+ * Transport wire detail; not meant for hand-written code.
+ * @internal
  */
 export class ChunkReader {
   constructor(stream: ReadableStream<Uint8Array>);
@@ -441,5 +516,8 @@ export class ChunkReader {
  * Both peers derive it independently — the server names flight regions with
  * it, the client routes them by it — so it must stay deterministic across
  * realms and releases.
+ *
+ * Transport wire detail; not meant for hand-written code.
+ * @internal
  */
 export function frameAddress(id: string, args?: readonly unknown[]): string;

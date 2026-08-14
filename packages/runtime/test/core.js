@@ -14,6 +14,26 @@ import {
   setContext
 } from "@solidjs/signals";
 
+// Client asset reveal gate (docs/client-css-reveal-gating.md): reading an
+// unsettled asset promise throws the core's NotReadyError so tracked
+// contexts (transitions, boundary reveals) hold and retry when it settles;
+// no-op once settled. Implemented over the core's async-source machinery —
+// one async node per promise, shared across readers. The node must be
+// created OUTSIDE the calling compute (`runWithOwner(null)`): waitAsset is
+// called from compute phases, and anything owned by the computing node is
+// disposed when it re-runs — the gate would die with the retry it triggers.
+const assetGates = new Map();
+export function waitAsset(promise) {
+  let gate = assetGates.get(promise);
+  if (!gate) {
+    runWithOwner(null, () => {
+      gate = createMemo(() => promise);
+    });
+    assetGates.set(promise, gate);
+  }
+  gate();
+}
+
 export { createRoot as root, getOwner, untrack, runWithOwner, merge as mergeProps, flatten };
 
 // Hydration-zone flag (mirrors solid's NoHydrateContext): under NoHydration,
@@ -51,11 +71,20 @@ export function Hydration(props) {
 // Context barrier for server-component render roots. The real
 // implementation (solid's runInServerComponentScope) rebuilds the scope
 // owner's context record so user context never crosses a server component —
-// that requires the core's own owner internals, so like runWithHydrationScope
-// the test core passes through; barrier semantics are covered against the
-// real core (solid-web's server suite).
+// that requires the core's own owner internals, so the test core only
+// mirrors the piece the runtime reads: the barrier MEMBERSHIP marker
+// (`inServerComponentScope`, the document face's live-hole arming gate).
+// Severing semantics are covered against the real core (solid-web's
+// server suite).
+const ServerComponentScopeContext = createContext(false);
 export function runInServerComponentScope(fn) {
-  return fn();
+  return runWithOwner(createOwner(), () => {
+    setContext(ServerComponentScopeContext, true);
+    return fn();
+  });
+}
+export function inServerComponentScope() {
+  return getContext(ServerComponentScopeContext) === true;
 }
 
 export function ssrHandleError(err) {
@@ -85,7 +114,18 @@ export function ssrScope(fn) {
   };
 }
 
+// Reactive-scope creation stamp (mirrors the framework impl, which counts
+// owner creations): the live-hole engine diffs this around an evaluation to
+// detect render-once work — a hole that creates components/memos is not
+// safely re-runnable and latches. The test core counts its own creation
+// sites (component invocations and compiled memo wrappers).
+let creations = 0;
+export function creationStamp() {
+  return creations;
+}
+
 export function createComponent(Comp, props) {
+  creations++;
   if (Comp.prototype && Comp.prototype.isClassComponent) {
     return untrack(() => {
       const comp = new Comp(props);
@@ -102,14 +142,45 @@ export const effect = (fn, effectFn, options) =>
     options ? { ...options, transparent: !options.scope } : { transparent: true }
   );
 
-export const memo = (fn, transparent) =>
-  transparent
-    ? fn.$r
-      ? fn
-      : createMemo(() => fn(), { transparent: true })
-    : createMemo(() => fn());
+export const memo = (fn, transparent) => {
+  if (transparent && fn.$r) return fn;
+  creations++;
+  return transparent ? createMemo(() => fn(), { transparent: true }) : createMemo(() => fn());
+};
 
 // Hydration-key owner scoping (solid-web's rxcore implements this over
 // createOwner({ id })). The test core has no hydration id chain, so the
 // scope is a passthrough — document-mode tests assert markers, not keys.
 export const runWithHydrationScope = (id, fn) => fn();
+
+// DR-2 value tier, document face (mirrors solid's rxcore, which wraps the
+// value in a full async-aware memo): the read throws not-ready until the
+// promise settles, then reads as the settled value. The frame sink pre-taps
+// iterables down to a promise of their first yield, so this only sees
+// thenables. Not-ready rides the test core's `_promise` convention
+// (ssrHandleError above), which the engine's hole machinery re-pulls on.
+export function ssrAsyncValue(value) {
+  let settled = false;
+  let errored = false;
+  let result;
+  const promise = Promise.resolve(value).then(
+    v => {
+      settled = true;
+      result = v;
+    },
+    e => {
+      settled = true;
+      errored = true;
+      result = e;
+    }
+  );
+  return () => {
+    if (!settled) {
+      const err = new Error("async value not ready");
+      err._promise = promise;
+      throw err;
+    }
+    if (errored) throw result;
+    return result;
+  };
+}

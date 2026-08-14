@@ -1,4 +1,4 @@
-import { JSONCodecOptions } from "../serializer.js";
+import { JSONCodecOptions } from "../serializer-decode.js";
 import { ServerFunction, ServerFunctionMetadata } from "./shared.js";
 
 export {
@@ -21,6 +21,7 @@ export {
   getServerFunctionsCodec,
   hasFlashCookie,
   isServerFunction,
+  serializeString,
   subscribeFlightData,
   withMeta
 } from "./shared.js";

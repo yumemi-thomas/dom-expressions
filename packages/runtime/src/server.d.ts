@@ -1,5 +1,5 @@
 import { JSX } from "./jsx.js";
-import { SerializerPlugin } from "./serializer.js";
+import { SerializerPlugin } from "./serializer-decode.js";
 export const DOMWithState: Record<string, Record<string, 1 | 2>>;
 export const ChildProperties: Set<string>;
 export const DelegatedEvents: Set<string>;
@@ -79,19 +79,6 @@ export function renderToString<T>(
     onHead?: (head: string) => void;
   }
 ): string;
-/** @deprecated use renderToStream which also returns a promise */
-export function renderToStringAsync<T>(
-  fn: () => T,
-  options?: {
-    timeoutMs?: number;
-    nonce?: string;
-    renderId?: string;
-    noScripts?: boolean;
-    plugins?: SerializerPlugin[];
-    manifest?: AssetManifest | AssetResolver | AssetResolverFn;
-    onError?: (err: any) => void;
-  }
-): Promise<string>;
 export function renderToStream<T>(
   fn: () => T,
   options?: {
@@ -116,7 +103,17 @@ export function renderToStream<T>(
     onHead?: (head: string) => void;
   }
 ): {
-  then: (fn: (html: string) => void) => void;
+  /**
+   * Awaiting the stream resolves with the complete HTML once every boundary
+   * settles — the fully-settled-string form of the render (`const html =
+   * await renderToStream(...)`). Render errors route through `onError` and
+   * the promise resolves with whatever HTML the render produced; it never
+   * rejects.
+   */
+  then<TResult1 = string, TResult2 = never>(
+    onfulfilled?: ((html: string) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
+  ): Promise<TResult1 | TResult2>;
   pipe: (writable: { write: (v: string) => void; end: () => void }) => void;
   pipeTo: (writable: WritableStream) => Promise<void>;
   /**
@@ -153,21 +150,20 @@ export function applyRef(
   r: ((element: any) => void) | ((element: any) => void)[],
   element: any
 ): void;
-/** @deprecated Use `useHead` — removed before `0.50.0` stable. */
-export function useAssets(fn: () => JSX.Element): void;
-/**
- * @deprecated Use the `onHead` render option — removed before `0.50.0`
- * stable. Reads ambient render state, so it is unsafe across concurrent
- * renders; `onHead` is closure-bound to its render and also carries
- * `useHead` output, which this does not.
- */
-export function getAssets(): string;
 /**
  * A head tag descriptor. Props values may be getters (evaluated lazily on
  * the server — at the owning flush boundary — and reactively on the client);
  * `children` is the text body (title text, inline style/script content).
  * `key` overrides the built-in dedupe identity (`title` is a hard singleton
  * that `key` cannot fork).
+ *
+ * Getters must be plain reads: they evaluate at flush time here (under no
+ * component owner) and inside registry-owned computations on the client, so
+ * a getter that allocates a reactive owner (`createMemo`, a `children()`
+ * helper) consumes a hydration id slot on one side only and desyncs every
+ * id allocated after the `useHead` call. Create such helpers eagerly at
+ * component position and read them from the getter. See
+ * docs/head-management-rfc.md.
  */
 export type HeadTag = {
   tag: "title" | "meta" | "link" | "style" | "script" | "base";
@@ -212,32 +208,62 @@ export declare const RequestContext: unique symbol;
  * `response` property on `RequestEvent` itself: integrations that provide
  * one declare it through module augmentation (as `@solidjs/router` does),
  * and this type names the shape they agree on. Core's server-function
- * handler reads its `Set-Cookie` headers when folding single-flight
- * cookies but never requires it.
+ * handler folds it onto the outgoing response when present — its
+ * `Set-Cookie` values (cookies appended during the call via
+ * `serializeCookie`) append cookie-by-cookie, other headers fill gaps —
+ * and reads it when folding single-flight cookies, but never requires it.
  */
 export interface ResponseStub {
   status?: number;
   statusText?: string;
   headers: Headers;
   /**
-   * Set by the integration once the response head has been derived/sent
-   * from this stub — status and headers can no longer change. Consumers
-   * that write response metadata during render (e.g. JSX response
-   * components) must treat later status/header writes and cleanup-time
-   * retractions as no-ops.
+   * Set once the response head has been derived/sent from this stub —
+   * status and headers can no longer change. Flip it through
+   * `commitResponseStub`, which also instruments the stub's `headers` so
+   * a post-commit write fails loudly (dev build throws, production
+   * reports + no-ops) instead of silently missing the wire. `status`/
+   * `statusText` stay plain fields: consumers that write response
+   * metadata during render (e.g. JSX response components) must still
+   * treat later status writes and cleanup-time retractions as no-ops.
    */
   committed?: boolean;
 }
 
 /**
+ * The type of `RequestEvent.locals` — a module-augmentable interface so
+ * applications can type the state their middleware hangs on the event.
+ * Augment it through the package that re-exports the event (interface
+ * identity flows through the re-export chain):
+ *
+ * ```ts
+ * declare module "@solidjs/web" {
+ *   interface RequestEventLocals {
+ *     user: User;
+ *   }
+ * }
+ * ```
+ *
+ * The index signature keeps un-augmented usage permissive — `locals` is a
+ * free-form bag by default — so augmentation adds precision for the keys
+ * it names without gating existing code. The flip side: unaugmented keys
+ * read as `any` rather than erroring, a deliberate trade (a strict-only
+ * `locals` would break every untyped write that works today).
+ */
+export interface RequestEventLocals {
+  [key: string | number | symbol]: any;
+}
+
+/**
  * The per-request context available on the server: the incoming `Request`
- * and a `locals` bag integrations and middleware can hang state on.
- * Frameworks typically extend this shape with richer fields (e.g. a
- * `response` head — see `ResponseStub`).
+ * and a `locals` bag integrations and middleware can hang state on (typed
+ * through the augmentable `RequestEventLocals`). Frameworks typically
+ * extend this shape with richer fields (e.g. a `response` head — see
+ * `ResponseStub`).
  */
 export interface RequestEvent {
   request: Request;
-  locals: Record<string | number | symbol, any>;
+  locals: RequestEventLocals;
 }
 /**
  * The current request event, when called on the server inside a request
@@ -266,6 +292,78 @@ export function createRequestEvent<T extends object = {}>(
  * otherwise.
  */
 export function getExpectedRedirectStatus(response: ResponseStub): number;
+
+/**
+ * Flips a response stub to `committed` — the moment its head freezes on
+ * the wire — and instruments the stub's `headers` mutating methods
+ * (`set`/`append`/`delete`, patched in place; the `Headers` identity and
+ * reads are untouched) so a post-commit write fails loudly instead of
+ * silently missing the wire: it throws in the dev build and reports +
+ * no-ops otherwise. Every head materialization path commits through here
+ * (`createSSRResponse`, the server-function handler's commit seam);
+ * integrations deriving their own heads should too.
+ *
+ * `allowLateLocation` is the stream path's documented exception: a
+ * `Location` set after the shell flushed is still honored client-side
+ * (stream completion appends a `window.location` script), so that one
+ * write stays permitted there.
+ */
+export function commitResponseStub(
+  stub: ResponseStub,
+  options?: { allowLateLocation?: boolean }
+): ResponseStub;
+
+/**
+ * Handler-lifecycle plumbing — a response's exit through the request
+ * event's response-stub lifecycle: page results leave through
+ * `createSSRResponse`, any other `Response` (a middleware early return, an
+ * API result) leaves through `commitEventResponse`; application middleware
+ * never calls this. Folds the event's stub onto the outgoing response —
+ * `Set-Cookie` appends entry-by-entry alongside the response's own, other
+ * stub headers fill gaps only (never the wire-protocol family the handlers
+ * own, never `Content-Type`/`Content-Length` on a bodiless response), the
+ * status is never taken from the stub — then commits the stub
+ * (`commitResponseStub`: post-commit writes fail loudly). Responses with
+ * immutable headers are rebuilt around merged copies.
+ *
+ * Idempotent at handler edges: an already-committed stub passes the
+ * response through untouched, so a handler may apply this unconditionally
+ * after its middleware chain unwinds — page responses from
+ * `createSSRResponse` come back committed and do not double-fold.
+ *
+ * `event` defaults to the ambient `getRequestEvent()`.
+ */
+export function commitEventResponse(response: Response, event?: RequestEvent): Response;
+
+/**
+ * The cookie codec (the platform-gap primitives — see cookies.d.ts): ALL
+ * of core's cookie surface. The blessed patterns are
+ * `parseCookieHeader(event.request.headers.get("cookie"))` for reads and
+ * `event.response.headers.append("set-cookie", serializeCookie(name,
+ * value, options))` for writes.
+ */
+export { parseCookieHeader, serializeCookie } from "./cookies.js";
+export type { CookieOptions } from "./cookies.js";
+
+/**
+ * The flash cookie's isomorphic half and the codec-free server-function
+ * layer (reference detection + the late-bound RPC seam) — mirrors of the
+ * client entry's exports, so integration code reading them stays
+ * universal. Declared through server-functions/shared.d.ts, the
+ * declaration home published-types layouts ship.
+ */
+export {
+  clearFlashCookie,
+  getServerFunctionMetadata,
+  getServerFunctionRPC,
+  hasFlashCookie,
+  isServerFunction
+} from "./server-functions/shared.js";
+export type {
+  ServerFunction,
+  ServerFunctionMetadata,
+  ServerFunctionRPC
+} from "./server-functions/shared.js";
 
 export interface SSRResponseOptions {
   /** Base head; the stub's status/headers win over it. */
@@ -318,7 +416,6 @@ export function composeMiddleware(
   next: (request?: Request) => Response | Promise<Response>
 ) => Promise<Response>;
 
-export function Assets(props: { children?: JSX.Element }): JSX.Element;
 export function untrack<T>(fn: () => T): T;
 
 // client-only APIs
@@ -418,5 +515,9 @@ export function ref(
 ): void;
 /** @deprecated not supported on the server side */
 export function setStyleProperty(node: Element, name: string, value: any): void;
-/** @deprecated not supported on the server side — register assets through the render context instead */
+/**
+ * @internal See client.d.ts — head-management RFC policy: ambient CSS is
+ * unmanaged; the head registry owns directly-mounted stylesheet lifecycle.
+ * @deprecated not supported on the server side — register assets through the render context instead
+ */
 export function acquireAsset(descriptor: unknown): () => void;

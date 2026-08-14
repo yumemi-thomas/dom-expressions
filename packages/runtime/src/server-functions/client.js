@@ -16,7 +16,9 @@ import {
   getFlightDataConsumer,
   getHeadersAndBody,
   getServerFunctionMetadata,
+  isJSONSafe,
   isServerFunction,
+  provideServerFunctionRPC,
   withMeta
 } from "./shared.js";
 
@@ -49,6 +51,10 @@ export {
   getServerFunctionsCodec,
   hasFlashCookie,
   isServerFunction,
+  // the rich-args entry's codec write half: its bundled form (solid-web's
+  // server-functions/dist/rich-args.js) resolves shared.js imports here so
+  // the codec config it reads is the shared built instance
+  serializeString,
   subscribeFlightData,
   withMeta
 } from "./shared.js";
@@ -61,36 +67,14 @@ const config = {
   serializeArgs: undefined
 };
 
-/**
- * Whether the argument list survives a `JSON.stringify` round trip
- * faithfully: JSON primitives (finite numbers only), arrays, and plain
- * objects. Anything else — Dates, Maps, typed arrays, undefined, NaN,
- * class instances — needs the codec (see `enableRichArguments`).
- */
-function isJSONSafe(value) {
-  if (value === null) return true;
-  const t = typeof value;
-  if (t === "string" || t === "boolean") return true;
-  if (t === "number") return Number.isFinite(value);
-  if (t !== "object") return false;
-  if (Array.isArray(value)) {
-    for (const v of value) if (!isJSONSafe(v)) return false;
-    return true;
-  }
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return false;
-  for (const k in value) if (!isJSONSafe(value[k])) return false;
-  return true;
-}
-
 function serializeArguments(args) {
   if (!config.serializeArgs) {
     throw new Error(
       "Server function arguments are sent as JSON by default and these " +
         "arguments are not JSON-serializable. Call enableRichArguments() " +
-        "(from the server-functions rich-args entry) once at startup to " +
-        "send Dates, Maps, Sets, typed arrays, etc. through the codec — or " +
-        "pass a single Blob/FormData/File argument, which has a native " +
+        '(from "@solidjs/web/server-functions/rich-args") once at startup ' +
+        "to send Dates, Maps, Sets, typed arrays, etc. through the codec — " +
+        "or pass a single Blob/FormData/File argument, which has a native " +
         "HTTP encoding."
     );
   }
@@ -128,6 +112,22 @@ export function configureServerFunctionsClient({
 }
 
 let INSTANCE = 0;
+
+// Fills the late-bound RPC seam (registry.js) with this transport's
+// surface. Called from createServerReference/GET — the code compiled
+// `'use server'` output invokes at module scope — NOT at this module's own
+// scope: routers import codec-free helpers from the same built entry, and a
+// top-level registration would be an unshakeable side effect pinning `GET`,
+// `decodeResponse` and the codec behind them into every such bundle. Hung
+// off the reference constructors, the whole transport (seroval included)
+// tree-shakes away unless a reference actually exists — and when one does,
+// the seam is filled before any integration code can hold it.
+let rpcProvided = false;
+function provideRPC() {
+  if (rpcProvided) return;
+  rpcProvided = true;
+  provideServerFunctionRPC({ GET, decodeResponse });
+}
 
 async function createRequest(base, id, instance, options, meta) {
   const headers = {
@@ -184,23 +184,31 @@ async function initializeResponse(base, id, instance, options, args, meta) {
   }
   // JSON-safe argument lists go as plain JSON — no codec on the wire, and
   // (because nothing else here references the serializer) no serialize-half
-  // of the codec in the bundle.
-  if (isJSONSafe(args)) {
-    return createRequest(
-      base,
-      id,
-      instance,
-      {
-        ...options,
-        body: JSON.stringify(args),
-        headers: {
-          ...options.headers,
-          "Content-Type": "application/json",
-          [BODY_FORMAT_HEADER]: BodyFormat.Json
-        }
-      },
-      meta
-    );
+  // of the codec in the bundle. The try mirrors the server's encodeResult:
+  // isJSONSafe answers "not safe" for cycles/depth instead of throwing, so
+  // this only catches what negotiation can still hit (a throwing getter,
+  // an engine limit) — falling through to the codec below, never rejecting
+  // the call over the format choice itself.
+  try {
+    if (isJSONSafe(args)) {
+      return createRequest(
+        base,
+        id,
+        instance,
+        {
+          ...options,
+          body: JSON.stringify(args),
+          headers: {
+            ...options.headers,
+            "Content-Type": "application/json",
+            [BODY_FORMAT_HEADER]: BodyFormat.Json
+          }
+        },
+        meta
+      );
+    }
+  } catch {
+    // fall through to the codec
   }
   // Bound calls ending in a natural HTTP encoding — `action.with(id)`
   // posting FormData/URLSearchParams — reuse the server-rendered form-post
@@ -210,28 +218,32 @@ async function initializeResponse(base, id, instance, options, args, meta) {
   // produces, so bound form actions need no codec. `undefined` coerces to
   // null exactly as it does in a rendered action url (JSON has none).
   if (args.length > 1) {
-    const trailing = getHeadersAndBody(args[args.length - 1]);
-    const leading = args.slice(0, -1).map(arg => (arg === undefined ? null : arg));
-    if (trailing && isJSONSafe(leading)) {
-      const target =
-        base +
-        (base.includes("?") ? "&" : "?") +
-        "args=" +
-        encodeURIComponent(JSON.stringify(leading));
-      return createRequest(
-        target,
-        id,
-        instance,
-        {
-          ...options,
-          body: trailing.body,
-          headers: {
-            ...options.headers,
-            ...trailing.headers
-          }
-        },
-        meta
-      );
+    try {
+      const trailing = getHeadersAndBody(args[args.length - 1]);
+      const leading = args.slice(0, -1).map(arg => (arg === undefined ? null : arg));
+      if (trailing && isJSONSafe(leading)) {
+        const target =
+          base +
+          (base.includes("?") ? "&" : "?") +
+          "args=" +
+          encodeURIComponent(JSON.stringify(leading));
+        return createRequest(
+          target,
+          id,
+          instance,
+          {
+            ...options,
+            body: trailing.body,
+            headers: {
+              ...options.headers,
+              ...trailing.headers
+            }
+          },
+          meta
+        );
+      }
+    } catch {
+      // same contract as above — negotiation failures fall to the codec
     }
   }
   // Everything else needs the codec, which is opt-in (enableRichArguments).
@@ -326,6 +338,7 @@ async function fetchServerFunction(base, id, options, args, meta, callArgs = arg
  * `withMeta`/`GET` writes shallow-merge over it like any other write.
  */
 export function createServerReference(id, name, base) {
+  provideRPC();
   const metadata = name === undefined ? {} : { name };
   // An explicit base targets that url verbatim — integrations reconstructing
   // a callable from a server-rendered action url (`?id=...&args=...`) keep
@@ -382,6 +395,7 @@ export function GET(fn) {
   if (!isServerFunction(fn)) {
     throw new Error("GET expects a server function reference");
   }
+  provideRPC();
   const id = fn.id;
   // the GET-transport callable inherits the source reference's declared
   // metadata (withMeta composes with GET in either order)

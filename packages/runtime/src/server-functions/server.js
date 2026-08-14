@@ -12,7 +12,7 @@
 // mutation — and never what they carry. Which data a mutation invalidates,
 // and how an outcome reaches the UI, stay with the integration.
 import { REVALIDATE_HEADER, isResponseEnvelope, isSafeError } from "../response.js";
-import { RequestContext, getRequestEvent } from "../server.js";
+import { RequestContext, commitEventResponse, getRequestEvent } from "../server.js";
 import { encodeFlashCookie } from "./flash.js";
 import {
   BODY_FORMAT_HEADER,
@@ -23,12 +23,15 @@ import {
   SERVER_FUNCTION_METADATA,
   SINGLE_FLIGHT_HEADER,
   configureServerFunctionsCodec,
+  decodeResponse,
   deserializeString,
   encodeErrorHeaderValue,
   extractBody,
   getHeadersAndBody,
   getServerFunctionsCodec,
+  isJSONSafe,
   isServerFunction,
+  provideServerFunctionRPC,
   serializeStream,
   withMeta
 } from "./shared.js";
@@ -128,7 +131,21 @@ const METHODS = new Map();
 // leak into (and overwrite) the outer scope's state.
 const INVOCATIONS = new WeakMap();
 
+// Server mirror of the client transport's late-bound RPC registration (see
+// client.js provideRPC and registry.js): the server half's `GET` records the
+// declared method for HTTP dispatch, so a router's query() wrapping a
+// reference during SSR must reach the SAME declaration bookkeeping — read
+// through the seam, filled the moment compiled server output registers or
+// references a function.
+let rpcProvided = false;
+function provideRPC() {
+  if (rpcProvided) return;
+  rpcProvided = true;
+  provideServerFunctionRPC({ GET, decodeResponse });
+}
+
 export function registerServerFunction(id, callback) {
+  provideRPC();
   REGISTRATIONS.set(id, callback);
   return callback;
 }
@@ -160,6 +177,7 @@ export function registerServerReference(id, fn, name) {
 export function createServerReference({ id, fn, name }) {
   if (typeof fn !== "function")
     throw new Error("Export from a 'use server' module must be a function");
+  provideRPC();
 
   // the metadata lives in a closure (not on the user's function) so
   // registering the raw implementation never mutates it. The compiler's
@@ -340,7 +358,13 @@ async function foldFlightData(hook, event, headers, outcome, context = {}) {
       return transformed;
     }
   }
-  return { value: outcome.value, data };
+  // A void mutation's envelope omits the `value` key rather than carrying
+  // `value: undefined`: both decode paths read `payload.value` as undefined
+  // either way, but only the key-less shape is JSON-safe — and a mutation
+  // returning nothing with JSON-safe flight data is THE common
+  // single-flight response, which should ride the JSON fast path (see
+  // encodeResult), not wake the codec.
+  return outcome.value === undefined ? { data } : { value: outcome.value, data };
 }
 
 // The generic halves of flight-data collection, computed by core so every
@@ -433,6 +457,30 @@ export function foldSetCookies(headers, setCookies) {
   return folded;
 }
 
+// Forwards a response's headers onto another header set. `Set-Cookie` goes
+// through `getSetCookie()` and appends value-by-value — `Headers` iteration
+// folds multi-value headers into one comma-joined entry on some runtimes,
+// and a folded `Set-Cookie` is corrupt (commas are legal inside a single
+// cookie's `Expires`). Everything else appends as iterated. This is the one
+// way response headers may merge here: never `get`/`set` folding.
+function mergeResponseHeaders(target, source) {
+  source.forEach((value, key) => {
+    if (key !== "set-cookie") target.append(key, value);
+  });
+  if (source.getSetCookie) {
+    for (const cookie of source.getSetCookie()) target.append("Set-Cookie", cookie);
+  } else if (source.has("set-cookie")) {
+    // ancient Headers polyfill without getSetCookie: better one folded
+    // entry than none
+    target.append("Set-Cookie", source.get("set-cookie"));
+  }
+}
+
+// The commit seam moved to `commitEventResponse` in ../server.js — one
+// public implementation shared with integrations' handler edges (a
+// middleware early return leaves through the same fold this handler's
+// responses do), so the gap-fill/denylist semantics cannot drift.
+
 // https://developer.mozilla.org/en-US/docs/Web/HTTP/Status#redirection_messages
 const validRedirectStatuses = new Set([301, 302, 303, 307, 308]);
 
@@ -461,7 +509,10 @@ export function createNoJSHandler({ base = "" } = {}) {
     let status = 303;
     let headers;
     if (result instanceof Response) {
-      headers = new Headers(result.headers);
+      // copy through the multi-Set-Cookie-preserving merge, not the
+      // Headers constructor (which folds them on some runtimes)
+      headers = new Headers();
+      mergeResponseHeaders(headers, result.headers);
       if (result.headers.has("Location")) {
         headers.set(
           "Location",
@@ -520,6 +571,38 @@ function encodeResult(value, headers, status, codec) {
     }
     return new Response(direct.body, { status, headers });
   }
+  // The response mirror of the client's argument negotiation: results
+  // without a natural HTTP encoding still avoid the codec when JSON can
+  // carry them faithfully. A void result sends no body at all (the client's
+  // decode answers undefined for body-less responses), and a JSON-safe one
+  // — plain data, single-flight `{ value, data }` envelopes included —
+  // rides `BodyFormat.Json`, which the client's extractBody already decodes
+  // with bare JSON.parse. Only values that NEED typed reconstruction
+  // (Dates, Maps, streams, promises, Errors — thrown errors always land
+  // here) reach the streaming codec, and only their arrival makes the
+  // client load its decode half (see shared.js loadSerializer). Negotiated
+  // per response: mixed pages simply carry both formats.
+  if (value === undefined) {
+    return new Response(null, { status, headers });
+  }
+  // By the time a result is being encoded the function has already run —
+  // side effects committed — so a failure HERE must never escape into
+  // dispatch's catch, where it would be sanitized and reported as the
+  // function itself throwing (a phantom error over a call that succeeded).
+  // isJSONSafe no longer throws on cycles/depth (they answer "not safe"),
+  // so this catch is belt and braces for what negotiation can still hit —
+  // a throwing getter, an engine limit on an extreme shape — and it falls
+  // through to the codec, which owns structured encoding errors.
+  try {
+    if (isJSONSafe(value)) {
+      headers.set(BODY_FORMAT_HEADER, BodyFormat.Json);
+      headers.set("Content-Type", "application/json");
+      return new Response(JSON.stringify(value), { status, headers });
+    }
+  } catch {
+    // fall through — serializedResponse overwrites the format headers the
+    // JSON attempt may have set before stringify threw
+  }
   const response = serializedResponse(value, headers, codec);
   return status === 200 ? response : new Response(response.body, { status, headers });
 }
@@ -527,21 +610,46 @@ function encodeResult(value, headers, status, codec) {
 /** Message a sanitized (production) server error carries on the wire. */
 export const GENERIC_SERVER_ERROR_MESSAGE = "Internal Server Error";
 
+// Build-variant dev flag. The `"_DX_DEV_"` string is replaced with a
+// boolean by the bundler packaging this runtime — @solidjs/web builds a dev
+// and a prod copy of its server-functions server entry and selects between
+// them through the `development` export condition, so Vite dev serves full
+// fidelity and every default resolution (plain node, production builds)
+// gets the sanitizing copy. The strict comparison keeps raw, unreplaced
+// source FAIL-SAFE: the bare string is not `true`, so a deep import that
+// bypassed the bundled entries sanitizes and omits diagnostic bodies like a
+// production build. Deliberately NOT process.env.NODE_ENV — the runtime is
+// a web-standard package and keys dev behavior on build variants, not
+// ambient node environment.
+let DEV = "_DX_DEV_" === true;
+
+/**
+ * Overrides the build-variant dev flag for this module instance — the seam
+ * for test harnesses and hand-rolled bundles whose packaging cannot replace
+ * `_DX_DEV_`. Applications never call this; select the dev build through
+ * the `development` export condition instead.
+ * @internal
+ */
+export function setServerFunctionsDev(dev) {
+  DEV = !!dev;
+}
+
 /**
  * Production error sanitization for a plain thrown value (not a
  * Response/envelope — those are intentional control flow, handled before
  * this). A raw `Error` (or thrown string/object) serialized to the client
  * would ship its `message` and every own-property verbatim over the wire —
  * an ORM/driver error's failing query, connection string, or bound params
- * included. So outside development it is replaced with a generic `Error`,
+ * included. So outside the dev build it is replaced with a generic `Error`,
  * preserving only that the client receives *an* `Error` (the protocol shape
  * consumers like the router's `submission.error` expect).
  *
- * Development keeps full fidelity (message, stack, own-props) for DX and the
- * dev toolbar inspector. The dev/prod line follows this file's existing
- * convention — `process.env.NODE_ENV === "development"` — so the fidelity is
- * opt-in to development and every other environment (production, test, CI,
- * unset) fails safe.
+ * The dev build keeps full fidelity (message, stack, own-props) for DX and
+ * the dev toolbar inspector. The dev/prod line is the build variant (the
+ * bundler-replaced `_DX_DEV_` flag behind the `development` export
+ * condition), so fidelity is opt-in to dev builds and every other
+ * resolution — production bundles, plain node, raw deep imports — fails
+ * safe.
  *
  * Escape hatch: a value branded with `markSafeError` (`Symbol.for(
  * "solid.SafeError")`) is intentional client-facing content and passes
@@ -550,7 +658,7 @@ export const GENERIC_SERVER_ERROR_MESSAGE = "Internal Server Error";
  * or brand the mapped error safe — so core never second-guesses them.
  */
 export function sanitizeServerError(value) {
-  if (process.env.NODE_ENV === "development") return value;
+  if (DEV) return value;
   if (isSafeError(value)) return value;
   return new Error(GENERIC_SERVER_ERROR_MESSAGE);
 }
@@ -611,20 +719,14 @@ export async function handleServerFunctionRequest(request, options = {}) {
   const functionId = resolveFunctionId(request, url);
 
   if (!functionId) {
-    return new Response(
-      process.env.NODE_ENV === "development" ? "Server function not found" : null,
-      { status: 404 }
-    );
+    return new Response(DEV ? "Server function not found" : null, { status: 404 });
   }
 
   let serverFunction;
   try {
     serverFunction = getServerFunction(functionId);
   } catch {
-    return new Response(
-      process.env.NODE_ENV === "development" ? `Unknown server function: ${functionId}` : null,
-      { status: 404 }
-    );
+    return new Response(DEV ? `Unknown server function: ${functionId}` : null, { status: 404 });
   }
 
   // method enforcement: GET requests only dispatch to functions that
@@ -634,12 +736,10 @@ export async function handleServerFunctionRequest(request, options = {}) {
   // default transport (e.g. a query()-wrapped function also called
   // directly).
   if (request.method === "GET" && METHODS.get(functionId) !== "GET") {
-    return new Response(
-      process.env.NODE_ENV === "development"
-        ? `Method not allowed for server function: ${functionId}`
-        : null,
-      { status: 405, headers: { Allow: "POST" } }
-    );
+    return new Response(DEV ? `Method not allowed for server function: ${functionId}` : null, {
+      status: 405,
+      headers: { Allow: "POST" }
+    });
   }
 
   const event = options.createEvent ? options.createEvent(request) : { request, locals: {} };
@@ -690,175 +790,183 @@ export async function handleServerFunctionRequest(request, options = {}) {
   };
 
   const headers = new Headers();
-  try {
-    let result = await provide(event, async () => {
-      // Identity is established BEFORE the wrapper runs, so
-      // getServerFunctionInvocation() answers throughout the wrap — code
-      // ahead of run() (auth, logging) included.
-      INVOCATIONS.set(event, { id: functionId });
-      const run = () => serverFunction(...parsed);
-      return wrapInvocation
-        ? wrapInvocation(run, { id: functionId, args: parsed, event, request, direct: false })
-        : run();
-    });
+  // The whole dispatch funnels through one seam so every outgoing response
+  // — encoded results, raw passthroughs, no-JS redirects, error bodies —
+  // gets the event's response stub folded on and the stub marked committed
+  // (see `commitEventResponse`). This is how cookies appended onto
+  // `event.response.headers` during a server function reach the wire.
+  const dispatch = async () => {
+    try {
+      let result = await provide(event, async () => {
+        // Identity is established BEFORE the wrapper runs, so
+        // getServerFunctionInvocation() answers throughout the wrap — code
+        // ahead of run() (auth, logging) included.
+        INVOCATIONS.set(event, { id: functionId });
+        const run = () => serverFunction(...parsed);
+        return wrapInvocation
+          ? wrapInvocation(run, { id: functionId, args: parsed, event, request, direct: false })
+          : run();
+      });
 
-    if (transformResult) {
-      result = await transformResult(event, result, flightContext);
-    }
-
-    let status = 200;
-    let metadata;
-    // envelope (from `respond()` or transformResult): HTTP metadata + value
-    if (isResponseEnvelope(result)) {
-      const { response, value } = result;
-      // consumers without the client runtime get the carried response
-      // whole — e.g. respond()'s real JSON body (invisible PE)
-      if (!instance && !handleNoJS && response && response.body) {
-        return response;
-      }
-      if (response && response.headers) {
-        response.headers.forEach((val, key) => headers.append(key, val));
-      }
-      if (response && response.status && (response.status < 300 || response.status >= 400)) {
-        status = response.status;
-      }
-      metadata = response;
-      result = value;
-    } else if (result instanceof Response) {
-      // raw responses pass through untouched
-      if (result.headers && result.headers.has("X-Content-Raw")) return result;
-      if (instance) {
-        // forward headers
-        if (result.headers) {
-          result.headers.forEach((value, key) => headers.append(key, value));
-        }
-        // forward non-redirect statuses (redirect handling is the client
-        // integration's job — the fetch call must not follow it)
-        if (result.status && (result.status < 300 || result.status >= 400)) {
-          status = result.status;
-        }
-        metadata = result;
-        if (result.body == null) {
-          result = null;
-        }
-      }
-    }
-
-    if (collectsFlight) {
-      result = await foldFlightData(
-        flightHook,
-        event,
-        headers,
-        {
-          id: functionId,
-          value: result,
-          response: metadata,
-          request,
-          thrown: false
-        },
-        flightContext
-      );
-      // The fold built the body itself (markup in the payload) — it already
-      // carries the accumulated headers.
-      if (result instanceof Response && result.headers.has("X-Content-Raw")) return result;
-    }
-
-    // calls made without the client runtime (no-JS form posts)
-    if (!instance) {
-      if (handleNoJS) return handleNoJS(result, request, parsed);
-      if (result instanceof Response) return result;
-      return encodeResult(result, headers, 200, codec);
-    }
-
-    return encodeResult(result, headers, status, codec);
-  } catch (x) {
-    if (x instanceof Response || isResponseEnvelope(x)) {
       if (transformResult) {
-        x = await transformResult(event, x, { ...flightContext, thrown: true });
+        result = await transformResult(event, result, flightContext);
       }
+
       let status = 200;
       let metadata;
-      if (isResponseEnvelope(x)) {
-        const { response, value } = x;
-        if (response && response.headers) {
-          response.headers.forEach((val, key) => headers.append(key, val));
+      // envelope (from `respond()` or transformResult): HTTP metadata + value
+      if (isResponseEnvelope(result)) {
+        const { response, value } = result;
+        // consumers without the client runtime get the carried response
+        // whole — e.g. respond()'s real JSON body (invisible PE)
+        if (!instance && !handleNoJS && response && response.body) {
+          return response;
         }
-        if (
-          response &&
-          response.status &&
-          (!instance || response.status < 300 || response.status >= 400)
-        ) {
+        if (response && response.headers) {
+          mergeResponseHeaders(headers, response.headers);
+        }
+        if (response && response.status && (response.status < 300 || response.status >= 400)) {
           status = response.status;
         }
         metadata = response;
-        x = value;
-      } else if (x instanceof Response) {
-        if (x.headers) {
-          x.headers.forEach((value, key) => headers.append(key, value));
-        }
-        if (x.status && (!instance || x.status < 300 || x.status >= 400)) {
-          status = x.status;
-        }
-        metadata = x;
-        if (x.body == null) {
-          x = null;
+        result = value;
+      } else if (result instanceof Response) {
+        // raw responses pass through untouched
+        if (result.headers && result.headers.has("X-Content-Raw")) return result;
+        if (instance) {
+          // forward headers
+          if (result.headers) {
+            mergeResponseHeaders(headers, result.headers);
+          }
+          // forward non-redirect statuses (redirect handling is the client
+          // integration's job — the fetch call must not follow it)
+          if (result.status && (result.status < 300 || result.status >= 400)) {
+            status = result.status;
+          }
+          metadata = result;
+          if (result.body == null) {
+            result = null;
+          }
         }
       }
 
-      // thrown control-flow signals collect too — a thrown redirect carries
-      // flight data for the destination route
       if (collectsFlight) {
-        x = await foldFlightData(
+        result = await foldFlightData(
           flightHook,
           event,
           headers,
           {
             id: functionId,
-            value: x,
+            value: result,
             response: metadata,
             request,
-            thrown: true
+            thrown: false
           },
           flightContext
         );
-        // A thrown redirect is the common single-flight mutation shape, so
-        // this is the path that carries markup for the destination — it still
-        // has to be flagged as thrown for the client to re-throw it.
-        if (x instanceof Response && x.headers.has("X-Content-Raw")) {
-          x.headers.set(ERROR_HEADER, "true");
-          return x;
-        }
+        // The fold built the body itself (markup in the payload) — it already
+        // carries the accumulated headers.
+        if (result instanceof Response && result.headers.has("X-Content-Raw")) return result;
       }
 
-      headers.set(ERROR_HEADER, "true");
+      // calls made without the client runtime (no-JS form posts)
       if (!instance) {
-        // `x` was nulled when the thrown Response had no body, but the no-JS
-        // handler reads redirect metadata off the result — hand it the
-        // original Response, matching what the returned path passes.
-        if (handleNoJS) return handleNoJS(x ?? metadata, request, parsed, true);
-        if (x instanceof Response) return x;
+        if (handleNoJS) return handleNoJS(result, request, parsed);
+        if (result instanceof Response) return result;
+        return encodeResult(result, headers, 200, codec);
       }
-      return encodeResult(x, headers, status, codec);
+
+      return encodeResult(result, headers, status, codec);
+    } catch (x) {
+      if (x instanceof Response || isResponseEnvelope(x)) {
+        if (transformResult) {
+          x = await transformResult(event, x, { ...flightContext, thrown: true });
+        }
+        let status = 200;
+        let metadata;
+        if (isResponseEnvelope(x)) {
+          const { response, value } = x;
+          if (response && response.headers) {
+            mergeResponseHeaders(headers, response.headers);
+          }
+          if (
+            response &&
+            response.status &&
+            (!instance || response.status < 300 || response.status >= 400)
+          ) {
+            status = response.status;
+          }
+          metadata = response;
+          x = value;
+        } else if (x instanceof Response) {
+          if (x.headers) {
+            mergeResponseHeaders(headers, x.headers);
+          }
+          if (x.status && (!instance || x.status < 300 || x.status >= 400)) {
+            status = x.status;
+          }
+          metadata = x;
+          if (x.body == null) {
+            x = null;
+          }
+        }
+
+        // thrown control-flow signals collect too — a thrown redirect carries
+        // flight data for the destination route
+        if (collectsFlight) {
+          x = await foldFlightData(
+            flightHook,
+            event,
+            headers,
+            {
+              id: functionId,
+              value: x,
+              response: metadata,
+              request,
+              thrown: true
+            },
+            flightContext
+          );
+          // A thrown redirect is the common single-flight mutation shape, so
+          // this is the path that carries markup for the destination — it still
+          // has to be flagged as thrown for the client to re-throw it.
+          if (x instanceof Response && x.headers.has("X-Content-Raw")) {
+            x.headers.set(ERROR_HEADER, "true");
+            return x;
+          }
+        }
+
+        headers.set(ERROR_HEADER, "true");
+        if (!instance) {
+          // `x` was nulled when the thrown Response had no body, but the no-JS
+          // handler reads redirect metadata off the result — hand it the
+          // original Response, matching what the returned path passes.
+          if (handleNoJS) return handleNoJS(x ?? metadata, request, parsed, true);
+          if (x instanceof Response) return x;
+        }
+        return encodeResult(x, headers, status, codec);
+      }
+
+      // Plain thrown value (not a Response/envelope): the security-sensitive
+      // path. Sanitized to a generic Error outside development unless branded
+      // safe, so a driver/ORM error's message and own-properties never reach
+      // the client (see sanitizeServerError). Both the wire body and the
+      // ERROR_HEADER message derive from the sanitized value.
+      const safe = sanitizeServerError(x);
+
+      if (!instance) {
+        if (handleNoJS) return handleNoJS(safe, request, parsed, true);
+        const message = safe instanceof Error ? safe.message : String(safe);
+        return new Response(DEV ? message : null, { status: 500 });
+      }
+
+      const error = safe instanceof Error ? safe.message : typeof safe === "string" ? safe : "true";
+      // header values are latin1 ByteStrings — Headers.set throws on anything
+      // above U+00FF, so non-latin1 messages ride percent-encoded (the client
+      // decodes symmetrically; the structured error still travels in the body)
+      headers.set(ERROR_HEADER, encodeErrorHeaderValue(error));
+      return encodeResult(safe, headers, 200, codec);
     }
-
-    // Plain thrown value (not a Response/envelope): the security-sensitive
-    // path. Sanitized to a generic Error outside development unless branded
-    // safe, so a driver/ORM error's message and own-properties never reach
-    // the client (see sanitizeServerError). Both the wire body and the
-    // ERROR_HEADER message derive from the sanitized value.
-    const safe = sanitizeServerError(x);
-
-    if (!instance) {
-      if (handleNoJS) return handleNoJS(safe, request, parsed, true);
-      const message = safe instanceof Error ? safe.message : String(safe);
-      return new Response(process.env.NODE_ENV === "development" ? message : null, { status: 500 });
-    }
-
-    const error = safe instanceof Error ? safe.message : typeof safe === "string" ? safe : "true";
-    // header values are latin1 ByteStrings — Headers.set throws on anything
-    // above U+00FF, so non-latin1 messages ride percent-encoded (the client
-    // decodes symmetrically; the structured error still travels in the body)
-    headers.set(ERROR_HEADER, encodeErrorHeaderValue(error));
-    return encodeResult(safe, headers, 200, codec);
-  }
+  };
+  return commitEventResponse(await dispatch(), event);
 }

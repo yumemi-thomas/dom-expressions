@@ -11,7 +11,7 @@ globalThis.TextEncoder = function () {
 
 const fixture = `<div _hk=0 id="main" data-id="12" aria-role="button" class="selected" checked style="color:red" ><h1 custom-attr="1" disabled title="Hello John" style="background-color:red" class="selected"><a href="/">Welcome</a></h1></div>`;
 const fixture2 = `<span _hk=0 class="Hello John"> Hello &lt;div/> </span>`;
-const fixture3 = `<span> Hello &lt;div/><script nonce=\"1a2s3d4f5g\">window._$HY||(e=>{let t=e=>e&&e.hasAttribute&&(e.hasAttribute(\"_hk\")?e:t(e.host&&e.host.nodeType?e.host:e.parentNode));[\"click\",\"input\"].forEach((o=>document.addEventListener(o,(o=>{if(!e.events)return;let s=t(o.composedPath&&o.composedPath()[0]||o.target);s&&!e.completed.has(s)&&e.events.push([s,o])}))))})(_$HY={events:[],completed:new WeakSet,r:{},fe(){}});</script><!--xs--><link rel=\"modulepreload\" href=\"chunk.js\"></span>`;
+const fixture3 = `<span> Hello &lt;div/><script nonce=\"1a2s3d4f5g\">window._$HY||(e=>{let t=e=>e&&e.hasAttribute&&(e.hasAttribute(\"_hk\")?e:t(e.host&&e.host.nodeType?e.host:e.parentNode));[\"click\",\"input\"].forEach((o=>document.addEventListener(o,(o=>{if(!e.events)return;let s=t(o.composedPath&&o.composedPath()[0]||o.target);s&&!e.completed.has(s)&&e.events.push([s,o])}))))})(_$HY={events:[],completed:new WeakSet,r:{},fe(){}});</script><!--xs--></span>`;
 const fixture4 = `<span > Hello &lt;div/> </span>`;
 
 const Comp1 = () => {
@@ -80,8 +80,7 @@ const Comp2 = () => {
 const Comp3 = () => {
   const greeting = "Hello",
     name = "<div/>";
-  r.useAssets(() => r.ssr`<link rel="modulepreload" href="chunk.js">`);
-  return r.ssr`<span> ${r.escape(greeting)} ${r.escape(name)}${r.HydrationScript()}${r.getAssets()}</span>`;
+  return r.ssr`<span> ${r.escape(greeting)} ${r.escape(name)}${r.HydrationScript()}</span>`;
 };
 
 const Comp4 = () => {
@@ -210,15 +209,22 @@ describe("custom serialization plugins", () => {
     expect(html).toContain("<div>test</div>");
   });
 
-  it("renderToStringAsync accepts plugins option", async () => {
+  it("awaiting renderToStream resolves the settled HTML (accepts plugins option)", async () => {
     const Comp = () => {
       sharedConfig.context.serialize("pt", new Point(15, 25));
       return r.ssr`<div>async</div>`;
     };
 
-    const html = await r.renderToStringAsync(Comp, { plugins: [PointPlugin] });
+    // The fully-settled-string form of the render — what renderToStringAsync
+    // was before its removal. `then` is a real thenable: awaiting works and
+    // the return value chains as a Promise.
+    const stream = r.renderToStream(Comp, { plugins: [PointPlugin] });
+    const chained = stream.then(html => html.length);
+    expect(typeof chained.then).toBe("function");
+    const html = await stream;
     expect(html).toContain("new Point(15,25)");
     expect(html).toContain("<div>async</div>");
+    expect(await chained).toBe(html.length);
   });
 
   it("renderToStream accepts plugins option", done => {
@@ -964,6 +970,36 @@ describe("root-level module asset serialization", () => {
     expect(html).toContain("/assets/Lazy-abc.js");
   });
 
+  // Island integrations run one renderToString per island into the same
+  // document. The root module map's registry name must carry the renderId,
+  // or each island's write would clobber the previous one's — a single
+  // page-global "_assets" leaves only the last island hydratable.
+  it("renderToString scopes the root module map name by renderId", () => {
+    const htmlA = r.renderToString(
+      () => {
+        const ctx = sharedConfig.context;
+        ctx.registerModule("i00", "/assets/IslandA-abc.js");
+        return r.ssr`<div>island a</div>`;
+      },
+      { renderId: "i0" }
+    );
+    const htmlB = r.renderToString(
+      () => {
+        const ctx = sharedConfig.context;
+        ctx.registerModule("i10", "/assets/IslandB-def.js");
+        return r.ssr`<div>island b</div>`;
+      },
+      { renderId: "i1" }
+    );
+    expect(htmlA).toContain("i0_assets");
+    expect(htmlA).toContain("/assets/IslandA-abc.js");
+    expect(htmlB).toContain("i1_assets");
+    expect(htmlB).toContain("/assets/IslandB-def.js");
+    // Neither render writes the other's name or the bare page-global.
+    expect(htmlA).not.toContain("i1_assets");
+    expect(htmlB).not.toContain("i0_assets");
+  });
+
   it("renderToStream serializes root-level modules in hydration data", async () => {
     const html = await new Promise(resolve => {
       const chunks = [];
@@ -1567,18 +1603,6 @@ describe("ssrElement child-property handling", () => {
       r.ssrElement("form", { action: { toString: () => "/actions/save" } })
     );
     expect(form).toContain('action="/actions/save"');
-  });
-});
-
-// injectAssets inserts useAssets-registered output above </head>. Without a
-// head tag it is a no-op; with one it should splice in the output.
-describe("useAssets injection path", () => {
-  it("injects useAssets output just before </head>", () => {
-    const html = r.renderToString(() => {
-      r.useAssets(() => r.ssr`<meta name="rendered" content="1">`);
-      return r.ssr`<html><head></head><body><div>x</div></body></html>`;
-    });
-    expect(html).toContain('<meta name="rendered" content="1"></head>');
   });
 });
 

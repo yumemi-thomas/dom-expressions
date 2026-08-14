@@ -309,6 +309,54 @@ binding's **wire shape**, never its liveness:
      projecting less ad hoc. Single-copy is preserved because the record is
      the only copy when the client is the only consumer; render-AND-pass
      duplication is the authored, bounded concession DR-3 rule 2 names.
+   - ***Build record (2026-08-10).*** Shipped as designed. The identity
+     rationale that settled the wire format, recorded: granular patches
+     carry **framework-owned identity** (root-relative paths recorded at
+     write time by the producer's own proxy — never computed by diffing),
+     which is what rules out the snapshot-plus-reconcile alternative:
+     reconciliation needs domain keys the framework cannot assume, while
+     the mutation log needs none. The letter was refined in four places
+     the build discovered:
+     - *The trace is multi-consumer.* Hydration's single-consumer tap became
+       a shared pump: one source iterator drives an append-only patch log,
+       and every `subscribe()` (hydration resume, each slot crossing) replays
+       from its own cursor — snapshots captured only at stable points (no
+       in-flight `next()`), so undrained writes can't double-apply.
+     - *The receiver is a minted projection, not a bare store.* The client
+       materializes the trace through `createProjection` under its own root:
+       the container REFERENCE is available synchronously, reads INTO it
+       suspend until the snapshot (the fill's own `<Loading>` covers them,
+       same contract as the value tier), patch batches apply through
+       `applyPatches`, and the result is readonly — writes stay
+       producer-owned by construction.
+     - *The envelope.* Seroval's own classification runs before plugin
+       tests — it reads `.constructor` (detonating a pending proxy) and
+       claims arrays outright — so raw containers can't be intercepted
+       reliably. The sink swaps each traced container, at any depth of an
+       argument, for a module-private `{ [TRACE] }` envelope (copy-on-write
+       walk) and the plugin matches THAT. On the document face the record
+       carries a `{ $tr, $ta }` marker literal instead, revived at arg-read
+       and memoized per trace — one live container, however many references.
+     - *Classification is trap-safe on BOTH faces, containers first.* The
+       server probes by WeakMap (`isContainerTraced`) before any content or
+       async probe; the client mirrors it by WeakSet
+       (`isMaterializedContainer`) in the props proxy and the record-dedupe
+       compare — where containers compare by identity only (same
+       materialized instance adopts silently; a re-serialized trace is a new
+       generation, a live-props change). The matrix surfaced this as a real
+       gap: `.then` probes and serialization compares detonate pending
+       containers.
+
+     Scope lines, recorded: this round crosses **whole containers**
+     (settled plain stores still ship as plain data — the trace registry
+     only claims async projections). *Parts* (nested-node exposure with
+     filtered/rebased traces, above) and *case 4* (async at container
+     paths) remain the designed extensions; a part of a PENDING projection
+     is not yet classifiable and must not be passed. And the write
+     discipline stands as documented but **unenforced**: raw reactive
+     writes during server render are wrong for ordinary SSR already
+     (the markup may have flushed); enforcement is parked with case 4's
+     diagnostics, not a Stage 5 deliverable.
 
 4. **Async at container paths** (promises/pending nodes stored IN a
    projection): two clocks interleave at one path — the mutation log (a path
@@ -339,6 +387,180 @@ lifetime semantics); **snapshot-per-frame dedupe** (stale back-references,
 above). Server-content async (`<Loading>` inside server JSX)
 is a different async and keeps the fragment model wholesale: one is markup the
 server owns, the other is data the client owns.
+
+**Status — the value tier (case 2) is implemented** (`dr2-value-tier`
+branches, dom-expressions + solid, verified end-to-end in the chat example):
+
+- *Server:* the record never waits — promises and async iterables serialize
+  through the codec as pending data refs (seroval streams resolutions/yields);
+  a not-ready thunk ships via retry-until-settled and rejections ride the data
+  channel, never the stream face.
+- *Client:* the slot-props proxy routes an async-valued prop through a lazy
+  async memo under the occurrence's owner, so the read suspends into the
+  covering boundary and, for iterables, IS the latest yield thereafter. Fresh
+  call-driven mounts shell-gate (the covering `Loading` holds until the
+  frame's first apply — content or error), giving a t=0 fill's pending arg
+  read its boundary.
+- *Typing:* `Slot<P>` deliberately keeps the fill's props settled;
+  `asyncArg<T>(...): T` is the identity that types the async value at the
+  border (widening `Slot`'s parameter would leak async unions into every
+  fill's contextual typing).
+- *Found under it:* signals' iterate loop assumed protocol-strict iterators;
+  seroval's deserialized streams return buffered steps as bare
+  `IteratorResult`s, which crashed the graph — fixed on `next` with
+  `for await` assimilation semantics (plus the latent post-gap sync-settle
+  drop). The value tier's consumption path depends on that fix.
+
+**Status — the document face (t=0) has the value tier.** Everything
+above was built call-driven-first; `createDocumentSlotProps` (the t=0
+face, where the *server* is the consumer and the fill renders inline into
+the document) predates DR-2, so its behavior was probed empirically and
+then completed (`document-face-arg-tiers.spec.tsx`, solid-web server
+suite; the shim-backed twins in the runtime's own
+`frame-server-component.spec.js`):
+
+- **Not-ready args were already handled — coarsely.** A thunk/getter
+  throwing not-ready at the unwrap, or an eager call suspending in the
+  component's render, propagates into the server component's own
+  `<Loading>`: the section defers as a fragment and the retry delivers
+  the settled value in markup. This is the "holding" alternative DR-2
+  rejected for the stream face's granularity — the whole section holds
+  instead of pending marks per arg — but at t=0 it is functional,
+  orphan-free, and consistent with "markup is the snapshot." (One
+  artifact: the retry re-invokes the slot, so the occurrence renumbers —
+  markers and record stay consistent with each other.) Pinned as passing.
+- **Async values passed whole now suspend at the inline read.** The
+  document face wraps them in a full async-aware memo (rxcore's
+  `ssrAsyncValue`, implemented over the reactive core's server memo): the
+  read throws not-ready into the engine's hole machinery — the covering
+  boundary holds, the re-pull delivers the settled value in markup — and
+  since the throw happens in the *fill's own* template hole, the holding
+  is finer than the thunk case's whole-section defer. The record is
+  untouched: the async value itself still ships there, its resolution
+  streaming through the document's data scripts, so page markup and the
+  adopted client's read now agree (previously the markup shipped an
+  empty hole over a raw promise read — a hydration mismatch).
+- **Async iterables tap their first yield** — one cursor, two consumers:
+  the inline read settles on the first yield (markup is the V1 snapshot;
+  later yields are the adopted client's story, per §10 of
+  generator-only-model.md) and the record ships a replay wrapper that
+  re-yields it before delegating, so the client still receives the
+  complete sequence. This is the first-value lock's semantics arrived at
+  from the transport side.
+
+Mode invariance holds at the border: the same authored crossing behaves
+identically whether the mount is call-driven or the initial document.
+The Case 1 ledger still does not run on the document sink — deliberate
+("the document is a snapshot"; within-response liveness is exclusively
+the frame render's story) — and the matrix's document-adoption suite now
+carries the arg-tier rows on both halves (the inline server render and
+the adopted client's record read).
+
+**Status — case 1 (expression bindings) is implemented**
+(`dr2-expression-bindings` branches, stacked on the value tier, verified
+end-to-end through Solid's SSR compile). The watched tier is live: `<props.slot
+thing={thing()} />` — the compiled getter, the common authored form — now
+re-evaluates at every commit the response observes and re-emits the
+occurrence's record when the value changed, for the response window. What
+shipped, against the design above:
+
+- *The ledger rides the sink*, as designed: bindings open after the
+  occurrence's record emits, for every re-runnable arg that classified as
+  data — compiled getters (captured from the property DESCRIPTOR, which also
+  fixed a latent crash: a not-ready getter re-thrown from the classifier's
+  catch killed the stream), author thunks, memos passed whole. Eagerly
+  evaluated call-expression args (`props.slot({ thing: thing() })`) stay
+  write-once — JS evaluated them before the border, same as any client call.
+- *The commit funnel needs no dependency graph*, as designed, but its choke
+  points are two, not one: settlements the sink already SEES (a data flush —
+  a serialized promise resolving, an iterator yielding; a fragment
+  resolving; a pending arg's retry succeeding) schedule the sweep directly,
+  and settlements a server-owned render makes INVISIBLE (noHydrate
+  serializes nothing — the HTML is the data) reach it through a `ctx.commit`
+  hook the frame render installs and the reactive core pokes at its settle
+  sites. Sweeps coalesce per microtask, bump the epoch once per batch, and
+  are reference-equality gated per binding. Refs MINTED by sweeps are
+  excluded from the funnel, so a getter returning fresh identities re-emits
+  at most once per real commit instead of looping the response.
+- *Server memos cache per epoch*, as designed, with one precision the design
+  glossed: epoch recompute applies to **sync-valued** computes only (the
+  sync memo path and full memos whose last result was plain). Async memo
+  values advance through their own settle machinery — re-running them would
+  mint new promises/iterators. Iterator memos get their liveness from a
+  **ledger-gated pump**: in a server-owned render nothing consumes the
+  iterator past the first value (there is no serialization tap), so when —
+  and only when — `ctx.commit` exists, the core keeps pulling, advancing the
+  memo's value and committing per yield. The pump never HOLDS the response;
+  completion latches the last yielded value.
+- *Document SSR keeps the first-value lock, deliberately.* The tapped
+  (hydration-serialized) iterator path still never advances the memo's
+  value: markup rendered from V1 must keep reading V1 or a mid-stream
+  boundary retry bakes V2 into HTML the client claims against V1's replay.
+  Within-response liveness is exclusively the frame render's story, where no
+  hydration claim exists. This is the one place case 1 is narrower than "no
+  liveness cliff anywhere": the cliff at t=0 document SSR is hydration's
+  consistency requirement, not a missing engine.
+- *Re-emission is wire-only, as predicted:* re-emitted records ride the
+  existing slot-record protocol (changed scalars inline; changed objects
+  under write-once VERSIONED refs, `arg:<occ>:<key>@<n>`), the client's
+  live-props path applies them, and the value-tier async wrap already reads
+  a re-shipped pending ref as suspend-with-latest — settled → not-ready
+  re-enters pending-with-previous exactly as specified. The end-of-response
+  latch runs one final synchronous sweep before `complete`, so a commit in
+  the last flush still ships.
+- *Two lifecycle edges intentionally deferred:* a superseded region does not
+  yet close its bindings mid-response (the enclosing response's sweeps just
+  find them equality-stable), and a never-successful binding HOLDS
+  completion through its serialized pending ref (the value tier's existing
+  semantics) rather than rejecting at truncation — the diagnosable-reject
+  pattern remains the design for abort/timeout handling when that lands.
+
+Case 3 (container traces) is built — whole containers on both faces, per
+its build record above. Case 4 (async at container paths) and the parts
+extension remain design-settled, not yet implemented; case 5's
+diagnosable-error guard exists for function args and unserializable
+outputs at the record path.
+
+The load-bearing distinction the value tier left ("live = self-announcing,
+latched = watched") is retired: watched values — memo reads, expression
+evaluation, state mutated by async settles — are live within the response
+window through the ledger, which was the missing engine. Async memos are now
+fully in the shipped column: whole or evaluated, first success ships and
+later commits re-emit. What remains latched is only what the design says
+must latch: values crossing at t=0 document SSR (hydration's first-value
+lock — since upgraded by Stage 4's `sc:live` channel, which makes the
+document face live within its own response window; see §9) and anything
+after the response window closes (cross-request updates are
+re-invocation's, by architecture).
+
+**Ratified: liveness is exclusive to the slot border — markup holes settle
+once.** *[Superseded 2026-08-07 by the reactive pole (§9): live markup
+holes generalize the ledger to insert positions, built as Stage 3
+(call-driven) and Stage 4 (t=0). What survives of this record is its
+boundary conditions — the explicit-authoring concern is answered by holes
+being commit-driven and impurity-gated rather than implicit re-renders,
+and the "value at render time" / document first-value-lock analysis below
+carried forward into Stage 3/4's latch semantics.]* `<p>{iterMemo()}</p>`
+in server component markup renders the value
+the hole resolved with and never retro-updates; only slot args get the
+ledger. The line is ownership, not implementation budget: a slot arg crosses
+into the client's LIVE reactive graph — something exists on the other side
+to apply an update, and re-emitting a record is a value update. A flushed
+markup hole has no live consumer; "updating" it means re-rendering and
+re-shipping markup, which is not an update but a NEW RENDER — and markup
+that advances is deliberately an explicit authoring form (the
+progressive-emission proposal's generator components, one snapshot per
+yield), never an implicit property of reading an async value in JSX.
+Implicit markup liveness would hold responses open and re-ship HTML without
+any author intent visible in the code. The author story has no dead ends:
+ticking *data* passes the async value through a slot arg to a client fill;
+ticking *markup* is a generator component. One precision: within a frame
+response "first value" means **value at render time** — a fragment that
+renders late reads the memo's then-current value (the pump may have advanced
+it), which is client time-semantics (a later render reads later state).
+Document SSR alone pins the strict first value, because hydration's replay
+starts at V1 and the claimed markup must agree. Two consumers, two
+consistency contracts, each matching what is alive on the other end.
 
 ### DR-3: Classification precedes resolution (template detection stays tractable)
 
@@ -674,3 +896,318 @@ is compensatory by definition — fix the cause instead.
    deletions land (row 20's `hy.r` occlusion drain and the #2968 deferral,
    both waiting on document-sink frame-shaped records at the wire freeze),
    so pinning it now would just fail CI without forcing the right work.
+
+## 9. Roadmap after DR-2 (revised 2026-08-07)
+
+§8's stages are the derivation-architecture build and are complete. This
+section is the forward roadmap from the DR-2 merge onward; its stage
+numbers are the working vocabulary and are distinct from §8's.
+
+The reactive pole is **ratified** (2026-08-07; the lean and its reasoning
+are recorded in `generator-only-model.md` §9). Live markup holes — the
+binding ledger generalized from `(occurrence, arg)` slot bindings to
+insert positions — are the plan of record; the generator-only model is
+retired as a pole and survives only as potential authoring sugar.
+
+1. **Stage 1 — Close out DR-2.** **Done.** The value tier on both faces
+   (call-driven; document face via the `ssrAsyncValue` rxcore seam), the
+   Case 1 binding ledger with commit-epoch sweeps and server memo
+   liveness, `asyncArg` border typing, the arg-tier matrix rows, and the
+   chat example. Merged to `next` and released.
+2. **Stage 2 — Ratify the pole.** **Done** (decision, not build): the
+   reactive pole, ratified 2026-08-07.
+3. **Stage 3 — Live holes, call-driven face.** **Built (2026-08-08, the
+   `live-holes` branches) — the ship line.** After this stage the model
+   is announceable: the complete reactive story for everything after
+   load, standard SSR semantics at load. What shipped, per the scope:
+   - Ledger generalization: **done.** Thunk-compiled content holes in
+     live frame renders wrap in identified comment pairs
+     (`<!--lh:N-->…<!--lh:/N-->`) and open ledger bindings; commits
+     re-run them, equality-gate the resolved HTML (marker-stripped
+     baselines), and re-emit changes as keyed `hole` chunks the client
+     morphs in place. Convergence is commit-driven and impurity-gated:
+     an evaluation that emits records or creates reactive scopes latches
+     (the record gate and the rxcore creation stamp), retry chains
+     resolve mint-suppressed (`$lhSuppress` through `buildAsyncWrap`),
+     and boundary/slot machinery is `$lhSkip`-tagged out.
+   - Content holes + the chat slice: **done.** The chat demo streams
+     markdown token-by-token through a `<Loading>`-wrapped iterable-fed
+     `innerHTML` hole, no client component; `ctx.hold()` keeps the
+     response window open for bounded async traces.
+   - Attribute holes: **done.** Markers can't sit inside tags, so a tag
+     with in-tag thunk holes is element-addressed: `ssr()`'s position
+     scan (extended with per-segment tag geometry) splices
+     ` data-lha="N"` at the tag open and captures the attribute area as
+     re-runnable parts — including positions dequeued from
+     cross-element `ssrGroup` batches, split per element. Rebuilds ship
+     as element-keyed `attr` chunks with explicit `removed` name lists
+     (the server holds the previous text; the client tracks no name
+     history) and the client patches the addressed element in place.
+     Mid-attr escalations latch the tag.
+   - Lifetime and error semantics: **done, one scoped deviation.**
+     Stream end latches (the end-latch sweep is the floor); supersession
+     spans evaluation (`ssr()` resolves interior holes at construction,
+     so nested mints land in the parent's retire list — a parent
+     re-emission retires the child ranges it replaces); a mid-window
+     throw is terminal — the hole latches at its last markup and the
+     failure ships as a hole-keyed error chunk, surfaced client-side as
+     a one-time diagnostic. The deviation: "escalates to the owning
+     boundary" is deferred — true escalation means boundary-region
+     re-emission (server) or a frame error-throw surface (client), and
+     the latter does not exist for ANY error tier yet (stream-level
+     `:error` only releases gates today). The hole-keyed error record is
+     the hook that surface will consume when it lands.
+   - The t=0 latch: **done and pinned** — document renders mark nothing
+     and inject nothing; bytes are untouched (first-value lock).
+     Correct-but-static is the accepted degraded mode at t=0; catch-up
+     liveness is Stage 4's upgrade, not a Stage 3 repair.
+   - Matrix rows and docs: **done** — engine cells in dom-expressions
+     `frame-live-holes.spec.js`, integration cells in solid-web
+     (`frame-live-holes*.spec.tsx`), rows in the lifecycle matrix's
+     "Live markup holes" section.
+4. **Stage 4 — Liveness at t=0.** **Built (2026-08-09, the
+   `document-liveness` branches).** The t=0 design made real: hole
+   markers and `data-lha` addresses armed in document renders inside
+   server component scope (plain document content keeps its exact
+   bytes — the scope barrier); ops ride ONE `sc:live` channel record,
+   serialized eagerly; adoption reconstructs the morph substrate from
+   page bytes; catch-up replays ops that landed before a boundary
+   adopted (geometry-routed); document ops go quiet when a call-driven
+   version supersedes them; the end latch ships last values and closes
+   the channel before flush. Case-1 getter args are live at t=0 too:
+   document arg bindings re-emit fid-tagged `slot` ops on the same
+   channel. Fill interiors are mint-suppressed (client-owned; the
+   record is their liveness story).
+5. **Stage 5 — Container tier (DR-2 case 3).** **Built (2026-08-10, the
+   `container-traces` branches).** Projections cross the slot border as
+   bounded async traces on both faces; the client materializes them
+   into live read-only projections. See the case-3 build record in DR-2
+   for what shipped and the scope lines (whole containers this round;
+   parts and case 4 remain the designed extensions).
+6. **Stage 6 — Generalized claims: the micro-affordance rung.** Promoted
+   from unlisted (2026-08-07, out of the Datastar comparison). The
+   router's claim sweep — behavior attached by attribute over any
+   server-materialized subtree, re-firing when a morph touches the
+   element — opened to user-defined claims, plus a shipped set of
+   micro-affordances. Kills "the first affordance costs a full
+   component ceremony" without adopting attribute-expression strings.
+   Sequenced here because it rides the same morph-surviving substrate
+   Stage 3 builds. Design sketch expanded 2026-08-13 — see §9.1.
+7. **Stage 7 — Connection-shaped transport.** Promoted from parked: the
+   sink-lifetime separation means SSE/socket transports turn the same
+   authored component non-terminating (generator-only-model.md §9,
+   "transport-indifference"). Includes making the discipline
+   enforceable, not just documented: the live graph is a re-derivable
+   projection of durable state — reconnection is re-invocation, and dev
+   should surface violations.
+
+Ordering note (2026-08-11): 6-before-7 above is substrate sequencing
+(claims ride Stage 3's morph-surviving substrate), not priority. The
+recorded priority lean is the reverse — new-API surface is
+bottom-of-bucket, so if the next stretch picks one up, Stage 7's
+transport work likely goes first.
+
+**Parked here (2026-08-11), state of the world for whoever resumes:**
+Stages 1–5 are built, merged to `next` in both repos, and released
+(dom-expressions `0.50.0-next.41`; the paired solid release verified
+against it — full suites plus browser passes over the chat and notes
+examples). Nothing is in flight: no unmerged branches, no uncommitted
+work; the `container-traces` worktree branches (`solid-dr2/`,
+`dom-expressions-dr2/` siblings of the main checkouts) are fully folded
+into `next` and exist only as workspaces. Development pairing
+convention: solid's `pnpm-workspace.yaml` gains a
+`'@dom-expressions/runtime': link:../dom-expressions-dr2/packages/runtime`
+override marked DO NOT COMMIT; commits that touch the lockfile drop the
+link, run `pnpm install --lockfile-only`, commit, then restore it.
+Release-order invariant: dom-expressions publishes before solid bumps
+its pins; solid's turbo cache can report a suite green without running
+it — force-execute `packages/solid-web` and `packages/solid` tests when
+verifying a release.
+
+Still parked, deliberately: generator authoring sugar (the ledger's
+supersession is already generator-ready); per-hole diff emission as a
+wire optimization (contained by hole scope; adopted only where
+measurement earns it). The chat demo's honest form sharpened the diff
+case (2026-08-10): one hole over a growing reply re-ships the whole
+rendered message per yield — O(n²) bytes over a generation for a few
+words of new information each time. The first rung is NOT general
+diffing (markup holes have no patch recorder; a wire diff would have to
+be computed — the same line that parked the generator model's
+server-side diffing): streamed text is append-mostly, and the hole
+binding already retains its last emission for the equality gate, so a
+prefix check yields an `append` op that ships just the tail, falling
+back to full re-emission + morph whenever the prefix breaks (a code
+fence closing retroactively). Additive to the chunk protocol; adopt
+when measurement earns it.
+
+### 9.1 Stage 6 sketch — generalized claims and the affordance tier (2026-08-13)
+
+Recorded from the design conversation before parking, so the shape
+survives the break. Nothing here is built.
+
+**The problem, precisely.** In the current model the smallest unit of
+client behavior is a component fill: a copy button on a code block
+costs a slot prop on the server component, an authored client
+component, and wiring at every call site. Worse than ceremony, there is
+an expressiveness hole: a live markup hole cannot mint components as it
+grows (the owner-creation latch, by design), so content streaming
+through a hole — every code block in a chat reply — has *no path to
+client behavior at all* today.
+
+**The substrate exists.** The element-claim seam in the client runtime
+(`registerElementClaim`, `claimElement`, `claimElementTree`,
+`CLAIM_SEAM`): compiled DOM output claims elements at creation;
+everything that materializes *serialized* server content — frame
+streams, adopted SSR ranges, morph grafts — sweeps the subtree through
+the same registry, re-firing when a morph touches an element. Dormant
+by design (a null check when no consumer is registered), idempotent,
+importless across bundled copies. Today it has one consumer (the
+router's link layer) and a hard-coded selector (`a[href],
+form[action]`). Stage 6 is that seam, opened.
+
+**Three moves:**
+
+1. *Open registration.* Consumer-declared claims keyed by an attribute
+   namespace (not arbitrary selectors — the sweep stays one
+   `querySelectorAll` over a fixed pattern). A server component writes
+   `<button data-copy>`; a registered claim owns that attribute and
+   attaches behavior when the element materializes, under the current
+   reactive owner for cleanup. Attribute values are declarative
+   arguments (`data-confirm="Delete this note?"`) — never code.
+2. *The lifecycle contract, stated.* Claims fire at creation, at
+   materialization of serialized content, and again when a morph
+   replaces the element; handlers are idempotent (element-keyed dedupe
+   per consumer). Identity-first morph does most state preservation for
+   free — matched elements are the same DOM nodes — so only
+   wholesale-replaced ranges re-claim fresh.
+3. *A shipped affordance tier* — prebuilt claims (each ~10 lines,
+   tree-shakeable entry) so the first affordance costs one attribute.
+
+**The authoring split.** `ref` is the client-side answer: an arbitrary
+closure attached in JSX. That form cannot cross the slot border (a
+closure does not serialize; inside a hole there is no owner to hold
+it). A claim attribute is the serializable *name* of behavior
+registered ahead of time on the client — behavior where all you have is
+markup. Same job, two transports, mirroring every other split in this
+design. (Solid 2.0 removed `use:` directives; there is no directive
+form to unify with — `ref` and claims are the complete pair.)
+
+**Candidate tier** (filter: leans on semantics already in the markup,
+needs zero expressions, or one of our examples already hand-wrote it):
+
+| Affordance | Goes on | Does |
+|---|---|---|
+| `data-toggle="#target"` | button | toggle class/`open` on target; menus, collapse |
+| `data-copy` | button | clipboard-write nearest `<pre>`/target text |
+| `data-confirm="msg"` | form, a | native `confirm()` gate before submit/navigate |
+| `data-indicator` | form, button | busy class + disabled while action/navigation in flight |
+| `data-autosubmit="300"` | input, select | debounced `requestSubmit()` of owning form |
+| `data-bind="param"` | input | two-way sync with a URL query param (router-aware) |
+| `data-scroll="bottom"` | container | follow appended/morphed content while reader at bottom |
+| `data-focus` | element | focus on materialize; preserve focus/caret across morphs |
+
+Four of these were already paid for by hand: the chat transcript's
+`ResizeObserver` pinning (`data-scroll`), the notes save/delete flows
+(`data-indicator`, `data-confirm`), the notes search field
+(`data-bind` + `data-autosubmit` — currently a client component whose
+whole job is "input writes a query param, debounced"). The composition
+is the pitch: `data-bind` plus a server component keyed by that param
+is live search with zero client components.
+
+**Positioning.** The tier is htmx's affordance lineage
+(request-lifecycle dressing: confirm/indicator/trigger), not
+Datastar's (a client reactive system in attributes —
+`data-signals`/`data-show`/`data-on` with expressions). We refuse the
+Datastar layer not because it is bad but because Solid already has a
+strictly better version: signals and JSX, typed, compiled, DCE'd.
+What we take from Datastar is architectural — morph-surviving
+attachment as a first-class contract, which htmx historically bolts
+on. One line: htmx's affordance tier, on Datastar's morph-survival
+discipline, under Solid's rule that expressions live in JSX. The
+escape hatch up from the tier is a component, never an attribute
+expression.
+
+**The state contract.** Affordances trigger actions and reflect
+transport or DOM-local state: submit, navigate, confirm, busy,
+open/closed, focus, scroll, a URL param. They never read or write
+signals or stores — the moment behavior needs client reactive state,
+that is the component threshold. This is what keeps the tier
+native-alignable.
+
+**Tier policy option (2026-08-13): spec'd-only built-ins.** Possibly
+the only *shipped* affordances are ones the platform has spec'd or
+formally proposed — `command`/`commandfor` enhancement, `popover`,
+`<details name>`, Triptych's forms — and Solid never mints attribute
+vocabulary at all: everything invented in the table above ships as
+documented `registerClaim` recipes, not package API. Buys: dissolves
+naming entirely; shrinks freeze exposure to ~zero (the shipped set is
+defined by an external process; deprecation is the browser shipping);
+makes the primitive the product. Costs: the two flagship compositions
+(`data-bind` live search, `data-scroll` stream-following) have no
+platform equivalent on any horizon and drop from one attribute to
+copy-a-recipe; and "spec'd" needs a line drawn — strict reading ships
+almost nothing today, loose reading tracks moving drafts. Spectrum to
+decide at build time, not before stable (the substrate is identical
+across all three): (a) spec'd-only + recipes, (b) spec'd built-ins +
+a blessed-recipes package that is explicitly non-contract, (c) the
+invented tier. Packaging posture only.
+
+**Native alignment rule.** The htmx-adjacent platform proposals
+(Triptych's button `action`/`method`, invoker `command`/`commandfor`
+— shipping, `popover` — shipped, `<details name>` — shipped) are
+attribute-shaped, expression-free, form/anchor-semantic: the same
+dialect. Each affordance is therefore written as a forward-polyfill —
+where a native attribute exists or is proposed, adopt its vocabulary
+(prefer enhancing `commandfor` over inventing toggle syntax) so markup
+written today degrades toward the platform, not away from it. The
+claims substrate makes the exit graceful: "the browser does this now"
+is deleting one registration. The exchange itself (partial
+replacement, Triptych's biggest ask) is *not* affordance-tier — frame
+streams and morphs already own it and do more.
+
+**RC-freeze compatibility (2026-08-13).** The claim trio is frozen
+public API — `@solidjs/web`'s client entry wholesale re-exports the
+runtime client, so `registerElementClaim`/`claimElement`/
+`claimElementTree` and their semantics (handlers observe the
+navigation-relevant set: `a[href]`, `form[action]`) are in the RC
+contract, with the router's `setupLinkClaims` as a live consumer. The
+generalization is additive *only if* one line holds: attribute-keyed
+claims route through their own per-attribute handler lists — the
+existing `registerElementClaim` broadcast channel must NOT widen to
+observe attribute-claimed elements, or every frozen-API consumer
+starts receiving element kinds the contract never promised. Likewise
+the `CLAIM_SEAM` registered symbol (a flat handler array shared across
+separately bundled — potentially differently versioned — runtime
+copies) keeps its shape; attribute-keyed registration hangs off a
+second registered symbol.
+
+**Decide before stable (2026-08-13; the seam is movable during RC,
+frozen after).** Two decisions harden at stable; everything else in
+this sketch is provably additive later:
+
+1. *The navigation element set.* `a[href], form[action]` is baked into
+   the frozen channel's semantics — consumer filters are written
+   against it — and it is currently incomplete as a navigation
+   contract: `area[href]` navigates, `button[formaction]` re-targets a
+   form. Widening after stable changes what every registered handler
+   receives (the self-inflicted version of the "channel never widens"
+   hazard). Settle the set during RC, or document it as closed and
+   final.
+2. *The seam global's shape.* `CLAIM_SEAM` holds a bare array shared
+   across separately bundled — potentially differently versioned —
+   runtime copies, so stable's shape is the wire format forever.
+   Either reshape to an extensible object now, or commit to attribute
+   claims living on a second registered symbol (zero RC churn — the
+   recorded lean).
+
+Explicitly additive later, no RC action: attribute-keyed registration
+(new function, own routing), the affordance tier (new entry), a
+trailing metadata parameter on handlers (creation vs sweep vs
+morph-touch phase), and `claimElement`/`claimElementTree` (compiler
+output contract, version-paired, unchanged regardless).
+
+**Open questions:** exact attribute namespace and sweep cost; packaging
+(which entry ships the tier so it stays tree-shakeable); the re-claim
+dedupe contract (element-keyed WeakSet per consumer is the obvious
+shape); how `data-bind` discovers the router without a hard
+dependency.

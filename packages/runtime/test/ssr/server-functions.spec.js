@@ -52,7 +52,8 @@ import {
   handleServerFunctionRequest,
   registerServerFunction,
   registerServerReference,
-  sanitizeServerError
+  sanitizeServerError,
+  setServerFunctionsDev
 } from "../../src/server-functions/server";
 import { FLASH_COOKIE, clearFlashCookie, hasFlashCookie } from "../../src/server-functions/shared";
 import { RequestContext } from "../../src/server";
@@ -185,6 +186,307 @@ describe("framed codec streams", () => {
 
   it("decodes empty responses to undefined", async () => {
     expect(await decodeResponse(new Response(null, { status: 302 }))).toBeUndefined();
+  });
+});
+
+describe("response format negotiation", () => {
+  // The response mirror of the argument fast path: the server answers
+  // JSON-safe results as plain JSON (BodyFormat.Json) and void results with
+  // no body at all, so a plain-data app never wakes the codec on either leg
+  // — the client's decode half loads lazily on the first Serialized body
+  // (shared.js loadSerializer). Negotiated per response: nothing here is a
+  // mode, so JSON and Serialized results interleave freely on one page.
+  function dispatch(request, options) {
+    return handleServerFunctionRequest(request, options);
+  }
+
+  function connectTransport(options) {
+    const original = globalThis.fetch;
+    const posts = [];
+    globalThis.fetch = (url, init) => {
+      posts.push(String(url));
+      return dispatch(new Request(new URL(url, "http://localhost"), init), options);
+    };
+    return { restore: () => (globalThis.fetch = original), posts };
+  }
+
+  function scriptedRequest(id) {
+    return new Request("http://localhost/_server", {
+      method: "POST",
+      headers: {
+        "X-Server-Function-Id": id,
+        "X-Server-Function-Instance": "server-function:test"
+      }
+    });
+  }
+
+  it("answers JSON-safe results as plain JSON", async () => {
+    const value = { ok: true, items: ["a", 1, null], nested: { deep: false } };
+    registerServerFunction("fmt-json-0", async () => value);
+    const response = await dispatch(scriptedRequest("fmt-json-0"));
+    expect(response.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Json);
+    expect(response.headers.get("Content-Type")).toBe("application/json");
+    // decodable with bare JSON.parse — nothing codec-shaped on the wire
+    expect(JSON.parse(await response.clone().text())).toEqual(value);
+    expect(await decodeResponse(response)).toEqual(value);
+  });
+
+  it("answers void results with no body at all", async () => {
+    registerServerFunction("fmt-void-0", async () => {});
+    const response = await dispatch(scriptedRequest("fmt-void-0"));
+    expect(response.body).toBeNull();
+    expect(response.headers.has(BODY_FORMAT_HEADER)).toBe(false);
+    expect(await decodeResponse(response)).toBeUndefined();
+
+    // and the full client roundtrip resolves undefined
+    const { restore } = connectTransport();
+    try {
+      await expect(createClientReference("fmt-void-0")()).resolves.toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps the codec for results needing typed reconstruction", async () => {
+    registerServerFunction("fmt-rich-0", async () => ({ when: new Date(0) }));
+    const response = await dispatch(scriptedRequest("fmt-rich-0"));
+    expect(response.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Serialized);
+    const decoded = await decodeResponse(response);
+    expect(decoded.when).toBeInstanceOf(Date);
+    expect(decoded.when.getTime()).toBe(0);
+  });
+
+  it("values JSON would corrupt stay on the codec (undefined properties, NaN)", async () => {
+    registerServerFunction("fmt-faithful-0", async () => ({ present: 1, missing: undefined }));
+    const withUndefined = await dispatch(scriptedRequest("fmt-faithful-0"));
+    expect(withUndefined.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Serialized);
+    const decoded = await decodeResponse(withUndefined);
+    expect("missing" in decoded).toBe(true);
+    expect(decoded.missing).toBeUndefined();
+
+    registerServerFunction("fmt-faithful-1", async () => ({ ratio: NaN }));
+    const withNaN = await dispatch(scriptedRequest("fmt-faithful-1"));
+    expect(withNaN.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Serialized);
+    expect(Number.isNaN((await decodeResponse(withNaN)).ratio)).toBe(true);
+  });
+
+  // Negotiation-guard regressions (ryansolid/dom-expressions#566): the JSON
+  // fast path's isJSONSafe used to recurse without cycle detection, so a
+  // cyclic result RangeError'd during ENCODING and dispatch's catch reported
+  // it as the function throwing — a phantom error over a call whose side
+  // effects had already committed.
+  it("cyclic results ride the codec and round-trip — not a phantom function error", async () => {
+    registerServerFunction("fmt-cycle-0", async () => {
+      const a = { name: "a" };
+      a.self = a;
+      return a;
+    });
+    const response = await dispatch(scriptedRequest("fmt-cycle-0"));
+    // the call SUCCEEDED: no error flag, the codec carries the cycle
+    expect(response.headers.get(ERROR_HEADER)).toBeNull();
+    expect(response.status).toBe(200);
+    expect(response.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Serialized);
+    const decoded = await decodeResponse(response);
+    expect(decoded.name).toBe("a");
+    expect(decoded.self).toBe(decoded);
+
+    // and end to end through the client transport
+    const { restore } = connectTransport();
+    try {
+      const value = await createClientReference("fmt-cycle-0")();
+      expect(value.name).toBe("a");
+      expect(value.self).toBe(value);
+    } finally {
+      restore();
+    }
+  });
+
+  it("deep JSON-safe nesting stays on the JSON fast path (stringify handles it)", async () => {
+    // ~8k levels overflowed the old recursive guard even though
+    // JSON.stringify carries it fine — and the codec CANNOT take it (its
+    // depth limit protects the decoding peer), so the guard itself must
+    // survive and answer true.
+    registerServerFunction("fmt-deep-0", async () => {
+      const root = {};
+      let cursor = root;
+      for (let i = 0; i < 8000; i++) cursor = cursor.next = {};
+      cursor.leaf = true;
+      return root;
+    });
+    const response = await dispatch(scriptedRequest("fmt-deep-0"));
+    expect(response.headers.get(ERROR_HEADER)).toBeNull();
+    expect(response.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Json);
+    let depth = 0;
+    let cursor = JSON.parse(await response.text());
+    while (cursor.next) {
+      cursor = cursor.next;
+      depth++;
+    }
+    expect(depth).toBe(8000);
+    expect(cursor.leaf).toBe(true);
+  });
+
+  it("acyclic shared references still count as JSON-safe (no codec for aliasing)", async () => {
+    // cycle detection is ancestor-based: a diamond (same object referenced
+    // twice, no cycle) keeps riding plain JSON exactly as before — flipping
+    // it to the codec would pull seroval into plain-data apps
+    const shared = { theme: "dark" };
+    registerServerFunction("fmt-diamond-0", async () => ({ a: shared, b: shared }));
+    const response = await dispatch(scriptedRequest("fmt-diamond-0"));
+    expect(response.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Json);
+    expect(JSON.parse(await response.text())).toEqual({
+      a: { theme: "dark" },
+      b: { theme: "dark" }
+    });
+  });
+
+  it("negotiates per response: JSON and Serialized results interleave on one page", async () => {
+    registerServerFunction("fmt-mixed-json-0", async () => ({ plain: true }));
+    registerServerFunction("fmt-mixed-rich-0", async () => ({ when: new Date(7) }));
+    const { restore } = connectTransport();
+    try {
+      const plain = await createClientReference("fmt-mixed-json-0")();
+      expect(plain).toEqual({ plain: true });
+      const rich = await createClientReference("fmt-mixed-rich-0")();
+      expect(rich.when).toBeInstanceOf(Date);
+      expect(rich.when.getTime()).toBe(7);
+      // and back again — negotiation carries no state between calls
+      expect(await createClientReference("fmt-mixed-json-0")()).toEqual({ plain: true });
+    } finally {
+      restore();
+    }
+  });
+
+  it("thrown errors keep the codec and the error flag (typed reconstruction)", async () => {
+    setServerFunctionsDev(true);
+    registerServerFunction("fmt-error-0", async () => {
+      throw new Error("nope");
+    });
+    try {
+      const response = await dispatch(scriptedRequest("fmt-error-0"));
+      expect(response.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Serialized);
+      expect(response.headers.get(ERROR_HEADER)).toBe("nope");
+
+      const { restore } = connectTransport();
+      try {
+        const rejection = await createClientReference("fmt-error-0")().catch(x => x);
+        expect(rejection).toBeInstanceOf(Error);
+        expect(rejection.message).toBe("nope");
+      } finally {
+        restore();
+      }
+    } finally {
+      setServerFunctionsDev(false);
+    }
+  });
+
+  it("a markSafeError'd error survives production sanitization on the wire", async () => {
+    // default build state is prod (fail-safe raw source): the brand is the
+    // pass-through, and the rich path carries the typed Error
+    registerServerFunction("fmt-safe-error-0", async () => {
+      throw markSafeError(new Error("Card declined"));
+    });
+    const { restore } = connectTransport();
+    try {
+      const rejection = await createClientReference("fmt-safe-error-0")().catch(x => x);
+      expect(rejection).toBeInstanceOf(Error);
+      expect(rejection.message).toBe("Card declined");
+    } finally {
+      restore();
+    }
+  });
+
+  describe("single-flight envelopes", () => {
+    function flightOptions(data) {
+      return { collectFlightData: () => data };
+    }
+
+    it("rides the JSON format when contents are JSON-safe (one POST, refreshed data)", async () => {
+      registerServerFunction("fmt-sf-json-0", async () => ({ ok: true }));
+      const { restore, posts } = connectTransport(flightOptions({ "/notes": ["fresh"] }));
+      const delivered = [];
+      const unsubscribe = subscribeFlightData((data, { response }) => {
+        delivered.push({ data, format: response.headers.get(BODY_FORMAT_HEADER) });
+      });
+      try {
+        const value = await createClientReference("fmt-sf-json-0")();
+        expect(value).toEqual({ ok: true });
+        // one round trip carried both the value and the refreshed data
+        expect(posts).toHaveLength(1);
+        expect(delivered).toEqual([{ data: { "/notes": ["fresh"] }, format: BodyFormat.Json }]);
+      } finally {
+        unsubscribe();
+        restore();
+      }
+    });
+
+    it("omits a void mutation's value key so the envelope stays JSON", async () => {
+      registerServerFunction("fmt-sf-void-0", async () => {});
+      const folded = await dispatch(
+        new Request("http://localhost/_server", {
+          method: "POST",
+          headers: {
+            "X-Server-Function-Id": "fmt-sf-void-0",
+            "X-Server-Function-Instance": "server-function:test",
+            [SINGLE_FLIGHT_HEADER]: "true"
+          }
+        }),
+        flightOptions({ "/notes": ["fresh"] })
+      );
+      expect(folded.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Json);
+      expect(JSON.parse(await folded.clone().text())).toEqual({ data: { "/notes": ["fresh"] } });
+      // both payload readers see the same undefined value
+      expect(await decodeResponsePayload(folded)).toEqual({
+        value: undefined,
+        flightData: { "/notes": ["fresh"] }
+      });
+    });
+
+    it("cyclic flight data keeps the envelope on the codec and round-trips", async () => {
+      // same #566 guard, envelope surface: integration-produced data with a
+      // back-reference used to RangeError while encoding `{ value, data }`
+      registerServerFunction("fmt-sf-cycle-0", async () => ({ ok: true }));
+      const node = { key: "/graph" };
+      node.parent = node;
+      const { restore, posts } = connectTransport(flightOptions({ "/graph": node }));
+      const delivered = [];
+      const unsubscribe = subscribeFlightData((data, { response }) => {
+        delivered.push({ data, format: response.headers.get(BODY_FORMAT_HEADER) });
+      });
+      try {
+        const value = await createClientReference("fmt-sf-cycle-0")();
+        expect(value).toEqual({ ok: true });
+        expect(posts).toHaveLength(1);
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0].format).toBe(BodyFormat.Serialized);
+        const graph = delivered[0].data["/graph"];
+        expect(graph.key).toBe("/graph");
+        expect(graph.parent).toBe(graph);
+      } finally {
+        unsubscribe();
+        restore();
+      }
+    });
+
+    it("keeps the codec when flight contents are rich (one POST, typed data)", async () => {
+      registerServerFunction("fmt-sf-rich-0", async () => ({ ok: true }));
+      const { restore, posts } = connectTransport(flightOptions({ "/notes": [new Date(0)] }));
+      const delivered = [];
+      const unsubscribe = subscribeFlightData((data, { response }) => {
+        delivered.push({ data, format: response.headers.get(BODY_FORMAT_HEADER) });
+      });
+      try {
+        const value = await createClientReference("fmt-sf-rich-0")();
+        expect(value).toEqual({ ok: true });
+        expect(posts).toHaveLength(1);
+        expect(delivered).toHaveLength(1);
+        expect(delivered[0].format).toBe(BodyFormat.Serialized);
+        expect(delivered[0].data["/notes"][0]).toBeInstanceOf(Date);
+      } finally {
+        unsubscribe();
+        restore();
+      }
+    });
   });
 });
 
@@ -465,8 +767,7 @@ describe("handler", () => {
   });
 
   it("propagates thrown errors to the client (dev: full message)", async () => {
-    const prev = process.env.NODE_ENV;
-    process.env.NODE_ENV = "development";
+    setServerFunctionsDev(true);
     registerServerFunction("boom-0", async () => {
       throw new Error("kaboom");
     });
@@ -475,22 +776,17 @@ describe("handler", () => {
       await expect(createClientReference("boom-0")()).rejects.toThrow("kaboom");
     } finally {
       restore();
-      process.env.NODE_ENV = prev;
+      setServerFunctionsDev(false);
     }
   });
 
   describe("error header encoding", () => {
-    // These assert real error content on the wire — i.e. development
-    // fidelity. Outside development the handler sanitizes plain errors (see
-    // the "production error sanitization" suite), so pin the mode here.
-    let prevNodeEnv;
-    beforeEach(() => {
-      prevNodeEnv = process.env.NODE_ENV;
-      process.env.NODE_ENV = "development";
-    });
-    afterEach(() => {
-      process.env.NODE_ENV = prevNodeEnv;
-    });
+    // These assert real error content on the wire — i.e. dev-build
+    // fidelity. Outside the dev build the handler sanitizes plain errors
+    // (see the "production error sanitization" suite), so pin the mode here
+    // through the build-variant seam.
+    beforeEach(() => setServerFunctionsDev(true));
+    afterEach(() => setServerFunctionsDev(false));
 
     // Header values are latin1 ByteStrings: without the encoding guard,
     // Headers.set throws on messages with code points above U+00FF and the
@@ -599,18 +895,14 @@ describe("handler", () => {
   });
 
   describe("production error sanitization", () => {
-    // The handler sanitizes plain thrown values outside development so a
+    // The handler sanitizes plain thrown values outside the dev build so a
     // driver/ORM error can't leak its message or own-properties (a failing
     // query, a connection string) to the client. Intentional error content
     // travels as a thrown Response/envelope, or an Error branded safe.
-    let prevNodeEnv;
-    beforeEach(() => {
-      prevNodeEnv = process.env.NODE_ENV;
-      process.env.NODE_ENV = "production";
-    });
-    afterEach(() => {
-      process.env.NODE_ENV = prevNodeEnv;
-    });
+    // Raw (unreplaced) source is the sanitizing default already; pin it
+    // explicitly so a dev-pinned sibling suite can't bleed in.
+    beforeEach(() => setServerFunctionsDev(false));
+    afterEach(() => setServerFunctionsDev(false));
 
     function errorRequest(id) {
       return new Request("http://localhost/_server", {
@@ -750,31 +1042,34 @@ describe("handler", () => {
   });
 
   describe("sanitizeServerError policy", () => {
-    let prevNodeEnv;
-    beforeEach(() => (prevNodeEnv = process.env.NODE_ENV));
-    afterEach(() => (process.env.NODE_ENV = prevNodeEnv));
+    // The dev/prod line is the build variant (`_DX_DEV_` replaced by the
+    // bundler), not NODE_ENV — `setServerFunctionsDev` is the test seam for
+    // that replacement.
+    afterEach(() => setServerFunctionsDev(false));
 
-    it("dev keeps the thrown value verbatim (full fidelity)", () => {
-      process.env.NODE_ENV = "development";
+    it("dev build keeps the thrown value verbatim (full fidelity)", () => {
+      setServerFunctionsDev(true);
       const err = new Error("full detail");
       err.query = "SELECT 1";
       expect(sanitizeServerError(err)).toBe(err);
     });
 
-    it("non-development replaces a plain Error with a generic one", () => {
-      process.env.NODE_ENV = "production";
+    it("prod build replaces a plain Error with a generic one", () => {
+      setServerFunctionsDev(false);
       const out = sanitizeServerError(new Error("leaky"));
       expect(out).toBeInstanceOf(Error);
       expect(out.message).toBe(GENERIC_SERVER_ERROR_MESSAGE);
     });
 
-    it("fails safe when NODE_ENV is unset (sanitizes)", () => {
-      delete process.env.NODE_ENV;
+    it("fails safe with no build signal at all (raw source sanitizes)", () => {
+      // This suite runs the raw, unreplaced source — the deep-import case.
+      // The default (never having called setServerFunctionsDev(true) in
+      // this test) must sanitize.
       expect(sanitizeServerError(new Error("leaky")).message).toBe(GENERIC_SERVER_ERROR_MESSAGE);
     });
 
     it("passes a branded error through in production", () => {
-      process.env.NODE_ENV = "production";
+      setServerFunctionsDev(false);
       const err = markSafeError(new Error("intentional"));
       expect(isSafeError(err)).toBe(true);
       expect(sanitizeServerError(err)).toBe(err);
@@ -1403,12 +1698,11 @@ describe("single-flight", () => {
   });
 
   it("never collects for plain thrown errors", async () => {
-    // Pinned to development so the message assertion reads real content; the
-    // point of the test is that the flight hook is skipped and the response
-    // is still error-flagged. (Sanitization is covered in "production error
-    // sanitization".)
-    const prev = process.env.NODE_ENV;
-    process.env.NODE_ENV = "development";
+    // Pinned to the dev build so the message assertion reads real content;
+    // the point of the test is that the flight hook is skipped and the
+    // response is still error-flagged. (Sanitization is covered in
+    // "production error sanitization".)
+    setServerFunctionsDev(true);
     registerServerFunction("sf-error-0", async () => {
       throw new Error("kaboom");
     });
@@ -1419,7 +1713,7 @@ describe("single-flight", () => {
       expect(response.headers.has(SINGLE_FLIGHT_HEADER)).toBe(false);
       expect(response.headers.get("X-Server-Function-Error")).toBe("kaboom");
     } finally {
-      process.env.NODE_ENV = prev;
+      setServerFunctionsDev(false);
     }
   });
 
@@ -2076,6 +2370,27 @@ describe("argument encoding fast path", () => {
     }
   });
 
+  it("cyclic args reject with codec guidance, not a RangeError, and never dispatch", async () => {
+    // #566's client-side variant (pre-existing, from the argument fast
+    // path): isJSONSafe used to blow the stack on a cyclic argument BEFORE
+    // the serializeArguments fallback could engage — the caller saw a
+    // RangeError instead of the actionable enableRichArguments guidance.
+    // NOTE: declared before any test enables rich arguments (the config is
+    // module-level and sticks for the rest of the file).
+    registerServerReference("cyclic-args-0", async a => a.self === a);
+    const callable = createClientReference("cyclic-args-0");
+    const restore = connectTransport({ provideEvent });
+    try {
+      requests.length = 0;
+      const cyclic = { name: "a" };
+      cyclic.self = cyclic;
+      await expect(callable(cyclic)).rejects.toThrow(/not JSON-serializable/);
+      expect(requests).toHaveLength(0);
+    } finally {
+      restore();
+    }
+  });
+
   it("non-JSON-safe args throw with guidance until rich arguments are enabled", async () => {
     registerServerReference("rich-args-0", async d => d instanceof Date && d.getTime());
     const callable = createClientReference("rich-args-0");
@@ -2088,6 +2403,26 @@ describe("argument encoding fast path", () => {
       const { enableRichArguments } = await import("../../src/server-functions/rich-args");
       enableRichArguments();
       await expect(callable(new Date(1234))).resolves.toBe(1234);
+      expect(requests[0].init.headers[BODY_FORMAT_HEADER]).toBe(BodyFormat.Serialized);
+      expect(requests[0].init.body.startsWith(";0x")).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("cyclic args ride the codec once rich arguments are enabled", async () => {
+    // the server decodes the framed body with the codec, so the cycle
+    // arrives intact — the function observes the back-reference itself
+    registerServerReference("cyclic-args-1", async a => a.name === "a" && a.self === a);
+    const callable = createClientReference("cyclic-args-1");
+    const restore = connectTransport({ provideEvent });
+    try {
+      const { enableRichArguments } = await import("../../src/server-functions/rich-args");
+      enableRichArguments();
+      requests.length = 0;
+      const cyclic = { name: "a" };
+      cyclic.self = cyclic;
+      await expect(callable(cyclic)).resolves.toBe(true);
       expect(requests[0].init.headers[BODY_FORMAT_HEADER]).toBe(BodyFormat.Serialized);
       expect(requests[0].init.body.startsWith(";0x")).toBe(true);
     } finally {

@@ -471,6 +471,61 @@ describe("Phase 1: Hydration error diagnostics", () => {
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
   });
+
+  // Frame regions (`data-fid`) are another layer's property: their fills
+  // claim through scoped registries on their own schedule — a lazy route
+  // module can adopt long after the document root completes. The ambient
+  // gather must not collect their interiors, or the completion sweep
+  // reports those legitimately-late claims as unclaimed markup.
+  it("the ambient gather leaves frame-region interiors to their own claim scopes", () => {
+    const warn = jest.spyOn(console, "warn").mockImplementation(() => {});
+    const _tmpl$ = r.template("<div>Content</div>");
+    container.innerHTML =
+      '<div _hk="0">Mine</div>' +
+      '<dx-frame data-fid="f1"><section _hk="sc-f1-slot#0-0">Frame owned</section></dx-frame>';
+
+    r.hydrate(() => {
+      const _el$ = r.getNextElement(_tmpl$);
+      r.insert(container, _el$, undefined, [...container.childNodes]);
+    }, container);
+
+    expect(document.querySelector('[_hk="sc-f1-slot#0-0"]').isConnected).toBe(true);
+    sharedConfig.verifyHydration();
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  // A boundary's late resume gathers by prefix — it names exactly what it
+  // owns, so it collects wherever the keys sit, frame interiors included
+  // (a deferred segment inside an adopted slot fill lands there).
+  it("a prefix-scoped gather still collects inside frame regions", () => {
+    container.innerHTML = "";
+    r.hydrate(() => {}, container);
+    container.innerHTML =
+      '<dx-frame data-fid="f1"><section _hk="1902-0">Deferred content</section></dx-frame>';
+    sharedConfig.gather("1902");
+    expect(sharedConfig.registry.has("1902-0")).toBe(true);
+  });
+
+  // The frame element as the hydration root: its interior is exactly what
+  // this root walks, so the opacity rule must not apply to itself.
+  it("hydrating directly on a frame element claims its interior", () => {
+    const frame = document.createElement("dx-frame");
+    frame.setAttribute("data-fid", "f2");
+    frame.innerHTML = '<div _hk="0">Inside</div>';
+    container.innerHTML = "";
+    container.appendChild(frame);
+    const inner = frame.firstChild;
+    const _tmpl$ = r.template("<div>Inside</div>");
+
+    r.hydrate(() => {
+      const _el$ = r.getNextElement(_tmpl$);
+      expect(_el$).toBe(inner);
+      r.insert(frame, _el$, undefined, [...frame.childNodes]);
+    }, frame);
+
+    expect(frame.firstChild).toBe(inner);
+  });
 });
 
 /**
@@ -1200,6 +1255,198 @@ describe("loadModuleAssets shortcut branches", () => {
     expect(globalThis._$HY.modules[moduleUrl]).toBe(shared);
     // The loading entry we installed was reused rather than replaced.
     expect(globalThis._$HY.loading[moduleUrl]).toBe(loadingPromise);
+  });
+});
+
+// Multiple hydrate() roots in one tick — the islands pattern: an entry-client
+// loops document.querySelectorAll("solid-island") calling hydrate() per node.
+// When a serialized `_assets` map defers rendering behind the module preload,
+// every root's synchronous prologue runs before any root's render. sharedConfig
+// is shared and live: without re-installing each root's scope in its .then,
+// the first root renders against the LAST root's registry (claims nothing) and
+// its `finally { hydrating = false }` makes every later root render unhydrated
+// (fresh nodes over server DOM, and lazy() skips its module lookup).
+describe("concurrent hydrate() roots deferred behind module preload (islands)", () => {
+  let originalHY;
+  beforeEach(() => {
+    originalHY = globalThis._$HY;
+  });
+  afterEach(() => {
+    globalThis._$HY = originalHY;
+  });
+
+  it("each deferred root re-arms hydrating and claims its own gathered registry", async () => {
+    let resolveLoad;
+    const keyA = "i00";
+    const keyB = "i10";
+    const load = new Promise(res => (resolveLoad = res));
+    globalThis._$HY = {
+      events: [],
+      completed: new WeakSet(),
+      // One root map per render — separate renderToString calls (islands)
+      // serialize under renderId-scoped names so they don't clobber each
+      // other in the shared registry.
+      r: {
+        i0_assets: { [keyA]: "/assets/Island-abc.js" },
+        i1_assets: { [keyB]: "/assets/Island-abc.js" }
+      },
+      modules: {},
+      loading: {
+        [keyA]: load.then(mod => {
+          globalThis._$HY.modules[keyA] = mod;
+        }),
+        [keyB]: load.then(mod => {
+          globalThis._$HY.modules[keyB] = mod;
+        })
+      },
+      done: false,
+      fe() {}
+    };
+
+    const islandA = document.createElement("div");
+    const islandB = document.createElement("div");
+    islandA.innerHTML = '<div _hk="i00">One</div>';
+    islandB.innerHTML = '<div _hk="i10">Two</div>';
+    document.body.appendChild(islandA);
+    document.body.appendChild(islandB);
+    const serverA = islandA.firstChild;
+    const serverB = islandB.firstChild;
+
+    const _tmpl$A = r.template("<div>One</div>");
+    const _tmpl$B = r.template("<div>Two</div>");
+
+    const runs = [];
+    const hydrateIsland = (container, tmpl, renderId) =>
+      r.hydrate(
+        () => {
+          const _el$ = r.getNextElement(tmpl);
+          runs.push({ renderId, hydrating: sharedConfig.hydrating, claimed: _el$ });
+          r.insert(container, _el$, undefined, [...container.childNodes]);
+        },
+        container,
+        { renderId }
+      );
+
+    // Same tick, like an entry-client's forEach over the document's islands.
+    hydrateIsland(islandA, _tmpl$A, "i0");
+    hydrateIsland(islandB, _tmpl$B, "i1");
+
+    // Both roots parked behind the shared module preload.
+    expect(runs.length).toBe(0);
+
+    resolveLoad({ default: () => "Island" });
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    expect(runs.length).toBe(2);
+    // Each deferred render must run in hydration mode against its own
+    // gathered registry — not whichever root's prologue ran last.
+    expect(runs[0].hydrating).toBe(true);
+    expect(runs[1].hydrating).toBe(true);
+    expect(runs[0].claimed).toBe(serverA);
+    expect(runs[1].claimed).toBe(serverB);
+    // The flag still winds down once the deferred renders finish.
+    expect(sharedConfig.hydrating).toBe(false);
+
+    islandA.remove();
+    islandB.remove();
+  });
+
+  // The OTHER islands shape: ONE document render (renderId "") whose islands
+  // re-enter through <Hydration id>. All island modules live in the single
+  // bare "_assets" map; each island's hydrate(renderId) falls back to it.
+  it("island roots fall back to the single-render bare _assets map", async () => {
+    let resolveLoad;
+    const keyA = "i00";
+    const keyB = "i10";
+    const load = new Promise(res => (resolveLoad = res));
+    globalThis._$HY = {
+      events: [],
+      completed: new WeakSet(),
+      r: {
+        _assets: { [keyA]: "/assets/Island-abc.js", [keyB]: "/assets/Island-abc.js" }
+      },
+      modules: {},
+      loading: {
+        [keyA]: load.then(mod => {
+          globalThis._$HY.modules[keyA] = mod;
+        }),
+        [keyB]: load.then(mod => {
+          globalThis._$HY.modules[keyB] = mod;
+        })
+      },
+      done: false,
+      fe() {}
+    };
+
+    const islandA = document.createElement("div");
+    const islandB = document.createElement("div");
+    islandA.innerHTML = '<div _hk="i00">One</div>';
+    islandB.innerHTML = '<div _hk="i10">Two</div>';
+    document.body.appendChild(islandA);
+    document.body.appendChild(islandB);
+    const serverA = islandA.firstChild;
+    const serverB = islandB.firstChild;
+
+    const _tmpl$A = r.template("<div>One</div>");
+    const _tmpl$B = r.template("<div>Two</div>");
+
+    const claims = [];
+    const hydrateIsland = (container, tmpl, renderId) =>
+      r.hydrate(
+        () => {
+          const _el$ = r.getNextElement(tmpl);
+          claims.push(_el$);
+          r.insert(container, _el$, undefined, [...container.childNodes]);
+        },
+        container,
+        { renderId }
+      );
+
+    hydrateIsland(islandA, _tmpl$A, "i0");
+    hydrateIsland(islandB, _tmpl$B, "i1");
+    expect(claims.length).toBe(0);
+
+    resolveLoad({ default: () => "Island" });
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    expect(claims).toEqual([serverA, serverB]);
+    expect(sharedConfig.hydrating).toBe(false);
+    islandA.remove();
+    islandB.remove();
+  });
+
+  it("a root without its own scoped map skips the deferred path", () => {
+    globalThis._$HY = {
+      events: [],
+      completed: new WeakSet(),
+      // Some OTHER render's root map — not this root's renderId.
+      r: { i9_assets: { i90: "/assets/Other-xyz.js" } },
+      modules: {},
+      loading: {},
+      done: false,
+      fe() {}
+    };
+
+    const island = document.createElement("div");
+    island.innerHTML = '<div _hk="i00">Solo</div>';
+    document.body.appendChild(island);
+    const server = island.firstChild;
+    const _tmpl$ = r.template("<div>Solo</div>");
+
+    let claimed;
+    r.hydrate(
+      () => {
+        claimed = r.getNextElement(_tmpl$);
+        r.insert(island, claimed, undefined, [...island.childNodes]);
+      },
+      island,
+      { renderId: "i0" }
+    );
+
+    // Synchronous hydration — a foreign root's module map must not park
+    // this root behind someone else's preload.
+    expect(claimed).toBe(server);
+    island.remove();
   });
 });
 
