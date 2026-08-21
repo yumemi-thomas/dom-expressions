@@ -452,63 +452,64 @@ impl<'a> VisitMut<'a> for Remover<'_, 'a> {
     fn visit_statements(&mut self, statements: &mut oxc_allocator::Vec<'a, Statement<'a>>) {
         let mut index = 0;
         while index < statements.len() {
-            let keep = match &mut statements[index] {
-                Statement::FunctionDeclaration(function) => {
-                    if self.spans.contains(&function.span()) {
-                        self.collector()
-                            .visit_function(function, oxc_syntax::scope::ScopeFlags::Function);
-                        false
-                    } else {
-                        true
-                    }
-                }
-                Statement::ClassDeclaration(class) => {
-                    if self.spans.contains(&class.span()) {
-                        self.collector().visit_class(class);
-                        false
-                    } else {
-                        true
-                    }
-                }
-                // Babel's `VariableDeclaration` visitor drops emptied
-                // declarations; an emptied labeled declaration goes with its
-                // labels (removal hook).
-                statement @ (Statement::VariableDeclaration(_)
-                | Statement::LabeledStatement(_)) => !self.statement_fully_removed(statement),
-                Statement::ImportDeclaration(import) => {
-                    let declaration_is_type = import.import_kind.is_type();
-                    if let Some(specifiers) = &mut import.specifiers {
-                        let had = specifiers.len();
-                        specifiers.retain(|specifier| !self.spans.contains(&specifier.span()));
-                        let pruned = specifiers.len() != had;
-                        if pruned {
-                            self.changed = true;
+            let keep =
+                match &mut statements[index] {
+                    Statement::FunctionDeclaration(function) => {
+                        if self.spans.contains(&function.span()) {
+                            self.collector()
+                                .visit_function(function, oxc_syntax::scope::ScopeFlags::Function);
+                            false
+                        } else {
+                            true
                         }
-                        // A pruned import whose surviving specifiers are all
-                        // type-only imports no runtime binding, but the
-                        // declaration would still emit — and a bare module
-                        // edge to a server module is exactly the leak this
-                        // shake guards against. The Babel implementation
-                        // counts VALUE specifiers when deciding whole-
-                        // declaration removal (solid-start #2273); mirror
-                        // it: the declaration goes with its last value
-                        // specifier. Imports the shake never touched stay
-                        // untouched.
-                        let type_only = declaration_is_type
-                            || specifiers.iter().all(|specifier| {
-                                matches!(
-                                    specifier,
-                                    oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(s)
-                                        if s.import_kind.is_type()
-                                )
-                            });
-                        !(had > 0 && (specifiers.is_empty() || (pruned && type_only)))
-                    } else {
-                        true
                     }
-                }
-                _ => true,
-            };
+                    Statement::ClassDeclaration(class) => {
+                        if self.spans.contains(&class.span()) {
+                            self.collector().visit_class(class);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    // Babel's `VariableDeclaration` visitor drops emptied
+                    // declarations; an emptied labeled declaration goes with its
+                    // labels (removal hook).
+                    statement @ (Statement::VariableDeclaration(_)
+                    | Statement::LabeledStatement(_)) => !self.statement_fully_removed(statement),
+                    Statement::ImportDeclaration(import) => {
+                        let declaration_is_type = import.import_kind.is_type();
+                        if let Some(specifiers) = &mut import.specifiers {
+                            let had = specifiers.len();
+                            specifiers.retain(|specifier| !self.spans.contains(&specifier.span()));
+                            let pruned = specifiers.len() != had;
+                            if pruned {
+                                self.changed = true;
+                            }
+                            // A pruned import whose surviving specifiers are all
+                            // type-only imports no runtime binding, but the
+                            // declaration would still emit — and a bare module
+                            // edge to a server module is exactly the leak this
+                            // shake guards against. The Babel implementation
+                            // counts VALUE specifiers when deciding whole-
+                            // declaration removal (solid-start #2273); mirror
+                            // it: the declaration goes with its last value
+                            // specifier. Imports the shake never touched stay
+                            // untouched.
+                            let type_only = declaration_is_type
+                                || specifiers.iter().all(|specifier| {
+                                    matches!(
+                                        specifier,
+                                        oxc_ast::ast::ImportDeclarationSpecifier::ImportSpecifier(s)
+                                            if s.import_kind.is_type()
+                                    )
+                                });
+                            !(had > 0 && (specifiers.is_empty() || (pruned && type_only)))
+                        } else {
+                            true
+                        }
+                    }
+                    _ => true,
+                };
             if keep {
                 index += 1;
             } else {
