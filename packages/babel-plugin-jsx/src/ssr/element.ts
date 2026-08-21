@@ -323,6 +323,11 @@ function escapeExpression(
         | babelTypes.BlockStatement;
     return expression;
   } else if (t.isTemplateLiteral(expression)) {
+    // Interpolations are escaped recursively. The static quasis are not —
+    // `url("${x}")` would otherwise leave a raw `"` inside style="..." /
+    // attr="...". Escape those parts at compile time when this expression
+    // is landing in an attribute.
+    if (attr) escapeTemplateQuasis(expression, true);
     expression.expressions = expression.expressions.map(
       e =>
         escapeExpression(
@@ -412,6 +417,18 @@ function escapeExpression(
     registerImportMethod(path, "escape"),
     [expression as babelTypes.Expression].concat(attr ? [t.booleanLiteral(true)] : [])
   );
+}
+
+function escapeTemplateQuasis(expression: babelTypes.TemplateLiteral, attr: boolean) {
+  for (const quasi of expression.quasis) {
+    const src = quasi.value.cooked != null ? quasi.value.cooked : quasi.value.raw;
+    const escaped = escapeHTML(src, attr);
+    if (typeof escaped !== "string" || escaped === src) continue;
+    quasi.value.cooked = escaped;
+    // Codegen prints `raw`. Re-escape template delimiters so `&quot;` etc.
+    // stay literal text.
+    quasi.value.raw = escaped.replace(/\\/g, "\\\\").replace(/`/g, "\\`").replace(/\$\{/g, "\\${");
+  }
 }
 
 // Predicts whether a JSXFragment AST will compile to a single runtime
@@ -569,6 +586,18 @@ function transformAttributes(
           (
             value as babelTypes.JSXExpressionContainer & { _groupableTextContent?: boolean }
           )._groupableTextContent = true;
+        // innerHTML/textContent/innerText redirects travel the child pipeline,
+        // but their values are opaque content (an HTML/text string), never
+        // id-allocating JSX — and the client applies them as plain prop
+        // effects with no owner. Flag them so transformChildren skips the
+        // _$scope wrap a call-shaped value would otherwise get: the scope
+        // reserves a hydration child id the client never allocates, shifting
+        // every keyed sibling after it (#3015). The `children` attribute stays
+        // eligible — it is a real insert on the client and scopes there too.
+        if (key !== "children")
+          (
+            value as babelTypes.JSXExpressionContainer & { _childProperty?: boolean }
+          )._childProperty = true;
         children = value;
       } else {
         const isDynamicValue = isDynamic(attribute.get("value").get("expression"), {
@@ -787,7 +816,10 @@ function transformChildren(
         `Fragments can only be used top level in JSX. Not used under a <${tagName}>.`
       );
     }
-    const allocatesIds = hydratable && canChildSlotAllocateIds(node);
+    const allocatesIds =
+      hydratable &&
+      !(node.node as babelTypes.Node & { _childProperty?: boolean })._childProperty &&
+      canChildSlotAllocateIds(node);
     const child = transformNode(node, { doNotEscape, parentResults: results });
     if (!child) return;
     appendToTemplate(results.template, child.template as string | string[]);

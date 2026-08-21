@@ -16,7 +16,7 @@ mod shared;
 mod ssr;
 mod universal;
 
-pub use compiler::{compile, CompileOptions, CompileOutput, Generate, Renderer, Wrapper};
+pub use compiler::{CompileOptions, CompileOutput, Generate, Renderer, Wrapper, compile};
 pub use error::{CompileError, CompileErrorKind};
 pub use semantic_trace::{
     CallbackDecision, ExecutionSite, ExecutionSiteKind, OwnershipDecision, OwnershipSite,

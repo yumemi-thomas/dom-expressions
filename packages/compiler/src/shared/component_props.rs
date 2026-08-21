@@ -1,11 +1,9 @@
 use oxc_allocator::{Allocator, CloneIn};
-use oxc_ast::{
-    ast::{Expression, ObjectPropertyKind},
-    AstBuilder,
-};
+use oxc_ast::ast::{Expression, ObjectPropertyKind};
 use oxc_span::Span;
 
 use crate::dom::element::AstDomTransform;
+use crate::shared::ast_builder::AstBuilder;
 
 pub(crate) trait ComponentPropContext<'a>:
     crate::shared::condition::ConditionBuilder<'a>

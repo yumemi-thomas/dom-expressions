@@ -17,7 +17,9 @@ import {
   BodyFormat,
   ERROR_HEADER,
   FILE_FORM_KEY,
+  LIVE_SOURCE,
   SINGLE_FLIGHT_HEADER,
+  createChunk,
   decodeErrorHeaderValue,
   decodeResponse,
   decodeResponsePayload,
@@ -27,6 +29,7 @@ import {
   extractBody,
   getHeadersAndBody,
   getServerFunctionMetadata,
+  isJSONSafe,
   isServerFunction,
   serializeStream,
   serializeString,
@@ -36,7 +39,9 @@ import {
 import {
   GET as clientGET,
   createServerReference as createClientReference,
-  configureServerFunctionsClient
+  configureServerFunctionsClient,
+  live as clientLive,
+  observeServerFunctionCalls
 } from "../../src/server-functions/client";
 import {
   GET as serverGET,
@@ -50,9 +55,12 @@ import {
   getServerFunction,
   getServerFunctionInvocation,
   handleServerFunctionRequest,
+  live as serverLive,
+  observeServerFunctionCalls as observeServerFunctionCallsOnServer,
   registerServerFunction,
   registerServerReference,
   sanitizeServerError,
+  serializeResponseStream,
   setServerFunctionsDev
 } from "../../src/server-functions/server";
 import { FLASH_COOKIE, clearFlashCookie, hasFlashCookie } from "../../src/server-functions/shared";
@@ -80,6 +88,7 @@ class FakeStorage {
 
 beforeEach(() => {
   globalThis[RequestContext] = new FakeStorage();
+  configureServerFunctionsServer({ csrf: false });
 });
 
 afterEach(() => {
@@ -302,27 +311,28 @@ describe("response format negotiation", () => {
   });
 
   it("deep JSON-safe nesting stays on the JSON fast path (stringify handles it)", async () => {
-    // ~8k levels overflowed the old recursive guard even though
-    // JSON.stringify carries it fine — and the codec CANNOT take it (its
-    // depth limit protects the decoding peer), so the guard itself must
-    // survive and answer true.
-    registerServerFunction("fmt-deep-0", async () => {
-      const root = {};
-      let cursor = root;
-      for (let i = 0; i < 8000; i++) cursor = cursor.next = {};
-      cursor.leaf = true;
-      return root;
-    });
+    // Deep enough to sit above the codec's decode cap (64) — so a wrong
+    // "not safe" answer would fail to round-trip — and shallow enough that
+    // Node 24's JSON.stringify still delivers. The old 8000 figure was
+    // measured on Node 26; Node 24 (CI) cliffs around 5900, and the
+    // guard's ceiling is 4096 so it refuses before stringify throws.
+    const levels = 2048;
+    const root = {};
+    let cursor = root;
+    for (let i = 0; i < levels; i++) cursor = cursor.next = {};
+    cursor.leaf = true;
+    expect(isJSONSafe(root)).toBe(true);
+    registerServerFunction("fmt-deep-0", async () => root);
     const response = await dispatch(scriptedRequest("fmt-deep-0"));
     expect(response.headers.get(ERROR_HEADER)).toBeNull();
     expect(response.headers.get(BODY_FORMAT_HEADER)).toBe(BodyFormat.Json);
     let depth = 0;
-    let cursor = JSON.parse(await response.text());
+    cursor = JSON.parse(await response.text());
     while (cursor.next) {
       cursor = cursor.next;
       depth++;
     }
-    expect(depth).toBe(8000);
+    expect(depth).toBe(levels);
     expect(cursor.leaf).toBe(true);
   });
 
@@ -688,6 +698,55 @@ describe("handler", () => {
       new Request("http://localhost/_server?id=nope", { method: "POST" })
     );
     expect(unknown.status).toBe(404);
+  });
+
+  it("rejects bare 5xx client responses", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () => new Response(null, { status: 500 });
+    try {
+      await expect(createClientReference("bare-500")()).rejects.toThrow(
+        "Server function call failed with status 500"
+      );
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("rejects bodyless protocol errors with a useful fallback", async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async () =>
+      new Response(null, { status: 403, headers: { [ERROR_HEADER]: "true" } });
+    try {
+      await expect(createClientReference("bodyless-error")()).rejects.toThrow(
+        "Server function call failed with status 403"
+      );
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it("rejects bare 5xx single-flight responses after delivering their data", async () => {
+    const original = globalThis.fetch;
+    const consume = jest.fn();
+    const unsubscribe = subscribeFlightData(consume);
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ data: { refreshed: true } }), {
+        status: 502,
+        headers: {
+          "Content-Type": "application/json",
+          [BODY_FORMAT_HEADER]: BodyFormat.Json,
+          [SINGLE_FLIGHT_HEADER]: "true"
+        }
+      });
+    try {
+      await expect(createClientReference("single-flight-502")()).rejects.toThrow(
+        "Server function call failed with status 502"
+      );
+      expect(consume).toHaveBeenCalledWith({ refreshed: true }, { response: expect.any(Response) });
+    } finally {
+      unsubscribe();
+      globalThis.fetch = original;
+    }
   });
 
   it("roundtrips a full client call", async () => {
@@ -1367,6 +1426,141 @@ describe("handler", () => {
     );
     expect(response.status).toBe(302);
     expect(response.headers.get("Location")).toBe("/?flash=value");
+  });
+});
+
+describe("CSRF protection", () => {
+  function handle(request, options = {}) {
+    return handleServerFunctionRequest(request, { csrf: true, ...options });
+  }
+
+  function request(id, headers) {
+    return new Request("http://localhost/_server", {
+      method: "POST",
+      headers: {
+        "X-Server-Function-Id": id,
+        "X-Server-Function-Instance": "server-function:test",
+        ...headers
+      }
+    });
+  }
+
+  it.each([
+    ["fetch metadata", { "Sec-Fetch-Site": "same-origin" }],
+    ["Origin", { Origin: "http://localhost" }],
+    ["Referer", { Referer: "http://localhost/page" }]
+  ])("allows requests proven same-origin by %s", async (_, headers) => {
+    registerServerFunction("csrf-same-origin", async () => "ok");
+    const response = await handle(request("csrf-same-origin", headers));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Vary")).toBe("Sec-Fetch-Site, Origin, Referer");
+    expect(await decodeResponse(response)).toBe("ok");
+  });
+
+  it.each(["same-site", "cross-site", "none"])(
+    "rejects %s fetch metadata before invoking the function",
+    async fetchSite => {
+      const fn = jest.fn(async () => "unsafe");
+      registerServerFunction(`csrf-fetch-${fetchSite}`, fn);
+      const response = await handle(
+        request(`csrf-fetch-${fetchSite}`, {
+          "Sec-Fetch-Site": fetchSite,
+          Origin: "http://localhost",
+          Referer: "http://localhost/page"
+        })
+      );
+      expect(response.status).toBe(403);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(response.headers.get("Vary")).toBe("Sec-Fetch-Site, Origin, Referer");
+      expect(fn).not.toHaveBeenCalled();
+    }
+  );
+
+  it("falls back to Origin for unknown fetch metadata", async () => {
+    const fn = jest.fn(async () => "ok");
+    registerServerFunction("csrf-fetch-unknown", fn);
+    const response = await handle(
+      request("csrf-fetch-unknown", {
+        "Sec-Fetch-Site": "future-value",
+        Origin: "http://localhost"
+      })
+    );
+    expect(response.status).toBe(200);
+
+    fn.mockClear();
+    const denied = await handle(
+      request("csrf-fetch-unknown", { "Sec-Fetch-Site": "future-value" })
+    );
+    expect(denied.status).toBe(403);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a mismatched Origin without falling back to Referer", async () => {
+    const fn = jest.fn(async () => "unsafe");
+    registerServerFunction("csrf-origin", fn);
+    const response = await handle(
+      request("csrf-origin", {
+        Origin: "https://attacker.example",
+        Referer: "http://localhost/page"
+      })
+    );
+    expect(response.status).toBe(403);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("rejects requests without origin metadata by default", async () => {
+    const fn = jest.fn(async () => "unsafe");
+    registerServerFunction("csrf-missing", fn);
+    const response = await handle(request("csrf-missing"));
+    expect(response.status).toBe(403);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it("supports a configured public origin", async () => {
+    registerServerFunction("csrf-public-origin", async () => "ok");
+    const response = await handle(
+      request("csrf-public-origin", { Origin: "https://app.example.com" }),
+      { csrf: { origin: "https://app.example.com" } }
+    );
+    expect(response.status).toBe(200);
+  });
+
+  it("can allow requests without origin metadata explicitly", async () => {
+    registerServerFunction("csrf-missing-opt-in", async () => "ok");
+    const response = await handle(request("csrf-missing-opt-in"), {
+      csrf: { allowRequestsWithoutOriginCheck: true }
+    });
+    expect(response.status).toBe(200);
+  });
+
+  it("can be disabled explicitly", async () => {
+    registerServerFunction("csrf-disabled", async () => "ok");
+    const response = await handle(request("csrf-disabled"), { csrf: false });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Vary")).toBe(null);
+  });
+
+  it("preserves existing Vary values", async () => {
+    registerServerFunction(
+      "csrf-vary",
+      async () =>
+        new Response("ok", {
+          headers: { "X-Content-Raw": "true", Vary: "Accept-Encoding" }
+        })
+    );
+    const response = await handle(request("csrf-vary", { "Sec-Fetch-Site": "same-origin" }));
+    expect(response.headers.get("Vary")).toBe("Accept-Encoding, Sec-Fetch-Site, Origin, Referer");
+  });
+
+  it("supports server-wide configuration", async () => {
+    registerServerFunction("csrf-configured", async () => "ok");
+    configureServerFunctionsServer({ csrf: true });
+    try {
+      const response = await handleServerFunctionRequest(request("csrf-configured"));
+      expect(response.status).toBe(403);
+    } finally {
+      configureServerFunctionsServer({ csrf: false });
+    }
   });
 });
 
@@ -2324,6 +2518,115 @@ describe("prepareRequest", () => {
   });
 });
 
+describe("server function call observers", () => {
+  function connectTransport() {
+    const original = globalThis.fetch;
+    globalThis.fetch = (input, init) => {
+      const request =
+        input instanceof Request ? input : new Request(new URL(input, "http://localhost"), init);
+      return handleServerFunctionRequest(request);
+    };
+    return () => {
+      globalThis.fetch = original;
+    };
+  }
+
+  it("observes requests and responses without claiming the transport", async () => {
+    registerServerFunction("observe-0", async (a, b) => ({ total: a + b }));
+    const calls = [];
+    const stop = observeServerFunctionCalls(call => calls.push(call));
+    const restore = connectTransport();
+    try {
+      const result = await createClientReference("observe-0", "add")(2, 3);
+      expect(result).toEqual({ total: 5 });
+      expect(calls).toHaveLength(2);
+      expect(calls[0]).toMatchObject({
+        type: "request",
+        id: "observe-0",
+        instance: expect.any(String),
+        meta: { name: "add" },
+        time: expect.any(Number)
+      });
+      expect(calls[1]).toMatchObject({
+        type: "response",
+        id: "observe-0",
+        instance: calls[0].instance,
+        meta: { name: "add" },
+        time: expect.any(Number)
+      });
+      await expect(calls[0].request.json()).resolves.toEqual([2, 3]);
+      await expect(calls[1].response.json()).resolves.toEqual({ total: 5 });
+    } finally {
+      stop();
+      restore();
+    }
+  });
+
+  it("isolates observers and supports unsubscribe", async () => {
+    registerServerFunction("observe-1", async () => "ok");
+    const error = new Error("observer failed");
+    const report = jest.spyOn(console, "error").mockImplementation(() => {});
+    const first = jest.fn(() => {
+      throw error;
+    });
+    const second = jest.fn();
+    const stopFirst = observeServerFunctionCalls(first);
+    const stopSecond = observeServerFunctionCalls(second);
+    const restore = connectTransport();
+    try {
+      await expect(createClientReference("observe-1")()).resolves.toBe("ok");
+      expect(first).toHaveBeenCalledTimes(2);
+      expect(second).toHaveBeenCalledTimes(2);
+      expect(report).toHaveBeenCalledWith(error);
+
+      stopFirst();
+      stopSecond();
+      first.mockClear();
+      second.mockClear();
+      await createClientReference("observe-1")();
+      expect(first).not.toHaveBeenCalled();
+      expect(second).not.toHaveBeenCalled();
+    } finally {
+      stopFirst();
+      stopSecond();
+      report.mockRestore();
+      restore();
+    }
+  });
+
+  it("observes the final GET request URL", async () => {
+    serverGET(createServerReference(registerServerReference("observe-get-0", async id => id)));
+    const calls = [];
+    const stop = observeServerFunctionCalls(call => calls.push(call));
+    const restore = connectTransport();
+    try {
+      const result = await clientGET(createClientReference("observe-get-0"))(42);
+      expect(result).toBe(42);
+      const request = calls.find(call => call.type === "request").request;
+      expect(request.method).toBe("GET");
+      expect(request.url).toContain("id=observe-get-0");
+      expect(request.url).toContain("args=%5B42%5D");
+    } finally {
+      stop();
+      restore();
+    }
+  });
+
+  it("is a no-op on the server entry", async () => {
+    const observer = jest.fn();
+    const stop = observeServerFunctionCallsOnServer(observer);
+    registerServerFunction("observe-server-noop-0", async () => "ok");
+    const restore = connectTransport();
+    try {
+      await expect(createClientReference("observe-server-noop-0")()).resolves.toBe("ok");
+      expect(observer).not.toHaveBeenCalled();
+    } finally {
+      stop();
+      restore();
+    }
+  });
+});
+
 describe("argument encoding fast path", () => {
   const requests = [];
   function connectTransport(options) {
@@ -2425,6 +2728,488 @@ describe("argument encoding fast path", () => {
       await expect(callable(cyclic)).resolves.toBe(true);
       expect(requests[0].init.headers[BODY_FORMAT_HEADER]).toBe(BodyFormat.Serialized);
       expect(requests[0].init.body.startsWith(";0x")).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("async-iterable teardown and failure wiring", () => {
+  // A producer whose lifecycle is observable at the iterator protocol level:
+  // yields the given values, then parks the next pull on a promise that never
+  // settles — the shape of a stream whose producer is still working. Unlike
+  // an async generator (which can't honor return() while suspended mid-await),
+  // this surfaces teardown deterministically via onClose.
+  function hangingIterable(onClose, values = ["first"]) {
+    return {
+      [Symbol.asyncIterator]() {
+        let i = 0;
+        return {
+          next() {
+            if (i < values.length) return Promise.resolve({ done: false, value: values[i++] });
+            return new Promise(() => {});
+          },
+          return(value) {
+            onClose && onClose();
+            return Promise.resolve({ done: true, value });
+          }
+        };
+      }
+    };
+  }
+
+  // Collects `count` frames off a live codec stream, then cancels the source.
+  // Frames are 1:1 with codec emissions (root node first, then one per
+  // settled async value), so this gives deterministic "the wire carried this
+  // much before dying" prefixes for the drop tests.
+  async function takeFrames(stream, count) {
+    const reader = stream.getReader();
+    const frames = [];
+    for (let i = 0; i < count; i++) frames.push((await reader.read()).value);
+    void reader.cancel();
+    return frames;
+  }
+
+  function bodyFrom(frames, terminal) {
+    return new ReadableStream({
+      // paced delivery: erroring a stream DISCARDS its queued chunks, so
+      // frames must clear the consumer's pump before the terminal action —
+      // a macrotask gap per frame makes "arrived, then the wire died"
+      // deterministic instead of a race against internal pull timing
+      async start(controller) {
+        for (const frame of frames) {
+          controller.enqueue(frame);
+          await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        terminal(controller);
+      }
+    });
+  }
+
+  it("plain-object iterables are not JSON-safe (the stream must ride the codec)", () => {
+    // stringify would ship `{}` and silently drop the stream
+    expect(isJSONSafe(hangingIterable(null))).toBe(false);
+    expect(isJSONSafe({ [Symbol.iterator]: function* () {} })).toBe(false);
+    expect(isJSONSafe({ plain: true })).toBe(true);
+  });
+
+  it("consumer cancelling the response stream closes the producer iterator", async () => {
+    let closed = false;
+    const stream = serializeResponseStream(hangingIterable(() => (closed = true)));
+    const reader = stream.getReader();
+    await reader.read(); // root frame — the codec holds the iterator now
+    expect(closed).toBe(false);
+    await reader.cancel();
+    expect(closed).toBe(true);
+  });
+
+  it("request signal abort closes the producer and terminates the stream", async () => {
+    let closed = false;
+    const controller = new AbortController();
+    const stream = serializeResponseStream(
+      hangingIterable(() => (closed = true)),
+      undefined,
+      controller.signal
+    );
+    const reader = stream.getReader();
+    await reader.read();
+    controller.abort();
+    expect(closed).toBe(true);
+    // the stream errors for anyone still reading — no hang
+    await expect(reader.read()).rejects.toThrow();
+  });
+
+  it("an already-aborted signal never opens the producer", async () => {
+    let opened = false;
+    const controller = new AbortController();
+    controller.abort();
+    const stream = serializeResponseStream(
+      {
+        [Symbol.asyncIterator]() {
+          opened = true;
+          return { next: () => new Promise(() => {}) };
+        }
+      },
+      undefined,
+      controller.signal
+    );
+    const reader = stream.getReader();
+    expect((await reader.read()).done).toBe(true);
+    expect(opened).toBe(false);
+  });
+
+  it("a dropped body rejects a pending top-level promise instead of hanging", async () => {
+    const frames = await takeFrames(
+      serializeStream({ ready: 1, pending: new Promise(() => {}) }),
+      1
+    );
+    const result = await deserializeStream(
+      new Response(bodyFrom(frames, c => c.error(new Error("connection lost"))))
+    );
+    expect(result.ready).toBe(1);
+    await expect(result.pending).rejects.toThrow("connection lost");
+  });
+
+  it("a dropped body rejects an open stream's next() instead of hanging", async () => {
+    // two frames: the root node, then the "first" value push
+    const frames = await takeFrames(serializeStream(hangingIterable(null, ["first"])), 2);
+    const result = await deserializeStream(
+      new Response(bodyFrom(frames, c => c.error(new Error("connection lost"))))
+    );
+    const it = result[Symbol.asyncIterator]();
+    await expect(it.next()).resolves.toEqual({ done: false, value: "first" });
+    await expect(it.next()).rejects.toThrow("connection lost");
+  });
+
+  it("truncation on a frame boundary still fails stranded values", async () => {
+    // the body CLOSES cleanly (indistinguishable from completion), but the
+    // promise never got its resolution chunk — it must not hang forever
+    const frames = await takeFrames(serializeStream({ pending: new Promise(() => {}) }), 1);
+    const result = await deserializeStream(new Response(bodyFrom(frames, c => c.close())));
+    await expect(result.pending).rejects.toThrow(/ended unexpectedly/);
+  });
+
+  it("a malformed frame mid-stream fails pending values", async () => {
+    const frames = await takeFrames(serializeStream({ pending: new Promise(() => {}) }), 1);
+    const result = await deserializeStream(
+      new Response(
+        bodyFrom(frames, c => {
+          c.enqueue(createChunk("not json"));
+          c.close();
+        })
+      )
+    );
+    await expect(result.pending).rejects.toThrow();
+  });
+
+  it("normal completion is unaffected by the failure sweep", async () => {
+    const result = await deserializeStream(
+      new Response(serializeStream({ eventual: Promise.resolve("later"), now: 2 }))
+    );
+    expect(result.now).toBe(2);
+    await expect(result.eventual).resolves.toBe("later");
+    // give the drain's end-of-stream sweep a beat: the settled promise must
+    // stay settled (rejecting a resolved promise is a no-op)
+    await new Promise(r => setTimeout(r, 0));
+    await expect(result.eventual).resolves.toBe("later");
+  });
+
+  it("iterator.return() on a streamed result aborts the call and tears down the producer", async () => {
+    let serverClosed = false;
+    registerServerReference("stream-teardown-0", async () =>
+      hangingIterable(() => (serverClosed = true), ["first"])
+    );
+    const callable = createClientReference("stream-teardown-0");
+    const original = globalThis.fetch;
+    // Request(url, init) adopts init.signal as request.signal, so this
+    // in-process transport carries the client abort to the server handler
+    // the same way a real fetch cancellation would.
+    globalThis.fetch = (url, init) =>
+      handleServerFunctionRequest(new Request(new URL(url, "http://localhost"), init), {
+        provideEvent: (event, run) => run()
+      });
+    try {
+      const result = await callable();
+      const it = result[Symbol.asyncIterator]();
+      await expect(it.next()).resolves.toEqual({ done: false, value: "first" });
+      expect(serverClosed).toBe(false);
+      await expect(it.return()).resolves.toEqual({ done: true, value: undefined });
+      // abort propagation is a listener hop; give it a beat
+      await new Promise(r => setTimeout(r, 10));
+      expect(serverClosed).toBe(true);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+describe("live declaration", () => {
+  // A signal-honoring in-process transport: Request(url, init) adopts
+  // init.signal as request.signal, so client aborts reach the server
+  // handler like a real fetch cancellation would.
+  function connectTransport(requests) {
+    const original = globalThis.fetch;
+    globalThis.fetch = (url, init) => {
+      requests && requests.push({ url: String(url), init });
+      return handleServerFunctionRequest(new Request(new URL(url, "http://localhost"), init), {
+        provideEvent: (event, run) => run()
+      });
+    };
+    return () => {
+      globalThis.fetch = original;
+    };
+  }
+
+  function hangingIterable(onClose, values = ["first"]) {
+    return {
+      [Symbol.asyncIterator]() {
+        let i = 0;
+        return {
+          next() {
+            if (i < values.length) return Promise.resolve({ done: false, value: values[i++] });
+            return new Promise(() => {});
+          },
+          return(value) {
+            onClose && onClose();
+            return Promise.resolve({ done: true, value });
+          }
+        };
+      }
+    };
+  }
+
+  it("server live() writes metadata and brands the in-process resolved iterable", async () => {
+    const callable = createServerReference(
+      registerServerReference("live-brand-0", async function* () {
+        yield 1;
+        yield 2;
+      })
+    );
+    const liveRef = serverLive(callable);
+    expect(getServerFunctionMetadata(liveRef).live).toBe(true);
+    expect(liveRef.id).toBe("live-brand-0");
+    expect(liveRef.url).toContain("live-brand-0");
+
+    const event = { request: new Request("http://localhost/"), locals: {} };
+    const result = await globalThis[RequestContext].run(event, () => liveRef());
+    expect(result[LIVE_SOURCE]).toBe(true);
+    // the brand is a marker, not a wrapper: the stream consumes as-is
+    const seen = [];
+    for await (const v of result) seen.push(v);
+    expect(seen).toEqual([1, 2]);
+  });
+
+  it("client live() streams values, completes with the source, and brands the iterable", async () => {
+    registerServerReference("live-basic-0", async function* () {
+      yield 1;
+      yield 2;
+    });
+    const liveFn = clientLive(createClientReference("live-basic-0"));
+    expect(getServerFunctionMetadata(liveFn).live).toBe(true);
+    const restore = connectTransport();
+    try {
+      const iterable = liveFn();
+      expect(iterable[LIVE_SOURCE]).toBe(true);
+      const seen = [];
+      for await (const v of iterable) seen.push(v);
+      expect(seen).toEqual([1, 2]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("reconnects with backoff when a connected stream dies", async () => {
+    let invocations = 0;
+    registerServerReference("live-reconnect-0", async function* () {
+      invocations++;
+      if (invocations === 1) {
+        yield "a";
+        throw new Error("mid-stream death");
+      }
+      yield "b";
+    });
+    const liveFn = clientLive(createClientReference("live-reconnect-0"));
+    const restore = connectTransport();
+    try {
+      const seen = [];
+      for await (const v of liveFn()) seen.push(v);
+      // the death was invisible to the consumer: values flowed across the
+      // reconnect and the SECOND (healthy) completion ended the iterable
+      expect(seen).toEqual(["a", "b"]);
+      expect(invocations).toBe(2);
+    } finally {
+      restore();
+    }
+  });
+
+  it("onstatus reports the wire facts the value stream erases", async () => {
+    let invocations = 0;
+    registerServerReference("live-status-0", async function* () {
+      invocations++;
+      if (invocations === 1) {
+        yield "a";
+        throw new Error("mid-stream death");
+      }
+      yield "b";
+    });
+    const liveFn = clientLive(createClientReference("live-status-0"));
+    const restore = connectTransport();
+    try {
+      const statuses = [];
+      const src = liveFn();
+      // assigned AFTER receiving the object — the loop reads it late
+      src.onstatus = (state, error) => statuses.push([state, error && error.message]);
+      const seen = [];
+      for await (const v of src) seen.push(v);
+      expect(seen).toEqual(["a", "b"]);
+      expect(statuses).toEqual([
+        ["connected", undefined],
+        ["reconnecting", "mid-stream death"],
+        ["connected", undefined],
+        ["closed", undefined]
+      ]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("onstatus: consumer break reports closed exactly once", async () => {
+    registerServerReference("live-status-break-0", async function* () {
+      yield "only";
+      await new Promise(() => {});
+    });
+    const liveFn = clientLive(createClientReference("live-status-break-0"));
+    const restore = connectTransport();
+    try {
+      const statuses = [];
+      const src = liveFn();
+      src.onstatus = state => statuses.push(state);
+      const it = src[Symbol.asyncIterator]();
+      expect((await it.next()).value).toBe("only");
+      await it.return();
+      // a second return (legal on iterators) must not double-report
+      await it.return();
+      expect(statuses).toEqual(["connected", "closed"]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("onstatus: first-connect failures emit nothing — the rejection is the channel", async () => {
+    registerServerReference("live-status-fail-0", async () => {
+      throw new Error("no such thing");
+    });
+    const liveFn = clientLive(createClientReference("live-status-fail-0"));
+    const restore = connectTransport();
+    try {
+      const statuses = [];
+      const src = liveFn();
+      src.onstatus = state => statuses.push(state);
+      const it = src[Symbol.asyncIterator]();
+      // (message unasserted: production sanitization rewrites it)
+      await expect(it.next()).rejects.toThrow();
+      expect(statuses).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
+  it("connectivity returning wakes the backoff sleep early", async () => {
+    let invocations = 0;
+    registerServerReference("live-online-0", async function* () {
+      invocations++;
+      if (invocations === 1) {
+        yield "a";
+        throw new Error("death");
+      }
+      yield "b";
+    });
+    const listeners = new Set();
+    const origAdd = globalThis.addEventListener;
+    const origRemove = globalThis.removeEventListener;
+    globalThis.addEventListener = (type, fn) => {
+      if (type === "online") listeners.add(fn);
+    };
+    globalThis.removeEventListener = (type, fn) => {
+      listeners.delete(fn);
+    };
+    const liveFn = clientLive(createClientReference("live-online-0"));
+    const restore = connectTransport();
+    try {
+      const started = Date.now();
+      const firing = (async () => {
+        // the sleep registers its wake as an online listener — fire it as
+        // soon as it appears, well before the 500ms first-retry timer
+        while (!listeners.size) await new Promise(r => setTimeout(r, 5));
+        for (const fn of [...listeners]) fn();
+      })();
+      const seen = [];
+      for await (const v of liveFn()) seen.push(v);
+      await firing;
+      expect(seen).toEqual(["a", "b"]);
+      expect(Date.now() - started).toBeLessThan(400);
+      // the wake was removed after use — no listener left behind
+      expect(listeners.size).toBe(0);
+    } finally {
+      globalThis.addEventListener = origAdd;
+      globalThis.removeEventListener = origRemove;
+      restore();
+    }
+  });
+
+  it("first-connect failures reject like a normal call", async () => {
+    registerServerReference("live-fail-0", async () => {
+      throw new Error("nope");
+    });
+    const liveFn = clientLive(createClientReference("live-fail-0"));
+    const restore = connectTransport();
+    try {
+      const it = liveFn()[Symbol.asyncIterator]();
+      await expect(it.next()).rejects.toThrow();
+    } finally {
+      restore();
+    }
+  });
+
+  it("break ends the in-flight call and tears down the producer", async () => {
+    let serverClosed = false;
+    registerServerReference("live-teardown-0", async () =>
+      hangingIterable(() => (serverClosed = true), ["first"])
+    );
+    const liveFn = clientLive(createClientReference("live-teardown-0"));
+    const restore = connectTransport();
+    try {
+      for await (const v of liveFn()) {
+        expect(v).toBe("first");
+        break;
+      }
+      await new Promise(r => setTimeout(r, 10));
+      expect(serverClosed).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("live calls are reads: no single-flight enveloping with a consumer registered", async () => {
+    registerServerReference("live-read-0", async function* () {
+      yield "v";
+    });
+    const liveFn = clientLive(createClientReference("live-read-0"));
+    const requests = [];
+    const restore = connectTransport(requests);
+    const unsubscribe = subscribeFlightData(() => {});
+    try {
+      const seen = [];
+      for await (const v of liveFn()) seen.push(v);
+      expect(seen).toEqual(["v"]);
+      expect(requests).toHaveLength(1);
+      expect(requests[0].init.headers[SINGLE_FLIGHT_HEADER]).toBeUndefined();
+    } finally {
+      unsubscribe();
+      restore();
+    }
+  });
+
+  it("composes with GET: live(GET(fn)) rides the GET transport", async () => {
+    serverGET(
+      createServerReference(
+        registerServerReference("live-get-0", async function* (n) {
+          yield n * 2;
+        })
+      )
+    );
+    const liveFn = clientLive(clientGET(createClientReference("live-get-0")));
+    expect(getServerFunctionMetadata(liveFn)).toEqual(
+      expect.objectContaining({ method: "GET", live: true })
+    );
+    const requests = [];
+    const restore = connectTransport(requests);
+    try {
+      const seen = [];
+      for await (const v of liveFn(21)) seen.push(v);
+      expect(seen).toEqual([42]);
+      expect(requests[0].init.method).toBe("GET");
+      expect(requests[0].url).toContain("args=");
     } finally {
       restore();
     }

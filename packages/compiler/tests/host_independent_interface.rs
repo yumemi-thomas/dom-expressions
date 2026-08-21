@@ -2,8 +2,8 @@
 #![cfg(not(feature = "node"))]
 
 use dom_expressions_compiler::{
-    compile, CompileErrorKind, CompileOptions, ExecutionSiteKind, Generate, TerminalDecision,
-    ValueDecision,
+    CompileErrorKind, CompileOptions, ExecutionSiteKind, Generate, TerminalDecision, ValueDecision,
+    compile,
 };
 
 #[test]
@@ -112,10 +112,12 @@ fn public_core_rejects_an_empty_module_name() {
         },
     );
 
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("non-empty module name"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty module name")
+    );
 }
 
 #[test]
@@ -264,12 +266,15 @@ fn semantic_tracing_does_not_change_code_or_source_maps() {
         .expect("compile no-inline style with a source map")
     };
 
+    // Oxc 0.144 lazily initializes source-map state on the first codegen in
+    // the process. Compare the two modes after that common one-time path.
+    let _warmup = compile_with_trace(false);
     let ordinary = compile_with_trace(false);
     let traced = compile_with_trace(true);
     assert_eq!(
         ordinary.source_map.as_deref(),
         Some(
-            r#"{"version":3,"names":["style={{ color: signal() }}","<div style={{ color: signal() }} />"],"sources":["input.jsx"],"sourcesContent":["const view = <div style={{ color: signal() }} />;"],"mappings":";;;;AAAa,mBAAmC;AAA9BA;QAAO,EAAE,OAAO,QAAQ,EAAE;IAA1B;wBAA2B;;AAA7C,MAAM,OAAOC"}"#,
+            r#"{"version":3,"names":["style={{ color: signal() }}","<div style={{ color: signal() }} />"],"sources":["input.jsx"],"sourcesContent":["const view = <div style={{ color: signal() }} />;"],"mappings":";;;;AAAa,kBAAkC;AAA7BA;QAAO,EAAE,OAAO,OAAO,EAAE;AAAC,IAA1B;uBAA0B;;AAA5C,MAAM,OAAOC"}"#,
         )
     );
     assert_eq!(traced.code, ordinary.code);
@@ -287,6 +292,53 @@ fn static_string_attributes_are_not_execution_sites() {
         let trace = traced(source, inline_styles);
         assert!(trace.sites.is_empty(), "unexpected site for {source}");
     }
+}
+
+#[test]
+fn native_element_keys_are_elided_with_and_without_spreads() {
+    for (source, needle) in [
+        ("const view = <div $key={identity()} />;", "identity()"),
+        (
+            "const view = <div {...props} $key={spreadIdentity()} />;",
+            "spreadIdentity()",
+        ),
+    ] {
+        let output = compile(
+            source,
+            &CompileOptions {
+                semantic_trace: true,
+                ..CompileOptions::default()
+            },
+        )
+        .expect("native $key should compile with a total trace");
+        assert!(!output.code.contains("$key"), "{}", output.code);
+        let trace = output.semantic_trace.expect("semantic trace");
+        assert!(trace.sites.iter().any(|site| {
+            site.kind == ExecutionSiteKind::NativeAttribute
+                && site.decision == TerminalDecision::Value(ValueDecision::Elided)
+                && &source[site.span.start as usize..site.span.end as usize] == needle
+        }));
+    }
+}
+
+#[test]
+fn component_keys_remain_component_properties() {
+    let source = "const view = <Row $key={identity()} />;";
+    let output = compile(
+        source,
+        &CompileOptions {
+            semantic_trace: true,
+            ..CompileOptions::default()
+        },
+    )
+    .expect("component $key should remain a property");
+    assert!(output.code.contains("$key"), "{}", output.code);
+    let trace = output.semantic_trace.expect("semantic trace");
+    assert!(trace.sites.iter().any(|site| {
+        site.kind == ExecutionSiteKind::ComponentProperty
+            && site.decision == TerminalDecision::Value(ValueDecision::CallerContext)
+            && &source[site.span.start as usize..site.span.end as usize] == "identity()"
+    }));
 }
 
 #[test]

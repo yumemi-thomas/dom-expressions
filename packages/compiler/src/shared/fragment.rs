@@ -9,7 +9,7 @@ use oxc_span::GetSpan;
 
 use crate::shared::array::expression_to_array_element;
 use crate::shared::ast::arrow_return_expression;
-use crate::shared::mode_lower::{dynamic_child_thunk, mode_ast, ModeLower};
+use crate::shared::mode_lower::{ModeLower, dynamic_child_thunk, mode_ast};
 use crate::shared::utils::{decode_html_entities, trim_jsx_text};
 
 pub(crate) fn lower_fragment<'a, C: ModeLower<'a>>(
@@ -25,7 +25,7 @@ pub(crate) fn lower_fragment<'a, C: ModeLower<'a>>(
             JSXChild::Text(text) => {
                 let value = decode_html_entities(&trim_jsx_text(&text.value));
                 if !value.is_empty() {
-                    values.push(ast.expression_string_literal(text.span, ast.atom(&value), None));
+                    values.push(ast.expression_string_literal(text.span, ast.str(&value), None));
                 }
             }
             JSXChild::ExpressionContainer(container) => {

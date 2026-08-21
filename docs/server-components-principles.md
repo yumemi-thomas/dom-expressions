@@ -776,7 +776,10 @@ re-render it (A1, A2). The blessed pattern: optimistic state lives in client slo
 (which can overlay, badge, strike-through, or hide server content); server content
 itself settles when the mutation's single-flight response morphs it. The transport
 guarantees the two compose: a slot's optimistic state survives the settling morph
-(A7), so the overlay never flickers.
+(A7), so the overlay never flickers. (Stage 7 refines, not repeals, this line:
+transaction-scoped predictions may temporarily perturb server-rendered DOM,
+re-asserted over every authoritative apply and evaporating at settlement — the
+invariant that only server records make output durable stands. See §9.2.)
 
 ### 5.8 Producer-side symmetry
 
@@ -984,28 +987,68 @@ retired as a pole and survives only as potential authoring sugar.
    into live read-only projections. See the case-3 build record in DR-2
    for what shipped and the scope lines (whole containers this round;
    parts and case 4 remain the designed extensions).
-6. **Stage 6 — Generalized claims: the micro-affordance rung.** Promoted
-   from unlisted (2026-08-07, out of the Datastar comparison). The
-   router's claim sweep — behavior attached by attribute over any
-   server-materialized subtree, re-firing when a morph touches the
-   element — opened to user-defined claims, plus a shipped set of
-   micro-affordances. Kills "the first affordance costs a full
-   component ceremony" without adopting attribute-expression strings.
-   Sequenced here because it rides the same morph-surviving substrate
-   Stage 3 builds. Design sketch expanded 2026-08-13 — see §9.1.
-7. **Stage 7 — Connection-shaped transport.** Promoted from parked: the
+6. **Stage 6 — Behavior across the border: ref props and event
+   props.** **Next build target (re-scoped 2026-08-18; supersedes
+   the 08-16 predictions design, whose surviving model moved to
+   Stage 7; the 08-13 claims sketch was folded in and then cut the
+   same day — claims stay internal, see §9.1).** Functions already
+   cross the slot border as render props; Stage 6 completes the
+   taxonomy: a slot-arg function in *ref position* on a server
+   element delivers the element to the client closure — typed
+   through the server component's props, claim-engine lifecycle
+   (fire on adoption, re-fire on morph re-materialization), owner
+   and cleanup from the passing scope — and *event position*
+   resolves through delegation at dispatch. The transform is behind
+   the server-components compiler option (non-SC apps compile
+   byte-for-byte as today); with it on, SSR cost is gated at
+   evaluation by the render context's frame flag. One grammar: a
+   prop, used in a JSX position — interactive elements are authored
+   as JSX (hole thunks interleave `innerHTML` content with real JSX
+   affordances), so no attribute-claim author surface exists. More
+   fundamental than optimism and lands first: no transaction
+   machinery, the claim engine already exists, and event wiring /
+   third-party mounts / observers justify it standalone. Retires
+   `$ref`/`frame.refs` as author surface. See §9.1.
+7. **Stage 7 — Predictions.** **Design settled 2026-08-18 after a
+   same-night four-shape search (§9.2's decision record): one
+   declarative verb.** `predict(anchor, patch)` — transaction-scoped
+   claims about server markup, anchored by elements in hand (Stage 6
+   event/ref props; no names, no frame handle). The patch vocabulary
+   is JSX attribute semantics (per-key baselines captured at apply,
+   re-asserted over authoritative applies via the claim sweep,
+   baseline-restored at settlement) plus four relational content
+   keys — `before`/`prepend`/`append`/`after` — whose JSX renders
+   under a transaction-scoped owner into foreign ranges the morph
+   flows around; removal is their entire undo. No snapshots
+   anywhere; `children` replacement is excluded by that rule.
+   Content-key nodes persist across morphs, so predicted content may
+   be interactive — the old display-only caveat is repealed.
+   Substrate shipped 2026-08-15: keyed element matching in the morph
+   (`$key` → `_key`). See §9.2.
+8. **Stage 8 — Connection-shaped transport.** Promoted from parked: the
    sink-lifetime separation means SSE/socket transports turn the same
    authored component non-terminating (generator-only-model.md §9,
    "transport-indifference"). Includes making the discipline
    enforceable, not just documented: the live graph is a re-derivable
    projection of durable state — reconnection is re-invocation, and dev
-   should surface violations.
+   should surface violations. Seed recorded 2026-08-17 (§9.3): no new
+   APIs on either side — a connection is a response that doesn't end;
+   resume is supersession with settled emission; the document face is
+   bounded by an opt-in window; mutations settle against a watermark.
+   The related data-API question (top-level async iterators from plain
+   `"use server"` calls) is scoped separately and comes first.
 
-Ordering note (2026-08-11): 6-before-7 above is substrate sequencing
-(claims ride Stage 3's morph-surviving substrate), not priority. The
-recorded priority lean is the reverse — new-API surface is
-bottom-of-bucket, so if the next stretch picks one up, Stage 7's
-transport work likely goes first.
+Ordering note (revised 2026-08-18): Stage 6 is the next target and
+now *precedes* optimism — it is dependency-shallow (a compiler round
+plus the existing claim engine; no solid-core or transaction changes)
+and carries standalone value (event wiring, third-party mounts, the
+chat demo's copy button). Stage 7 consumes Stage 6's anchors and its
+re-assertion rides the same sweep. Stage 8 is independent afterward; it
+must eventually add causal settlement (a mutation's transaction
+remains open until the separate connection has applied its
+authoritative frame version), but Stage 7 is first proved against
+today's simpler single-flight ordering, where the response morph
+lands before the action transaction settles.
 
 **Parked here (2026-08-11), state of the world for whoever resumes:**
 Stages 1–5 are built, merged to `next` in both repos, and released
@@ -1040,174 +1083,782 @@ back to full re-emission + morph whenever the prefix breaks (a code
 fence closing retroactively). Additive to the chunk protocol; adopt
 when measurement earns it.
 
-### 9.1 Stage 6 sketch — generalized claims and the affordance tier (2026-08-13)
+### 9.1 Stage 6 design — behavior across the border: ref props and event props (2026-08-18)
 
-Recorded from the design conversation before parking, so the shape
-survives the break. Nothing here is built.
+Collapsed out of two prior sections during the 2026-08-17/18 design
+pass (Dev's ref-prop sketch; the SSR-cost resolution that followed):
+the 2026-08-16 predictions design that previously lived here is
+superseded — its surviving model moved to §9.2 (Stage 7) — and the
+2026-08-13 generalized-claims sketch that lived in §9.2 was folded
+in as a "class direction" for a few hours before being cut the same
+day (the internal-claims section below records why; the sketch
+survives in git history). One grammar remains: a prop, used in a
+JSX position. Stage 6 also moved *ahead* of optimism in the roadmap:
+it is dependency-shallow (one compiler round plus the claim engine
+that already exists — no transaction machinery, no solid-core
+changes) and carries standalone value. Names remain provisional.
 
-**The problem, precisely.** In the current model the smallest unit of
-client behavior is a component fill: a copy button on a code block
-costs a slot prop on the server component, an authored client
-component, and wiring at every call site. Worse than ceremony, there is
-an expressiveness hole: a live markup hole cannot mint components as it
-grows (the owner-creation latch, by design), so content streaming
-through a hole — every code block in a chat reply — has *no path to
-client behavior at all* today.
+**The reframe that makes this one stage.** Functions already cross
+the slot border: a function-valued slot arg *called* during server
+render is a render prop — the call becomes a slot record, the client
+executes the real closure, and the output fills the marked range.
+The closure never ships; a coordinate does. Stage 6 completes that
+taxonomy with the two remaining use sites, riding the same
+occurrence/binding bookkeeping:
 
-**The substrate exists.** The element-claim seam in the client runtime
-(`registerElementClaim`, `claimElement`, `claimElementTree`,
-`CLAIM_SEAM`): compiled DOM output claims elements at creation;
-everything that materializes *serialized* server content — frame
-streams, adopted SSR ranges, morph grafts — sweeps the subtree through
-the same registry, re-firing when a morph touches an element. Dormant
-by design (a null check when no consumer is registered), idempotent,
-importless across bundled copies. Today it has one consumer (the
-router's link layer) and a hard-coded selector (`a[href],
-form[action]`). Stage 6 is that seam, opened.
+```text
+use site         server emits                    client resolves via
+────────         ────────────                    ───────────────────
+called           slot record (id + args)         a range it renders into
+ref position     claim marker on the element     claim engine (per-element scope)
+event position   claim marker on the element     delegation (dispatch-time lookup)
+```
 
-**Three moves:**
+One exposure story covers all three: what ships is never behavior,
+only an address where behavior resolves from the passing scope. But
+the two marker positions resolve through different machinery, and
+the split is a real tiering (2026-08-18): events are the cheap,
+common tier — no per-element lifecycle at all — while refs are the
+powerful tier that pays for one.
 
-1. *Open registration.* Consumer-declared claims keyed by an attribute
-   namespace (not arbitrary selectors — the sweep stays one
-   `querySelectorAll` over a fixed pattern). A server component writes
-   `<button data-copy>`; a registered claim owns that attribute and
-   attaches behavior when the element materializes, under the current
-   reactive owner for cleanup. Attribute values are declarative
-   arguments (`data-confirm="Delete this note?"`) — never code.
-2. *The lifecycle contract, stated.* Claims fire at creation, at
-   materialization of serialized content, and again when a morph
-   replaces the element; handlers are idempotent (element-keyed dedupe
-   per consumer). Identity-first morph does most state preservation for
-   free — matched elements are the same DOM nodes — so only
-   wholesale-replaced ranges re-claim fresh.
-3. *A shipped affordance tier* — prebuilt claims (each ~10 lines,
-   tree-shakeable entry) so the first affordance costs one attribute.
+**Ref props — the instance direction, typed.** The server component
+uses a function prop in ref position; the client passes a closure:
 
-**The authoring split.** `ref` is the client-side answer: an arbitrary
-closure attached in JSX. That form cannot cross the slot border (a
-closure does not serialize; inside a hole there is no owner to hold
-it). A claim attribute is the serializable *name* of behavior
-registered ahead of time on the client — behavior where all you have is
-markup. Same job, two transports, mirroring every other split in this
-design. (Solid 2.0 removed `use:` directives; there is no directive
-form to unify with — `ref` and claims are the complete pair.)
+```tsx
+// client
+<CodeBlock copyBtn={el => {
+  const onClick = () =>
+    navigator.clipboard.writeText(el.closest("pre")?.textContent ?? "");
+  el.addEventListener("click", onClick);
+  onCleanup(() => el.removeEventListener("click", onClick));
+}} />
 
-**Candidate tier** (filter: leans on semantics already in the markup,
-needs zero expressions, or one of our examples already hand-wrote it):
+// server
+function CodeBlock(props) {
+  return <pre>
+    <button ref={props.copyBtn} aria-label="Copy">⧉</button>
+    <code>{highlighted}</code>
+  </pre>;
+}
+```
 
-| Affordance | Goes on | Does |
-|---|---|---|
-| `data-toggle="#target"` | button | toggle class/`open` on target; menus, collapse |
-| `data-copy` | button | clipboard-write nearest `<pre>`/target text |
-| `data-confirm="msg"` | form, a | native `confirm()` gate before submit/navigate |
-| `data-indicator` | form, button | busy class + disabled while action/navigation in flight |
-| `data-autosubmit="300"` | input, select | debounced `requestSubmit()` of owning form |
-| `data-bind="param"` | input | two-way sync with a URL query param (router-aware) |
-| `data-scroll="bottom"` | container | follow appended/morphed content while reader at bottom |
-| `data-focus` | element | focus on materialize; preserve focus/caret across morphs |
+This **replaces `$ref` strings and `frame.refs` as author surface**
+(the 2026-08-16 addressing decision is superseded; the index
+machinery survives internally, below). Coordination moved from a
+stringly name resolved through a frame handle into the props
+contract: the component's signature *declares* the handle, TypeScript
+checks both ends, and there is no handle to acquire — the
+`ServerComponent<P>` generic widens from "every prop is a `Slot`" to
+"every prop is a `Slot` or a behavior function." Under the hood
+nothing is new: the server recognizes a cross-border function in ref
+position and emits a marker attribute (`_hk` family) whose value
+indexes the occurrence's existing binding table — occurrence-scoped
+by construction, so two instances of one component never bleed, and
+an element carrying several bindings packs one attribute. Lifecycle
+is the claim engine's, which is exactly the contract behavior wants:
+fires per element (several elements may take the same prop), on
+adoption and on morph re-materialization (new element identity → the
+old per-element scope disposes, the callback re-runs, listeners
+re-attach), NOT re-fired when an attribute patch lands on a
+surviving element. The owner is the client component that passed the
+prop, so `onCleanup` works and context resolves.
 
-Four of these were already paid for by hand: the chat transcript's
-`ResizeObserver` pinning (`data-scroll`), the notes save/delete flows
-(`data-indicator`, `data-confirm`), the notes search field
-(`data-bind` + `data-autosubmit` — currently a client component whose
-whole job is "input writes a query param, debounced"). The composition
-is the pitch: `data-bind` plus a server component keyed by that param
-is live search with zero client components.
+Two contract lines that fall out (2026-08-18). *Function form only*:
+client Solid's assignment refs (`ref={myEl}`, `ref={els[i]}`)
+compile to assignments and cannot cross the border — the
+`ServerComponent` type says `(el: T) => void`, not `Ref<T>`. And
+*no array refs*: the array idiom exists client-side because refs
+fire once with no departure hook, but an ordered array is precisely
+what morphs make a lie (after a reorder, insertion order no longer
+matches document order — the misattribution `_key` just fixed,
+reborn in userland). The claim lifecycle is richer — per-element
+fire with cleanup — so N-element uses are per-element bodies, and a
+genuine collection is a Set maintained by the same pattern
+(`add` in the callback, `delete` in `onCleanup`). Nothing special
+ships; the pattern is documentation, a helper only if it earns
+itself later.
 
-**Positioning.** The tier is htmx's affordance lineage
-(request-lifecycle dressing: confirm/indicator/trigger), not
-Datastar's (a client reactive system in attributes —
-`data-signals`/`data-show`/`data-on` with expressions). We refuse the
-Datastar layer not because it is bad but because Solid already has a
-strictly better version: signals and JSX, typed, compiled, DCE'd.
-What we take from Datastar is architectural — morph-surviving
-attachment as a first-class contract, which htmx historically bolts
-on. One line: htmx's affordance tier, on Datastar's morph-survival
-discipline, under Solid's rule that expressions live in JSX. The
-escape hatch up from the tier is a component, never an attribute
-expression.
+What refs buy beyond Stage 7's anchors — with event wiring now the
+delegation tier's job, refs keep the element-in-hand-at-
+materialization set: third-party mounts (chart/editor/map
+libraries that want a DOM node, which server markup could never host
+before); observers and measurement (`IntersectionObserver`,
+`ResizeObserver`, focus management, scroll anchoring); persistent
+client islands — client content living inside server markup mounts
+through a real mount site fed by the ref prop (a `Portal` whose
+`mount` is a ref-delivered signal, re-targeting when the claim
+re-fires), NOT by hand-rolling `insert` inside the callback: a claim
+callback is behavior attachment, not a mount, and it re-fires
+(corrected 2026-08-18 — transaction-scoped optimistic content has
+its own, lighter path: §9.2's content keys). At the limit a
+client component is **pure behavior**: no markup of its own, a bag
+of functions handed to a server component — the server owns
+structure, the client owns interaction. That is the resolved form of
+the Datastar comparison: they attach behavior through attributes
+interpreted by a global runtime; we attach it through typed props
+that resolve to real closures with owner, context, and cleanup.
 
-**The state contract.** Affordances trigger actions and reflect
-transport or DOM-local state: submit, navigate, confirm, busy,
-open/closed, focus, scroll, a URL param. They never read or write
-signals or stores — the moment behavior needs client reactive state,
-that is the component threshold. This is what keeps the tier
-native-alignable.
+**Event props — the same marker, delegated (mechanics revised
+2026-08-18, superseding the same-day per-element-attach lean).**
+`<button onClick={props.onCopy}>` on a server intrinsic emits the
+same marker as a ref — but resolution is dispatch-time, not
+lifecycle-time. The tell was the list case: one `onToggle` prop
+serves N rows with identity read off the element (`data-id`, the
+`_key` already there) — one handler, many elements,
+identity-at-the-element *is* delegation, so the implementation
+should literally delegate. No `addEventListener` per element:
+the existing delegated-event up-walk (the same seam client Solid's
+`delegateEvents` uses, which the router already sequences itself
+after) additionally checks the marker attribute and resolves the
+occurrence's binding table at dispatch. What falls out:
 
-**Tier policy option (2026-08-13): spec'd-only built-ins.** Possibly
-the only *shipped* affordances are ones the platform has spec'd or
-formally proposed — `command`/`commandfor` enhancement, `popover`,
-`<details name>`, Triptych's forms — and Solid never mints attribute
-vocabulary at all: everything invented in the table above ships as
-documented `registerClaim` recipes, not package API. Buys: dissolves
-naming entirely; shrinks freeze exposure to ~zero (the shipped set is
-defined by an external process; deprecation is the browser shipping);
-makes the primitive the product. Costs: the two flagship compositions
-(`data-bind` live search, `data-scroll` stream-following) have no
-platform equivalent on any horizon and drop from one attribute to
-copy-a-recipe; and "spec'd" needs a line drawn — strict reading ships
-almost nothing today, loose reading tracks moving drafts. Spectrum to
-decide at build time, not before stable (the substrate is identical
-across all three): (a) spec'd-only + recipes, (b) spec'd built-ins +
-a blessed-recipes package that is explicitly non-contract, (c) the
-invented tier. Packaging posture only.
+- *Zero per-element machinery.* Nothing attaches, so morphs have
+  nothing to re-attach — the marker rides the markup through every
+  re-materialization for free, and the claim sweep never touches
+  event bindings.
+- *Hole content gains event handlers.* The owner-creation latch
+  means live markup holes cannot mint per-element claim scopes —
+  but delegation needs none: a marker-bearing element arriving
+  through a hole re-emission is live the instant it hits the DOM.
+  Event props work in exactly the territory previously written off
+  to attribute claims.
+- *Solid semantics, not a third dialect.* Riding the client
+  delegation seam inherits retargeted `currentTarget`,
+  `preventDefault`/`stopPropagation` behavior, and ordering against
+  the router's document-level handlers — a server-element handler
+  behaves identically to a client-element handler, which largely
+  dissolves the boundary-invisibility caveat this paragraph used to
+  carry (the dead window before a frame's binding table arrives is
+  what remains, and it is hydration's dead window, same answer).
+- *Non-bubbling events keep the old plan.* `focus`/`blur`/media
+  events can't delegate (same constraint as client Solid): those few
+  fall back to per-element attachment through the claim path, or the
+  bubbling variants (`focusin`/`focusout`).
 
-**Native alignment rule.** The htmx-adjacent platform proposals
-(Triptych's button `action`/`method`, invoker `command`/`commandfor`
-— shipping, `popover` — shipped, `<details name>` — shipped) are
-attribute-shaped, expression-free, form/anchor-semantic: the same
-dialect. Each affordance is therefore written as a forward-polyfill —
-where a native attribute exists or is proposed, adopt its vocabulary
-(prefer enhancing `commandfor` over inventing toggle syntax) so markup
-written today degrades toward the platform, not away from it. The
-claims substrate makes the exit graceful: "the browser does this now"
-is deleting one registration. The exchange itself (partial
-replacement, Triptych's biggest ask) is *not* affordance-tier — frame
-streams and morphs already own it and do more.
+Decided 2026-08-18: supported — a server component accepting `onX`
+props reads exactly like normal Solid. The earlier "events are sugar
+over the ref marker" framing inverted: events are the *cheaper*
+tier, and by usage weight the bigger one (Datastar's catalog audit:
+`data-on` is their interaction workhorse and maps entirely here;
+their materialization tier — intersect/resize/scroll-into-view/init
+— is the small set that genuinely needs refs; half their attributes
+are the client-reactive-state layer Solid natively is, or `predict`'s
+transaction-scoped slice of it). Refs remain the powerful tier for
+element-in-hand at materialization: mounts, observers, measurement.
 
-**RC-freeze compatibility (2026-08-13).** The claim trio is frozen
-public API — `@solidjs/web`'s client entry wholesale re-exports the
-runtime client, so `registerElementClaim`/`claimElement`/
-`claimElementTree` and their semantics (handlers observe the
-navigation-relevant set: `a[href]`, `form[action]`) are in the RC
-contract, with the router's `setupLinkClaims` as a live consumer. The
-generalization is additive *only if* one line holds: attribute-keyed
-claims route through their own per-attribute handler lists — the
-existing `registerElementClaim` broadcast channel must NOT widen to
-observe attribute-claimed elements, or every frozen-API consumer
-starts receiving element kinds the contract never promised. Likewise
-the `CLAIM_SEAM` registered symbol (a flat handler array shared across
-separately bundled — potentially differently versioned — runtime
-copies) keeps its shape; attribute-keyed registration hangs off a
-second registered symbol.
+**The SSR cost story (settled 2026-08-18; opt-in amendment
+2026-08-19): minimally detrimental by construction, and zero unless
+asked for.** Handler expressions in SSR output are today dropped at
+compile time, *unevaluated*. Behind a compiler option (the server
+components flag — apps not enabling server components never get the
+transform, and their SSR output compiles byte-for-byte as today),
+the compiler round (Babel + Rust, the `$key` shape) emits a guarded
+expression instead:
+
+```js
+sharedConfig.context.frame ? _$claim(props.onCopy) : ""
+```
+
+This is a compile-time capability flag with exact precedent in
+`hydratable`, carrying the same known trade-off: modules precompiled
+without the option can't offer ref/event positions inside an SC app,
+just as non-hydratable precompiled code can't hydrate — acceptable
+and established, since the plugin sets it app-wide and libraries
+shipping source (the ecosystem norm) inherit the app's setting. With
+the option on, the frame flag on the shared render context — the
+established channel for ambient render mode (the async property,
+hydration ids) — gates *evaluation*, not just output: normal SSR in
+an SC-enabled app pays one property read per handler position and
+the expression never runs (no new work, no new side effects,
+byte-identical markup). Carrying the sink
+reference on the context rather than a boolean makes the flag test
+and the binding-table handle the same read. Inside a frame render
+the brand test sorts values: cross-border function → marker into the
+occurrence's binding table; anything else → empty string plus a
+dev-mode warning naming the two exits ("this handler can never
+run — pass it from the client's props, or bind a mutation to
+`action=`"). The warning is runtime-only by necessity,
+not laziness (2026-08-18): SSR compilation is context-blind — the
+same compiled module serves hydratable SSR, where a local handler is
+legitimate (the client compilation of the same source owns it), and
+frame renders, where it's the mistake — so a static warning would
+false-positive on every ordinary hydratable component. Only the
+frame flag knows which face a render is on; the warning lives at the
+same layer as the gate. The teachable line, with its one carve-out:
+**requests may be server-authored (`action`/`formaction` serialize
+to URLs and the router upgrades them through delegation);
+interaction must be client-authored.** Zero client bytes for non-frames apps (the claim engine is
+frames-bundle-only); markup weight only on elements that actually
+claim. Pre-adoption clicks share hydration's dead window; if it ever
+matters, root-level delegation for marker-bearing elements is the
+known answer — deferred. In hydratable SSR the gate is closed by
+scope (no frame context), so client-compiled hydration keeps sole
+ownership of handlers — no double attachment.
+
+**Claims stay internal (2026-08-18, second pass — the folded
+attribute tier is cut).** The morning pass folded the 08-13
+generalized-claims sketch in here as a "class direction" for content
+not authored with props in scope; the evening pass killed it. The
+attraction of this stage is that there is exactly ONE grammar — a
+prop, used in a JSX position — and every rescue attempt for the
+attribute tier reintroduced a second one (a `registerClaim` registry
+with its own vocabulary; then a `claimAttr` string helper minting
+markers in post-processing output, briefly). The load-bearing case
+dissolved instead: **interactive elements are JSX — the pipeline
+produces content, not affordances.** The chat copy button doesn't
+need injecting into the markdown HTML string; the hole thunk
+interleaves — prose ships as `innerHTML`, code blocks are real JSX
+(`<pre><button onClick={props.onCopy}>⧉</button><code
+innerHTML={highlighted}/></pre>`) — and this works inside a
+streaming hole with nothing new: the thunk evaluates server-side,
+the event marker is an attribute in the emitted HTML, delegation
+resolves it at dispatch, and the owner-creation latch is irrelevant
+because no per-element scope is needed. Ref props stay out of hole
+interiors (they need the lifecycle the latch forbids); interaction
+there is event-shaped anyway. The pure rule: **behavior means JSX
+with a client prop. Content you won't parse into JSX gets no
+behavior** — the escape is parsing it, not a registry.
+
+What this kills as author surface, permanently: the `registerClaim`
+public opening, the `data-*` affordance vocabulary and its tier
+policy, the forward-polyfill program, the capability/context claim
+form. The 08-13/14 sketches survive in git history (and remain the
+reference if a future wave reopens the seam — nothing below
+forecloses that; it is simply no longer plan of record). What does
+NOT die: the element-claim seam itself (`registerElementClaim`,
+`claimElement`, `claimElementTree`, `CLAIM_SEAM`) — it stays exactly
+what it is today, frozen engine machinery with the router's link
+layer as its one public consumer, gaining Stage 6's ref-marker
+resolution as a second, *internal* consumer. Unnameable
+post-processed content that needs *materialization-time* behavior
+(an observer on every element of an injected string) is accepted as
+unsupported.
+
+**RC-freeze compatibility (2026-08-13, still binding).** The claim
+trio is frozen public API — `@solidjs/web`'s client entry wholesale
+re-exports the runtime client, so `registerElementClaim`/
+`claimElement`/`claimElementTree` and their semantics (handlers
+observe the navigation-relevant set: `a[href]`, `form[action]`) are
+in the RC contract, with the router's `setupLinkClaims` as a live
+consumer. Stage 6's internal ref-marker claim must route through its
+own channel — the frozen `registerElementClaim` broadcast must NOT
+widen to observe marker-claimed elements, or every frozen-API
+consumer starts receiving element kinds the contract never promised.
+Likewise the `CLAIM_SEAM` registered symbol (a flat handler array
+shared across separately bundled — potentially differently
+versioned — runtime copies) keeps its shape; the marker claim hangs
+off its own registered symbol.
 
 **Decide before stable (2026-08-13; the seam is movable during RC,
-frozen after).** Two decisions harden at stable; everything else in
-this sketch is provably additive later:
+frozen after).** Two decisions harden at stable regardless of the
+attribute tier's death, because the trio is frozen API either way:
 
-1. *The navigation element set.* `a[href], form[action]` is baked into
-   the frozen channel's semantics — consumer filters are written
-   against it — and it is currently incomplete as a navigation
-   contract: `area[href]` navigates, `button[formaction]` re-targets a
-   form. Widening after stable changes what every registered handler
-   receives (the self-inflicted version of the "channel never widens"
-   hazard). Settle the set during RC, or document it as closed and
-   final.
+1. *The navigation element set.* `a[href], form[action]` is baked
+   into the frozen channel's semantics — consumer filters are
+   written against it — and it is currently incomplete as a
+   navigation contract: `area[href]` navigates, `button[formaction]`
+   re-targets a form. Widening after stable changes what every
+   registered handler receives. Settle the set during RC, or
+   document it as closed and final.
 2. *The seam global's shape.* `CLAIM_SEAM` holds a bare array shared
    across separately bundled — potentially differently versioned —
    runtime copies, so stable's shape is the wire format forever.
-   Either reshape to an extensible object now, or commit to attribute
-   claims living on a second registered symbol (zero RC churn — the
-   recorded lean).
+   Either reshape to an extensible object now, or commit to internal
+   marker claims living on a second registered symbol (zero RC
+   churn — the recorded lean).
 
-Explicitly additive later, no RC action: attribute-keyed registration
-(new function, own routing), the affordance tier (new entry), a
-trailing metadata parameter on handlers (creation vs sweep vs
-morph-touch phase), and `claimElement`/`claimElementTree` (compiler
-output contract, version-paired, unchanged regardless).
+**What died here (2026-08-18):** `$ref` and `frame.refs` as author
+surface (the marker/index machinery survives as the internal claim
+that resolves ref-prop coordinates); ref-only `Frame` acquisition
+for behavior purposes; `$seam` was already dead; and — the evening
+pass — the attribute-claim tier as author surface (`registerClaim`,
+the affordance vocabulary; see the internal-claims section above).
+`Portal` did NOT die — what died is its *addressing* (names through
+a frame index): persistent islands still mount through it, fed by a
+ref-prop signal, because a mount needs an owner, lifecycle, and
+reactive re-targeting that a fire-again claim callback cannot
+supply. `$key` is untouched — morph-only identity, no client-facing
+role.
 
-**Open questions:** exact attribute namespace and sweep cost; packaging
-(which entry ships the tier so it stays tree-shakeable); the re-claim
-dedupe contract (element-keyed WeakSet per consumer is the obvious
-shape); how `data-bind` discovers the router without a hard
-dependency.
+**The three load-bearing bolts (flagged spec-before-build in the
+2026-08-18 audit; all three settled 2026-08-19 — Stage 6 is
+build-ready):**
+
+1. *Marker wire format — settled 2026-08-19: fully-qualified, one
+   attribute.* Elements with cross-border behavior positions carry
+   one marker attribute (`_bnd`, the `_hk` family) with grammar
+   `_bnd="<occ>:<pos>=<row>[,<pos>=<row>]*"` — occurrence id, then
+   position (lowercased event name, or `ref`) mapped to a row in
+   that occurrence's binding table. Fully-qualified rather than
+   ancestry-resolved, deliberately: encoding the occurrence id kills
+   the nearest-occurrence-root walk (and its nested-region
+   ambiguity) and stays correct for hole-emitted content wherever
+   the DOM puts it. All positions on one element share one
+   occurrence by construction — minted at one compile position
+   during one occurrence render — so the id is paid once per
+   element. Dispatch parses on first hit and caches keyed by the
+   attribute's string value; morph rewrites invalidate by changing
+   the string.
+2. *Binding-table supersession — settled 2026-08-19: the risk
+   dissolves into an invariant.* Rows are mint-order ordinals
+   within one occurrence render (loops mint N rows, one per
+   iteration — no compile-time-stable-index scheme survives loops,
+   so none is attempted). The invariant: **markers in applied DOM
+   always pair with the binding table of the same commit** —
+   guaranteed by construction because the morph applier swaps the
+   occurrence's table and patches the markup (including `_bnd`
+   values on `_key`-preserved rows) in one synchronous step, and
+   single-threaded JS means no dispatch interleaves. No versioning
+   protocol needed. What remains is dispatch on nodes the morph
+   dropped or detached mid-flight: row lookup misses, policy is
+   drop + dev-warn (hydration's dead-window answer). Ref claims
+   fire only from the post-apply sweep, so refs never see the
+   window at all.
+3. *Brand and composition rules — settled 2026-08-19: the stub is
+   the brand.* A function-valued slot arg arrives server-side as a
+   branded frame-function stub carrying its client coordinate —
+   that is already what makes render props callable — so the
+   evaluation test is stub-or-not, no new detection system. Branded
+   → mint a row storing the coordinate (the same stub in multiple
+   positions mints multiple rows to one coordinate, matching
+   latest-props semantics). Unbranded function under the frame flag
+   → empty string + the two-exit dev warning:
+   `onClick={debounce(props.onCopy)}` on the server is a
+   server-local closure and correctly fails — composition belongs
+   on the client, before passing. Spreads: v1 recognizes named
+   `ref`/`on*` JSX positions only; the SSR spread helper, under the
+   frame flag in dev, warns on handler-bearing keys (static
+   warnings are impossible — compilation is context-blind, as
+   recorded above).
+
+**Open questions (prototype-decidable).** The ref callback's cleanup
+contract (returned cleanup vs ambient `onCleanup` — lean: both,
+matching client refs); whether event sugar ships in the same
+compiler round or the next; dead-window policy stated as drop
+(hydration's answer) with root-replay as the known upgrade; the
+per-node attribute check's cost on the shared delegation walk; the
+re-fire dedupe contract for the internal marker claim (element-keyed
+WeakSet is the obvious shape).
+
+### 9.2 Stage 7 design — predictions: one declarative verb (settled 2026-08-18; supersedes the imperative-draft revival, overlays + entries, and the transactional draft)
+
+Fourth and, by its structure, final form of this design. The
+supersession chain compressed into one night's search once the
+machinery was priced honestly, and the search record is the most
+valuable thing on this page — four shapes were tried, and each wrong
+one died on a *named cost*, which is how we know the survivor is a
+minimum and not a mood:
+
+```text
+shape                            died on
+─────                            ───────
+imperative draft (mutate + add)  snapshot/restore/replay machinery —
+  (08-14 seed; revived 08-18)    arbitrary mutation of server-owned
+                                 nodes needs prior state; property
+                                 writes are invisible to observation;
+                                 restore must be a morph with property
+                                 overrides. Died twice.
+declarative patch + Portal       ceremony — mount site + optimistic
+  entries (08-16)                store + row authored away from the
+                                 action it predicts for.
+patch + imperative additive      the split — two grammars for one
+  body (08-18, hours)            concept; and a body exists only to
+                                 place nodes, which is four words of
+                                 vocabulary, not a function's worth.
+patch + JSX-valued position      position-as-third-argument grows an
+  argument (08-18, minutes)      hx-swap enum outside the patch.
+```
+
+The resolution: **placement is only four words, so it fits in the
+patch.** One verb, one declarative shape:
+
+```tsx
+predict(el,   { checked: true });                              // mutation
+predict(list, { append: <li class="pending">{title}</li> });   // creation
+predict(row,  { class: "saving", after: <Spinner /> });        // both, one claim
+```
+
+The patch vocabulary is the element's JSX attribute surface, applied
+by the same code path client JSX uses (`spread`/`assign` semantics):
+`class`/`classList`, `style` strings and objects, plain attributes
+including `data-*`/`aria-*`, the property-vs-attribute heuristics
+(`checked`/`value`/`open` as properties), and the namespaced forms
+(`attr:`/`prop:`/`bool:`) for free — **plus four relational content
+keys**: `before`, `prepend`, `append`, `after` (the platform blessed
+exactly this set: they are `insertAdjacentHTML`'s positions). An
+author who can write a Solid attribute expression can write a
+prediction; nothing outside that vocabulary exists to learn. Two
+carve-outs, both dev-warned: behavior-shaped keys (`ref`, `on*`) are
+excluded — behavior is Stage 6's job with its own element-scoped
+lifecycle, and a prediction is a statement about state — and
+content-destroying keys (`children`, `innerHTML`) are excluded by
+the no-snapshot rule. `textContent` stays in with a stated edge: its
+baseline is a string, a faithful undo only on text leaves —
+predicting it on an element with element children is the `innerHTML`
+violation in quieter clothes (dev mode checks `childElementCount`).
+
+**Two rollback regimes inside one shape — why this is convergence,
+not compromise.** Every claim a client can make about server markup
+is one of two kinds, and they have different capture problems:
+
+- *Mutation* ("this element will look different"). Rollback needs
+  the prior state, and the only cheap, sound way to get it is for
+  the author to declare which keys they touch — then baselines are
+  bounded and captured per-key at apply time (`el.checked` read
+  before written). This is precisely the data no other mechanism can
+  reach: property writes fire no mutation records, and the morph
+  deliberately preserves `checked`/`value`/`open` on matched nodes,
+  so an undeclared property prediction would survive its own
+  rollback. Declaration IS the rollback data — which is why mutation
+  must be declarative, not why it's prettier.
+- *Creation* ("new content will exist"). Rollback needs no memory at
+  all — removal is the undo — and the engine built the nodes, so
+  tracking is free without observing anything. Content-key JSX
+  renders under a **transaction-scoped owner** into a
+  marker-delimited range at the named position; the morph flows
+  around it as foreign (the same skip slot fills use); settlement
+  disposes the owner and removes the range.
+
+The design invariant that falls out, worth guarding in review: **no
+snapshots anywhere.** Which is also why the vocabulary has a
+deliberate hole — there is no `children` key. Wholesale replacement
+is mutation-shaped (it destroys server-owned content, so its undo
+needs a snapshot). The line, stated for authors: *predictions
+decorate and add; they never remove or rewrite what the server
+rendered.* If a real case ever demands replacement, it is a
+separately priced escalation tier, not a fifth content key.
+
+**Anchors are elements in hand.** No names, no frame handle, no
+index: the element arrives through Stage 6 — an event prop's
+`currentTarget`, a ref prop's delivery — and entity identity travels
+on the element (`data-id`, or the `_key` already present for the
+morph). Per-entity ref naming schemes (`$ref={`check:${id}`}`)
+dissolve entirely; the only ref props left are containers and
+singletons, which retires the old "ref-name volume at HN scale"
+wobble. The `_key` substrate is what makes an element pointer a
+stable anchor: keyed matching preserves the node across reordering
+morphs, so the common case never re-targets. Wholesale replacement
+of an anchor is the uncommon case, and the claim engine's re-fire on
+the replacement element is the re-target hook — attribute keys
+re-baseline and re-apply; content ranges re-mount at their named
+position.
+
+**Same transaction wave (unchanged).** A prediction registers in the
+current batch like an optimistic store write — visible immediately,
+adopted into the action transition when that batch becomes one,
+evaporating at settlement. Frames stay the third optimistic
+participant beside signals and stores. Success and failure are one
+code path: on success the settling morph's records already contain
+the predicted state (attribute baselines are written back into
+markup that now agrees; the authoritative row stands where the
+pending range vanished); on failure the records did not advance and
+the same restore/removal exposes them unchanged. Concurrent
+transactions clear independently — A settling restores A's baselines
+and removes A's ranges; B's predictions stand. Per-lane intent, no
+inverse DOM patches.
+
+**Re-assertion rides the claim sweep.** After every authoritative
+apply that touches a predicted element — morph, hole update,
+attribute record — attribute-key predictions re-capture baselines
+from the fresh authoritative state and re-apply, so server updates
+land *under* still-active predictions instead of erasing them.
+Content ranges don't re-assert at all in the common case: they are
+persistent foreign ranges the apply pipeline flows around. Which
+repeals the old display-only caveat for them — the nodes are never
+recreated, they have a real owner, so content inside a prediction
+may be genuinely interactive (pending styling with live bindings, a
+retry button that works).
+
+**The settle race, answered by single-flight.** Does the "Sending…"
+row coexist with the confirmed row? Under single-flight, no: the
+confirming morph and the transaction settling are the same event, so
+the range is removed in the tick its prediction comes true. The race
+exists only when an out-of-band refresh lands mid-transaction with
+the row already committed — a transient duplicate until settlement.
+Entity-keyed settlement (matching a prediction to the authoritative
+row that fulfills it) is deliberately NOT mechanism — it was the
+overlay model's answer, and it required naming schemes this design
+just deleted. Accepted, because it is stated. Stage 8's separate
+connection needs the causal watermark (§9.3) before the single-flight
+guarantee transfers.
+
+**In-flight streaming (unchanged rule).** Authoritative updates do
+not wait for optimism: every incoming chunk first advances the
+authoritative records, the morph applies them (flowing around
+prediction ranges), attribute-key predictions re-assert on the
+result. `latest records + still-active predictions = visible DOM`.
+One honest note on geometry: a prediction range parked *between*
+authoritative siblings floats — it keeps its approximate position
+(before its next surviving authoritative sibling) as the morph
+inserts and reorders around it, not a guaranteed slot. Position-by-
+DOM instead of position-by-model; for pending-row UX, the right
+trade.
+
+**Address-scoped (unchanged decision).** A prediction belongs to the
+content address of its anchor, captured at write time — the DR-1
+answer. Rebinding a mount to a new address never carries the old
+call's predictions; rebinding back while the transaction is active
+restores them; two mounts of one address show the same prediction.
+The tier's honest boundary line stands: **predictions do not span
+addresses.** An optimistic toggle against `getTodos("all")` does not
+appear in `getTodos("active")`, though the server would reflect it
+in both — the frame layer holds markup, not data. When optimism must
+span multiple server renders or outlive a transaction, it is
+data-shaped and belongs in a client store/projection (rendered, if
+it must live inside server markup, through a ref-fed `Portal` — the
+persistent-island path in §9.1, which remains available and simply
+stops being the blessed path for transaction-scoped optimism).
+Site-local state — focus, selection, an open menu — was never
+prediction state; it stays with components and Stage 6 behavior.
+
+**The worked case — TodoMVC add + toggle:**
+
+```tsx
+// ── server ("use server" component) ──────────────────────────
+function Todos(props) {
+  const todos = getTodos();
+  return (
+    <ul class="todo-list" ref={props.list}>
+      <For each={todos}>{t => (
+        <li $key={t.id} class={t.completed ? "completed" : ""}>
+          <input type="checkbox" checked={t.completed}
+                 data-id={t.id} onChange={props.onToggle} />
+          <label>{t.title}</label>
+        </li>
+      )}</For>
+    </ul>
+  );
+}
+
+// ── client ───────────────────────────────────────────────────
+const add = action(async (title: string) => {
+  predict(list(), { append: <li class="pending">{title} <small>Sending…</small></li> });
+  await createTodo(title);
+});
+
+const toggle = action(async (el: HTMLInputElement, completed: boolean) => {
+  predict(el, { checked: completed });
+  await toggleTodo(el.getAttribute("data-id"), completed);
+});
+
+<Todos list={setList}
+       onToggle={e => toggle(e.currentTarget, e.currentTarget.checked)} />;
+```
+
+The optimistic row is one line inside the action it predicts for —
+the colocation the imperative draft was chasing — and it makes no
+attempt to mirror the server row (deliberately pending-styled), so
+the "client fork that rots" failure mode has nothing to bite.
+
+**Shipped substrate (2026-08-15, `keyed-morph`) — unchanged.** Keyed
+element matching in the morph: `compatible()` requires equal `_key`,
+so live element state — typed `value`, `checked`, `open`, focus —
+follows the *entity* across reordering morphs. Shipped independently
+(it corrected a live defect); here it is what makes element-in-hand
+anchors stable and what keeps a prediction on the node it was made
+about.
+
+**Machinery ledger (the argument that settled the shape).** Net-new
+engine code, all in known territory: the patch applier is the JSX
+binding logic `spread`/`assign` already contain, wrapped with
+per-key baseline capture; content keys are the fill machinery
+(marker ranges, foreign skip — shipped) plus a transaction-scoped
+`createRoot`; re-assertion and re-targeting are consumers of the
+Stage 6 claim sweep; settlement hooks into the transaction machinery
+solid already runs. Nothing from the imperative draft's expensive
+tier — snapshots, restore-morph with property overrides, replay-wave
+scheduling, per-run disposable roots, mutation capture — survives as
+a requirement. dom-expressions owns the applier, ranges, and sweep
+consumers; solid-web binds registration to Solid's transactions.
+
+**Open questions.**
+
+- Pre-materialization predictions: `predict` against an anchor whose
+  frame hasn't adopted yet (queue until the claim delivers the
+  element, or no-op with a dev warning). Lean: queue — actions can
+  legitimately race adoption at t=0.
+- Content-key naming: `before`/`prepend`/`append`/`after` vs the
+  platform's `beforebegin`/`afterbegin`/`beforeend`/`afterend`.
+  Lean: ours read better and map 1:1; document the mapping.
+- The floating-range geometry above: whether "before next surviving
+  authoritative sibling" is stated contract or implementation
+  detail.
+- Whether repeated `predict` calls on one anchor in one transaction
+  merge (last-write-wins per key) or stack. Lean: merge per key —
+  matches how authors think about "the predicted state."
+- Dev-mode enforcement surface for the discipline line (warn on
+  imperative writes to server-owned attributes from claim/action
+  scopes).
+
+**Acceptance gate — Server Component TodoMVC (restated).** Port the
+existing `examples/todos` beside itself, preserving its delays, ~33%
+write failure, per-item retry, bulk actions, filters, and
+overlapping transitions. The existing app is the derived
+`createOptimisticStore` reference implementation; the port replaces
+its authoritative data/render with server-component markup plus
+predictions. Pass condition: **every optimistic behavior lands in
+`predict` patches (attribute or content keys) or in data-shaped
+client state — zero imperative DOM writes, zero selector coupling,
+zero vocabulary beyond JSX attributes and four position words.**
+Toggle/pending/disabled/error markup are attribute keys; add is a
+content key; counters and filter state are data-shaped (slot args /
+client signals). Do not publish the API until add/remove/toggle
+success and failure, checkbox correction, concurrent and bulk
+mutations, retry/error markup, state retention across reordering
+morphs (the `_key` substrate: focus, typed values), and clean
+hydration all work. The decision criterion beyond correctness is
+simplicity parity: if the port relocates the current store's
+simplicity into prediction bookkeeping, the abstraction fails.
+
+**Non-negotiable invariant (unchanged):** the frame itself remains
+derived. Predictions may temporarily perturb its rendered
+projection, but only an authoritative frame record can make that
+output durable.
+
+### 9.3 Stage 8 seed — connection-shaped transport (2026-08-17)
+
+Recorded from the design conversation; nothing here is built. The
+stage shrank three times during the pass, each time by discovering
+the capability already existed — what remains is a continuation story
+and a contract with failure, not a transport feature.
+
+**Scope split (decided the same night).** Server-component liveness
+(this section) is distinct from the data-API question: what a
+top-level async iterator returned from a plain `"use server"` call
+means as a Solid data primitive (consumption semantics, SSR, sharing,
+reconnection). The data layer is prioritized FIRST and investigated
+separately; the frames value tier should ride whatever it decides.
+This seed covers the frame/markup face only.
+
+**No new APIs — a connection is a response that doesn't end.**
+`"use server"` is untouched on both sides. The component not
+terminating is the entire liveness declaration, and it is observed,
+not configured: the stream face already waits on reactivity, because
+every live server source is await-shaped — a projection over a feed
+sits on a pending `next()` between events, a generator holds an
+outstanding yield, the retry loop holds an unsettled promise. There
+is no "subscribed but nothing pending" state (raw post-flush writes
+are already forbidden), so "waits on pending" and "waits on
+reactivity" are the same wait, and a component over an infinite feed
+would hold its response and keep emitting today. Stage 8 is the
+warranty on that accident, plus the pieces below.
+
+Configuration therefore lives at the edges, where config already
+lives: the server entry owns the operational envelope (carrier
+framing, hold caps, idle timeouts — per-route), the client host owns
+reconnect policy (backoff, a knob beside retention). Because
+reconnection is re-invocation, every cap is a QoS dial, not a
+correctness switch: a 30-second platform limit produces a 30-second
+resume cycle — chattier, still correct — degrading in the
+pathological limit to long-polling, emergent and never implemented.
+
+**Carrier is content negotiation.** The invocation is a POST whose
+response body is the record stream; "use SSE" is a response
+*framing*, not a channel. The entry opts in (`carrier: "sse"`),
+Content-Type carries the decision, the client picks its decoder off
+the header. SSE framing, NOT the EventSource API (which cannot POST,
+and whose auto-reconnect we do not want — the host owns resume): what
+SSE buys is the middleboxes — proxies and platform load balancers
+that buffer opaque chunked responses pass `text/event-stream`
+unbuffered — plus comment-line heartbeats against idle timeouts, and
+an `id:` field that is a natural home for the watermark. Live
+responses ship `Cache-Control: no-store` (a cached clone of an
+unbounded stream outlives its page). WebSocket stays deferred until
+proven necessary — upgrade handshake, bidirectional, the client must
+know a URL: the one carrier that would cost API.
+
+**Taxonomy: promises for eventual, iterators for persistent.** Every
+persistent thing the system already built is iterator-shaped —
+container traces (snapshot + patch iterable), generator components,
+live-hole re-emissions, the record stream itself. The only
+promise-factory is the retry loop, correctly, because it names an
+EVENTUAL value. Persistence and eventuality are the two async kinds;
+promise factories masquerading as persistence should not exist.
+
+**Resume is supersession, not continuation.** Iterators are not
+seekable; re-invocation replays from the start. So a resume is a
+SUPERSEDING RENDER of the address, never a continuation of the old
+iterator: fresh snapshot from durable state, morph converges,
+identical regions no-op, retained element state follows `_key`.
+Value-tier iterables get fresh-instance supersession — the resumed
+render's args replace the old ones, a client `For` re-renders from
+the new iterable, nothing appends twice. Cursors (true positional
+resume for sources with real sequence numbers) are an opt-in
+optimization, never the baseline, because the baseline must hold for
+sources that have none. The re-derivability line, sharpened: **if
+losing the transport loses the value, the value belonged in durable
+state, not in the iterator.** An in-flight LLM generation is eventual
+wearing iterator clothes — its durable form (the message row) is what
+a resume renders; the lost tail is app semantics, not framework
+failure. Dev-mode chaos reconnect is the enforcement.
+
+**Settled emission — progressiveness is consumer-relative.** The
+client's async-holds-latest rule, applied at the emitter: do not
+stream the settling journey to a consumer already holding content.
+The progression — fallbacks, partial reveals, loading states — is UX
+for an empty screen, not data; a resuming consumer has no empty
+screen. Same render, two emission policies, selected by the request
+itself (a resume request carries "I hold version N"; that bit IS the
+selector): fresh consumer → progressive, today's streaming; resuming
+consumer → render quietly to the existing settlement latch, emit one
+converged snapshot, keep the sink open. Regression never hits the
+wire — which retired the client-side version-floor guard an earlier
+draft of this seed needed.
+
+**Quiet resume contract.** A resume is lifecycle-silent: the host
+resume loop runs OUTSIDE transitions (no `isPending` pulses on a
+platform's 30-second cycle), retained content keeps boundaries
+revealed (first-content gating and async-holds-latest already
+guarantee no fallback flash), and a resume's own settlement settles
+nothing transaction-shaped — predictions hold to their watermark,
+never to the resume.
+
+**Watermark = cursor.** A mutation ack carries "reflected as of
+version N"; the transaction and its overlays hold until the
+address's version passes N — whether that version arrives on the
+original response, a live stream, or a resume snapshot. The same
+"I hold version N" is the resume request's emission-policy selector.
+Requires per-address versions monotonic across responses; the
+address-resident store is the authority.
+
+**Document face: bounded by a window, not by detection.** Persistence
+cannot be detected — a feed's pending `next()` is byte-identical to a
+finite generator's, and "will this settle?" is the halting problem —
+so it is DEMONSTRATED instead: the document window (an entry-level
+knob) closes the document response, and whatever outlives it is
+persistent by demonstration. Eventual = settles within the window;
+persistent = outlives it — an operational taxonomy, the same rule as
+any transport cap. **Default = no window = today's
+wait-for-full-settlement**: bounded generators stream their whole
+progression into the document (full content, SEO) exactly as now;
+nothing breaks. Setting the window is the opt-in to live-at-t=0, and
+is REQUIRED there — an unbounded source with no window holds the
+document open forever (tab spinner, `load` never fires, buffering
+proxies, unflushed serializer state). At the window: clean close at a
+record boundary, final sweep, a live-marker bit on frames whose
+bindings remained open; adoption sees the bit and starts the resume
+loop. The document is just the transport that ends first and most
+predictably; the gap between close and resume is covered by the
+settled snapshot (self-healing — no missed-event protocol). Honest
+cost: one extra server render per live frame per page load — the
+seam where per-address fan-out slots in later if it ever matters.
+
+**Work items (the whole stage, current best understanding):**
+
+1. Emission-policy selector on the frame render (progressive vs
+   settled), driven by the request's "I hold version N".
+2. Host resume loop: re-invoke on response death, backoff, outside
+   transitions.
+3. Fresh-iterable supersession proven on the resume path (existing
+   rule; needs the test).
+4. Watermark on mutation acks + monotonic per-address versions.
+5. Server teardown on client disconnect: response abort cancels the
+   generator and disposes the render — without this, every abandoned
+   tab leaks a server loop.
+6. Document window + live-marker bit + adoption-triggered resume.
+7. Open surface question: expose connection state on the frame handle
+   (a `connected` signal for "reconnecting…" UI) — small, additive,
+   undecided.
+
+Deliberately absent: any client authoring API, any server authoring
+API, any subscription registry, any cursor protocol, WebSocket.

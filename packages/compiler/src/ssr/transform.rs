@@ -1,14 +1,11 @@
 use crate::error::{Error, Result};
 use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
-use oxc_ast::{
-    ast::{
-        Argument, Expression, JSXAttributeItem, JSXAttributeValue, JSXChild, JSXElement,
-        JSXExpression, JSXFragment, ObjectPropertyKind, Program, Statement,
-    },
-    AstBuilder, NONE,
+use oxc_ast::ast::{
+    Argument, Expression, JSXAttributeItem, JSXAttributeValue, JSXChild, JSXElement, JSXExpression,
+    JSXFragment, ObjectPropertyKind, Program, Statement,
 };
 use oxc_ast_visit::VisitMut;
-use oxc_span::{GetSpan, Span, SPAN};
+use oxc_span::{GetSpan, SPAN, Span};
 
 use crate::dom::element::jsx_expression_to_expression;
 use crate::shared::array::expression_to_array_element;
@@ -17,20 +14,21 @@ use crate::shared::ast::{
     import_named, object_getter_property, object_property, variable_statement,
     zero_arg_iife_statements,
 };
+use crate::shared::ast_builder::AstBuilder;
 use crate::shared::attr_plan::{AttrPlan, AttrPlanner, PlanValue};
 use crate::shared::bindings::BindingTable;
-use crate::shared::classify::{jsx_text_is_filtered, significant_children, Classify};
-use crate::shared::component_callee::{component_callee_expression, ComponentCalleeContext};
+use crate::shared::classify::{Classify, jsx_text_is_filtered, significant_children};
+use crate::shared::component_callee::{ComponentCalleeContext, component_callee_expression};
 use crate::shared::component_props::{
-    component_property, component_props_expression, component_spread_expression,
-    flush_component_props, ComponentPropContext,
+    ComponentPropContext, component_property, component_props_expression,
+    component_spread_expression, flush_component_props,
 };
 use crate::shared::condition::{
-    is_condition_shape, transform_condition, transform_condition_inline, zero_arg_call_thunk,
-    ConditionBuilder,
+    ConditionBuilder, is_condition_shape, transform_condition, transform_condition_inline,
+    zero_arg_call_thunk,
 };
 use crate::shared::constants::{
-    child_properties, dom_with_state, reserved_namespace, DomPropertyState,
+    DomPropertyState, child_properties, dom_with_state, reserved_namespace,
 };
 use crate::shared::utils::{
     child_slot_allocates_ids, decode_html_entities, element_name, escape_html_attribute,
@@ -157,6 +155,11 @@ struct AttrChildren<'a> {
     groupable: bool,
     /// The source attribute carried the `/*@static*/` marker.
     marker_static: bool,
+    /// Only the `children` attribute redirect may allocate hydration ids —
+    /// it is a real insert on the client. innerHTML/textContent/innerText
+    /// are opaque prop writes there, so their holes never take the
+    /// `_$scope` id reservation (solidjs/solid#3015).
+    can_allocate_ids: bool,
 }
 
 impl<'a, 'source> AstSsrTransform<'a, 'source> {
@@ -297,7 +300,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                 oxc_ast::ast::VariableDeclarationKind::Var,
                 self.ast()
                     .binding_pattern_binding_identifier(SPAN, self.ast().ident(name)),
-                NONE,
+                None,
                 None,
                 false,
             )
@@ -374,8 +377,8 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                         self.ast().vec(),
                         self.ast()
                             .binding_pattern_binding_identifier(span, self.ast().ident(name)),
-                        oxc_ast::NONE,
-                        oxc_ast::NONE,
+                        None,
+                        None,
                         false,
                         None,
                         false,
@@ -389,22 +392,27 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             return;
         };
         let mut statements = self.ast().vec1(declaration);
-        if arrow.expression {
-            let Some(Statement::ExpressionStatement(expression_statement)) =
-                arrow.body.statements.first_mut()
-            else {
-                return;
-            };
-            let span = expression_statement.span;
+        if arrow.is_expression() {
+            let expression = arrow
+                .get_expression_mut()
+                .expect("expression arrow has an expression body");
+            let span = expression.span();
             let placeholder = self.ast().expression_null_literal(span);
-            let value = std::mem::replace(&mut expression_statement.expression, placeholder);
-            arrow.expression = false;
+            let value = std::mem::replace(expression, placeholder);
             statements.push(self.ast().statement_return(span, Some(value)));
-            arrow.body.statements.clear();
-            arrow.body.statements.extend(statements);
+            arrow.body = self
+                .ast()
+                .arrow_function_body_block(self.ast().function_body(
+                    span,
+                    self.ast().vec(),
+                    statements,
+                ));
         } else {
-            statements.extend(arrow.body.statements.drain(..));
-            arrow.body.statements.extend(statements);
+            let body = arrow
+                .get_function_body_mut()
+                .expect("block arrow has a function body");
+            statements.extend(body.statements.drain(..));
+            body.statements.extend(statements);
         }
     }
 
@@ -496,7 +504,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             // arrays (Babel's `createTemplate` for SSR).
             let init = if parts.len() == 1 {
                 self.ast()
-                    .expression_string_literal(SPAN, self.ast().atom(&parts[0]), None)
+                    .expression_string_literal(SPAN, self.ast().str(&parts[0]), None)
             } else {
                 self.template_array_expression(SPAN, &parts)
             };
@@ -509,7 +517,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             ));
         }
         statements.extend(program.body.drain(..));
-        let mut body = ArenaVec::new_in(self.allocator);
+        let mut body = ArenaVec::new_in(&self.allocator);
         body.extend(statements);
         program.body = body;
     }
@@ -520,7 +528,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             self.ast().vec_from_iter(parts.iter().map(|part| {
                 oxc_ast::ast::ArrayExpressionElement::StringLiteral(
                     self.ast()
-                        .alloc_string_literal(span, self.ast().atom(part), None),
+                        .alloc_string_literal(span, self.ast().str(part), None),
                 )
             })),
         )
@@ -659,7 +667,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                             oxc_ast::ast::VariableDeclarationKind::Var,
                             self.ast()
                                 .binding_pattern_binding_identifier(span, self.ast().ident(&name)),
-                            NONE,
+                            None,
                             Some(init),
                             false,
                         )
@@ -709,13 +717,12 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             ids: std::vec::Vec<String>,
         }
         let is_groupable = |value: &Expression<'a>, groupable: &[String]| -> Option<String> {
-            if let Expression::Identifier(identifier) = value {
-                if groupable
+            if let Expression::Identifier(identifier) = value
+                && groupable
                     .iter()
                     .any(|name| name == identifier.name.as_str())
-                {
-                    return Some(identifier.name.to_string());
-                }
+            {
+                return Some(identifier.name.to_string());
             }
             None
         };
@@ -846,21 +853,20 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             };
             // The component ref protocol only applies to expression-container
             // values (Babel's `isJSXExpressionContainer` gate).
-            if name == "ref" {
-                if let Some(JSXAttributeValue::ExpressionContainer(container)) = &attr.value {
-                    if container.expression.as_expression().is_some() {
-                        let value = self.transform_component_expression(&container.expression);
-                        if let Some(prop) = crate::shared::refs::component_ref_property(
-                            self,
-                            attr.span,
-                            value,
-                            &mut component_setup,
-                        ) {
-                            running_props.push(prop);
-                        }
-                        continue;
-                    }
+            if name == "ref"
+                && let Some(JSXAttributeValue::ExpressionContainer(container)) = &attr.value
+                && container.expression.as_expression().is_some()
+            {
+                let value = self.transform_component_expression(&container.expression);
+                if let Some(prop) = crate::shared::refs::component_ref_property(
+                    self,
+                    attr.span,
+                    value,
+                    &mut component_setup,
+                ) {
+                    running_props.push(prop);
                 }
+                continue;
             }
             let (value, needs_getter, setup) = match &attr.value {
                 None => (
@@ -873,7 +879,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                     (
                         self.ast().expression_string_literal(
                             attr.span,
-                            self.ast().atom(&value),
+                            self.ast().str(&value),
                             None,
                         ),
                         false,
@@ -1053,7 +1059,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                         values.push(ChildValue {
                             value: self.ast().expression_string_literal(
                                 span,
-                                self.ast().atom(&value),
+                                self.ast().str(&value),
                                 None,
                             ),
                             dynamic: false,
@@ -1223,7 +1229,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
         let args = self.ast().vec_from_array([
             Argument::StringLiteral(self.ast().alloc_string_literal(
                 element.span,
-                self.ast().atom(&tag_name),
+                self.ast().str(&tag_name),
                 None,
             )),
             expression_to_argument(props),
@@ -1237,7 +1243,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             element.span,
             self.ast()
                 .expression_identifier(element.span, self.ast().ident("_$ssrElement")),
-            NONE,
+            None,
             args,
             false,
         ))
@@ -1249,10 +1255,10 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
         has_children: bool,
     ) -> Result<Expression<'a>> {
         // A lone spread attribute passes its argument straight through.
-        if attributes.len() == 1 {
-            if let JSXAttributeItem::SpreadAttribute(spread) = &attributes[0] {
-                return Ok(spread.argument.clone_in(self.allocator));
-            }
+        if attributes.len() == 1
+            && let JSXAttributeItem::SpreadAttribute(spread) = &attributes[0]
+        {
+            return Ok(spread.argument.clone_in(self.allocator));
         }
         let mut prop_objects = std::vec::Vec::new();
         let mut running_props = std::vec::Vec::new();
@@ -1346,7 +1352,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                         &name,
                         self.ast().expression_string_literal(
                             attr.span,
-                            self.ast().atom(&value),
+                            self.ast().str(&value),
                             None,
                         ),
                     ),
@@ -1397,7 +1403,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                     if !text.is_empty() {
                         nodes.push(self.ast().expression_string_literal(
                             span,
-                            self.ast().atom(&text),
+                            self.ast().str(&text),
                             None,
                         ));
                     }
@@ -1532,7 +1538,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
 
     fn marker_string(&self, span: Span, marker: &str) -> Expression<'a> {
         self.ast()
-            .expression_string_literal(span, self.ast().atom(marker), None)
+            .expression_string_literal(span, self.ast().str(marker), None)
     }
 
     pub(crate) fn lower_fragment(&mut self, fragment: &JSXFragment<'a>) -> Result<Expression<'a>> {
@@ -1638,7 +1644,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             PlanValue::Literal(text) => {
                 if reserved || child_properties(&key) {
                     self.ast()
-                        .expression_string_literal(span, self.ast().atom(&text), None)
+                        .expression_string_literal(span, self.ast().str(&text), None)
                 } else {
                     if key == "$ServerOnly" {
                         return Ok(());
@@ -1782,7 +1788,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
         self.uses_ssr_attribute = true;
         let name_literal = self
             .ast()
-            .expression_string_literal(span, self.ast().atom(name), None);
+            .expression_string_literal(span, self.ast().str(name), None);
         let attr = self.helper_call(span, "_$ssrAttribute", vec![name_literal, value]);
         if is_dynamic {
             let arrow = self.arrow_return_expression(span, attr);
@@ -1836,7 +1842,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                     escaped_key,
                     oxc_ast::ast::BinaryOperator::Addition,
                     self.ast()
-                        .expression_string_literal(span, self.ast().atom(":"), None),
+                        .expression_string_literal(span, self.ast().str(":"), None),
                 );
                 self.helper_call(span, "_$ssrStyleProperty", vec![prefix, value_escaped])
             } else {
@@ -1845,7 +1851,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                 let prefix = format!("{}{}:", if index > 0 { ";" } else { "" }, key);
                 let prefix =
                     self.ast()
-                        .expression_string_literal(span, self.ast().atom(&prefix), None);
+                        .expression_string_literal(span, self.ast().str(&prefix), None);
                 self.helper_call(span, "_$ssrStyleProperty", vec![prefix, value_escaped])
             };
             parts.push(part);
@@ -1885,7 +1891,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             if values.is_empty() {
                 return self.ast().expression_string_literal(
                     span,
-                    self.ast().atom(&quasis[0]),
+                    self.ast().str(&quasis[0]),
                     None,
                 );
             }
@@ -1960,10 +1966,9 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                 continue;
             }
             let key_expression = match static_key {
-                Some(key) => {
-                    self.ast()
-                        .expression_string_literal(span, self.ast().atom(&key), None)
-                }
+                Some(key) => self
+                    .ast()
+                    .expression_string_literal(span, self.ast().str(&key), None),
                 None => self.escaped_classlist_key(span, property),
             };
             values.push(
@@ -1972,7 +1977,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                     property.value.clone_in(self.allocator),
                     key_expression,
                     self.ast()
-                        .expression_string_literal(span, self.ast().atom(""), None),
+                        .expression_string_literal(span, self.ast().str(""), None),
                 ),
             );
             quasis.push(if is_last {
@@ -2011,8 +2016,8 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
         let elements =
             self.ast()
                 .vec_from_iter(quasis.into_iter().enumerate().map(|(index, raw)| {
-                    let atom = self.ast().atom(&raw);
-                    self.ast().template_element(
+                    let atom = self.ast().str(&raw);
+                    self.ast().template_element_with_lone_surrogates(
                         SPAN,
                         oxc_ast::ast::TemplateElementValue {
                             raw: atom,
@@ -2043,7 +2048,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                 value,
                 oxc_ast::ast::LogicalOperator::Or,
                 self.ast()
-                    .expression_string_literal(span, self.ast().atom(" "), None),
+                    .expression_string_literal(span, self.ast().str(" "), None),
             )
         } else {
             value
@@ -2057,6 +2062,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             do_not_escape: key == "innerHTML",
             groupable: key == "textContent",
             marker_static,
+            can_allocate_ids: key == "children",
         })
     }
 
@@ -2214,6 +2220,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             do_not_escape,
             groupable,
             marker_static,
+            can_allocate_ids,
         } = children;
         let do_not_escape = do_not_escape || element_do_not_escape;
         // Literal after folding — Babel's `getStaticExpression` text path.
@@ -2238,7 +2245,14 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             _ => {}
         }
         let dynamic = !marker_static && self.classify().is_dynamic(None, &value, false);
-        let allocates = self.hydratable && expression_can_return_hydratable_child(&value);
+        // Only the `children` attribute redirect may take the `_$scope` id
+        // reservation — it is a real insert on the client and scopes there
+        // too. innerHTML/textContent/innerText values are opaque content (an
+        // HTML/text string) the client applies as plain prop effects with no
+        // owner; a scope here would reserve a hydration child id the client
+        // never allocates, shifting every keyed sibling after it (#3015).
+        let allocates =
+            self.hydratable && can_allocate_ids && expression_can_return_hydratable_child(&value);
         let value = self.dynamic_child_value(span, value, dynamic);
         let value = if do_not_escape {
             value
@@ -2321,7 +2335,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             span,
             self.ast()
                 .expression_identifier(span, self.ast().ident("_$ssr")),
-            NONE,
+            None,
             args,
             false,
         )
@@ -2333,7 +2347,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             span,
             self.ast()
                 .expression_identifier(span, self.ast().ident("_$ssrHydrationKey")),
-            NONE,
+            None,
             self.ast().vec(),
             false,
         )
@@ -2345,7 +2359,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             span,
             self.ast()
                 .expression_identifier(span, self.ast().ident("_$scope")),
-            NONE,
+            None,
             self.ast().vec1(expression_to_argument(value)),
             false,
         )
@@ -2357,7 +2371,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             span,
             self.ast()
                 .expression_identifier(span, self.ast().ident("_$escape")),
-            NONE,
+            None,
             self.ast().vec1(expression_to_argument(value)),
             false,
         )
@@ -2369,7 +2383,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             span,
             self.ast()
                 .expression_identifier(span, self.ast().ident("_$escape")),
-            NONE,
+            None,
             self.ast().vec_from_array([
                 expression_to_argument(value),
                 Argument::BooleanLiteral(self.ast().alloc_boolean_literal(span, true)),
@@ -2411,7 +2425,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                     let escaped = escape_static(&literal.value);
                     *value = self.ast().expression_string_literal(
                         literal.span,
-                        self.ast().atom(&escaped),
+                        self.ast().str(&escaped),
                         None,
                     );
                 }
@@ -2422,15 +2436,17 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                     let escaped = escape_static(&template.quasis[0].value.raw);
                     *value = self.ast().expression_string_literal(
                         template.span,
-                        self.ast().atom(&escaped),
+                        self.ast().str(&escaped),
                         None,
                     );
                 }
             }
             Expression::ArrowFunctionExpression(arrow) => {
-                let expression_body = arrow.expression;
-                let statements: &mut ArenaVec<'a, Statement<'a>> = &mut arrow.body.statements;
-                self.escape_body_returns(statements, expression_body, attr, escape_literals);
+                if let Some(expression) = arrow.get_expression_mut() {
+                    self.escape_expression_in_place(expression, attr, escape_literals);
+                } else if let Some(body) = arrow.get_function_body_mut() {
+                    self.escape_body_returns(&mut body.statements, false, attr, escape_literals);
+                }
             }
             Expression::FunctionExpression(function) => {
                 if let Some(body) = function.body.as_mut() {
@@ -2438,6 +2454,13 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                 }
             }
             Expression::TemplateLiteral(template) => {
+                // Interpolations are escaped recursively. The static quasis
+                // are not — `url("${x}")` would otherwise leave a raw `"`
+                // inside style="..." / attr="...". Escape those parts at
+                // compile time when this expression is landing in an attribute.
+                if attr {
+                    self.escape_template_quasis_for_attr(template);
+                }
                 for expression in template.expressions.iter_mut() {
                     self.escape_expression_in_place(expression, attr, escape_literals);
                 }
@@ -2466,15 +2489,16 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             {
                 match &mut call.callee {
                     Expression::ArrowFunctionExpression(arrow) => {
-                        let expression_body = arrow.expression;
-                        let statements: &mut ArenaVec<'a, Statement<'a>> =
-                            &mut arrow.body.statements;
-                        self.escape_body_returns(
-                            statements,
-                            expression_body,
-                            attr,
-                            escape_literals,
-                        );
+                        if let Some(expression) = arrow.get_expression_mut() {
+                            self.escape_expression_in_place(expression, attr, escape_literals);
+                        } else if let Some(body) = arrow.get_function_body_mut() {
+                            self.escape_body_returns(
+                                &mut body.statements,
+                                false,
+                                attr,
+                                escape_literals,
+                            );
+                        }
                     }
                     Expression::FunctionExpression(function) => {
                         if let Some(body) = function.body.as_mut() {
@@ -2507,6 +2531,41 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
                     self.escape_expression(span, inner)
                 };
             }
+        }
+    }
+
+    /// Escape static template-literal quasis in attribute position so
+    /// `url("${x}")` cannot leave a raw `"` inside style="..." / attr="...".
+    fn escape_template_quasis_for_attr(&self, template: &mut oxc_ast::ast::TemplateLiteral<'a>) {
+        let specs: std::vec::Vec<Option<(String, String)>> = template
+            .quasis
+            .iter()
+            .map(|quasi| {
+                let src = quasi
+                    .value
+                    .cooked
+                    .as_deref()
+                    .unwrap_or(quasi.value.raw.as_str());
+                let escaped = escape_html_attribute(src);
+                if escaped == src {
+                    None
+                } else {
+                    let raw = escaped
+                        .replace('\\', "\\\\")
+                        .replace('`', "\\`")
+                        .replace("${", "\\${");
+                    Some((escaped, raw))
+                }
+            })
+            .collect();
+        for (quasi, spec) in template.quasis.iter_mut().zip(specs) {
+            let Some((cooked, raw)) = spec else {
+                continue;
+            };
+            let cooked_atom = self.ast().str(&cooked);
+            let raw_atom = self.ast().str(&raw);
+            quasi.value.cooked = Some(cooked_atom);
+            quasi.value.raw = raw_atom;
         }
     }
 
@@ -2556,16 +2615,21 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             return init;
         };
         let mut arrow = arrow.unbox();
-        if arrow.params.items.is_empty() && arrow.body.statements.len() == 1 {
-            let statement = arrow.body.statements.pop().expect("length checked");
-            match statement {
-                Statement::ReturnStatement(ret) if ret.argument.is_some() => {
-                    return ret.unbox().argument.expect("checked in guard");
+        if arrow.params.items.is_empty() {
+            if arrow.is_expression() {
+                return arrow.body.into_expression();
+            }
+            let body = arrow
+                .get_function_body_mut()
+                .expect("block arrow has a function body");
+            if body.statements.len() == 1 {
+                let statement = body.statements.pop().expect("length checked");
+                match statement {
+                    Statement::ReturnStatement(ret) if ret.argument.is_some() => {
+                        return ret.unbox().argument.expect("checked in guard");
+                    }
+                    other => body.statements.push(other),
                 }
-                Statement::ExpressionStatement(statement) if arrow.expression => {
-                    return statement.unbox().expression;
-                }
-                other => arrow.body.statements.push(other),
             }
         }
         Expression::ArrowFunctionExpression(self.ast().alloc(arrow))
@@ -2583,12 +2647,14 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
             &value,
             Expression::ArrowFunctionExpression(arrow)
                 if arrow.params.items.is_empty()
-                    && arrow.body.statements.len() == 1
-                    && matches!(
-                        arrow.body.statements.first(),
-                        Some(Statement::ReturnStatement(_))
-                            | Some(Statement::ExpressionStatement(_))
-                    )
+                    && (arrow.is_expression()
+                        || arrow.get_function_body().is_some_and(|body| {
+                            body.statements.len() == 1
+                                && matches!(
+                                    body.statements.first(),
+                                    Some(Statement::ReturnStatement(_))
+                                )
+                        }))
         );
         if unwrappable {
             let body = self.unwrap_expression_arrow(value);
@@ -2624,7 +2690,7 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
         self.ast().expression_call(
             span,
             callee,
-            NONE,
+            None,
             self.ast()
                 .vec_from_iter(args.into_iter().map(expression_to_argument)),
             false,
@@ -2717,7 +2783,7 @@ fn component_children_getter_statements<'a>(
             match first {
                 Argument::ArrowFunctionExpression(arrow) => {
                     let arrow = arrow.unbox();
-                    function_body_statements(allocator, span, arrow.expression, arrow.body)
+                    crate::shared::ast::arrow_body_statements(allocator, span, arrow.body)
                 }
                 Argument::FunctionExpression(function) => match function.unbox().body {
                     Some(body) => function_body_statements(allocator, span, false, body),
@@ -2728,7 +2794,7 @@ fn component_children_getter_statements<'a>(
         }
         Expression::ArrowFunctionExpression(arrow) => {
             let arrow = arrow.unbox();
-            function_body_statements(allocator, span, arrow.expression, arrow.body)
+            crate::shared::ast::arrow_body_statements(allocator, span, arrow.body)
         }
         Expression::FunctionExpression(function) => match function.unbox().body {
             Some(body) => function_body_statements(allocator, span, false, body),
@@ -2839,7 +2905,7 @@ impl<'a> AstSsrTransform<'a, '_> {
         self.statement_depth += 1;
         self.bindings
             .enter_scope(crate::shared::bindings::BindingScopeKind::Block);
-        let mut body = ArenaVec::new_in(self.allocator);
+        let mut body = ArenaVec::new_in(&self.allocator);
         for mut statement in statements.drain(..) {
             if self.error.is_some() {
                 body.push(statement);
@@ -2877,11 +2943,10 @@ impl<'a> AstSsrTransform<'a, '_> {
                     self.function_parent_stack.last(),
                     Some(crate::shared::transform::FunctionParentKind::ClassMethod)
                 )
+                && let Some(capture) = self.take_this_capture_statement(statement.span())
             {
-                if let Some(capture) = self.take_this_capture_statement(statement.span()) {
-                    body.push(capture);
-                    self.clear_this_capture_context();
-                }
+                body.push(capture);
+                self.clear_this_capture_context();
             }
             for pending in self.pending_statements.drain(..) {
                 body.push(pending);
@@ -2908,32 +2973,40 @@ impl<'a> AstSsrTransform<'a, '_> {
         value: Expression<'a>,
     ) -> Expression<'a> {
         if let Expression::ArrowFunctionExpression(mut arrow) = value {
-            if arrow.expression && arrow.body.statements.len() == 1 {
-                if let Some(Statement::ExpressionStatement(statement)) = arrow.body.statements.pop()
-                {
-                    let mut expression = statement.unbox().expression;
-                    // The arrow is the JSX root's function parent — keep it on
-                    // the stack so the root-completion wrap doesn't fire and
-                    // the capture lands at the top of the arrow body instead.
-                    // Its var scope collects the expression-position `_v$`
-                    // hoists (Babel's `scope.push` targets the arrow).
-                    self.function_parent_stack
-                        .push(crate::shared::transform::FunctionParentKind::Arrow);
-                    self.push_var_scope(VarScopeKind::Collector);
-                    self.visit_expression(&mut expression);
-                    let vars = self.pop_var_scope();
-                    self.function_parent_stack.pop();
-                    arrow.expression = false;
-                    let mut statements = self.ast().vec();
-                    if let Some(capture) = self.take_this_capture_statement(span) {
-                        statements.push(capture);
-                        self.clear_this_capture_context();
-                    }
-                    statements.extend(self.bare_var_declaration(&vars));
-                    statements.push(self.ast().statement_return(span, Some(expression)));
-                    arrow.body.statements = statements;
-                    return Expression::ArrowFunctionExpression(arrow);
+            if arrow.is_expression() {
+                let placeholder = self.ast().expression_null_literal(span);
+                let mut expression = std::mem::replace(
+                    arrow
+                        .get_expression_mut()
+                        .expect("expression arrow has an expression body"),
+                    placeholder,
+                );
+                // The arrow is the JSX root's function parent — keep it on
+                // the stack so the root-completion wrap doesn't fire and
+                // the capture lands at the top of the arrow body instead.
+                // Its var scope collects the expression-position `_v$`
+                // hoists (Babel's `scope.push` targets the arrow).
+                self.function_parent_stack
+                    .push(crate::shared::transform::FunctionParentKind::Arrow);
+                self.push_var_scope(VarScopeKind::Collector);
+                self.visit_expression(&mut expression);
+                let vars = self.pop_var_scope();
+                self.function_parent_stack.pop();
+                let mut statements = self.ast().vec();
+                if let Some(capture) = self.take_this_capture_statement(span) {
+                    statements.push(capture);
+                    self.clear_this_capture_context();
                 }
+                statements.extend(self.bare_var_declaration(&vars));
+                statements.push(self.ast().statement_return(span, Some(expression)));
+                arrow.body = self
+                    .ast()
+                    .arrow_function_body_block(self.ast().function_body(
+                        span,
+                        self.ast().vec(),
+                        statements,
+                    ));
+                return Expression::ArrowFunctionExpression(arrow);
             }
             return Expression::ArrowFunctionExpression(arrow);
         }
@@ -3096,9 +3169,8 @@ fn record_statement_jsx_spans(statement: &Statement<'_>, spans: &mut std::vec::V
                 }
             }
         }
-        Statement::ExportNamedDeclaration(export) => {
-            if let Some(oxc_ast::ast::Declaration::VariableDeclaration(declaration)) =
-                &export.declaration
+        Statement::ExportDeclaration(export) => {
+            if let oxc_ast::ast::Declaration::VariableDeclaration(declaration) = &export.declaration
             {
                 for declarator in &declaration.declarations {
                     if let Some(span) = declarator.init.as_ref().and_then(jsx_span) {

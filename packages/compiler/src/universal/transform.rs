@@ -1,23 +1,21 @@
 use crate::error::{Error, Result};
 use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
-use oxc_ast::{
-    ast::{
-        Argument, Expression, JSXAttributeItem, JSXAttributeValue, JSXChild, JSXElement,
-        JSXExpression, JSXFragment, ObjectPropertyKind, Program, Statement,
-    },
-    AstBuilder,
+use oxc_ast::ast::{
+    Argument, Expression, JSXAttributeItem, JSXAttributeValue, JSXChild, JSXElement, JSXExpression,
+    JSXFragment, ObjectPropertyKind, Program, Statement,
 };
 use oxc_ast_visit::VisitMut;
 use oxc_span::{GetSpan, Span};
 
-use crate::dom::element::{jsx_expression_to_expression, AstDomTransform, DomTransformConfig};
+use crate::dom::element::{AstDomTransform, DomTransformConfig, jsx_expression_to_expression};
 use crate::shared::ast::{arrow_return_expression, expression_to_argument, object_method_property};
+use crate::shared::ast_builder::AstBuilder;
 use crate::shared::bindings::BindingTable;
 use crate::shared::classify::Classify;
 use crate::shared::component_props::ComponentPropContext;
 use crate::shared::condition::{
-    is_condition_shape, memo_wrap_thunk, transform_condition, transform_condition_inline,
-    zero_arg_call_thunk, ConditionBuilder,
+    ConditionBuilder, is_condition_shape, memo_wrap_thunk, transform_condition,
+    transform_condition_inline, zero_arg_call_thunk,
 };
 use crate::shared::refs::{assignment_fallback, callable_test};
 use crate::shared::utils::{
@@ -301,7 +299,7 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
             statements.push(self.import_named(built_in, &format!("_${built_in}")));
         }
         statements.extend(program.body.drain(..));
-        let mut body = ArenaVec::new_in(self.allocator);
+        let mut body = ArenaVec::new_in(&self.allocator);
         body.extend(statements);
         program.body = body;
     }
@@ -398,10 +396,10 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
         // exprs/dynamics) inlines as its `createElement(...)` expression.
         if result.exprs.is_empty() && result.dynamics.is_empty() && result.declarations.len() == 1 {
             let mut declarations = result.declarations;
-            if let Some(Statement::VariableDeclaration(mut declaration)) = declarations.pop() {
-                if let Some(init) = declaration.declarations[0].init.take() {
-                    return Ok((init, std::vec::Vec::new()));
-                }
+            if let Some(Statement::VariableDeclaration(mut declaration)) = declarations.pop()
+                && let Some(init) = declaration.declarations[0].init.take()
+            {
+                return Ok((init, std::vec::Vec::new()));
             }
             unreachable!("single native declaration is always `var _el$ = createElement(...)`");
         }
@@ -571,7 +569,7 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
                 // Babel passes the raw attribute source string through.
                 let value = self.ast().expression_string_literal(
                     value.span,
-                    self.ast().atom(&value.value),
+                    self.ast().str(&value.value),
                     None,
                 );
                 self.add_static_attr(
@@ -731,7 +729,7 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
                                 Some(JSXAttributeValue::StringLiteral(value)) => {
                                     self.ast().expression_string_literal(
                                         value.span,
-                                        self.ast().atom(&value.value),
+                                        self.ast().str(&value.value),
                                         None,
                                     )
                                 }
@@ -979,11 +977,11 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
             }
         }
 
-        if plans.is_empty() {
-            if let Some(container) = children_attr {
-                significant += 1;
-                self.plan_expression_child(container, &mut plans)?;
-            }
+        if plans.is_empty()
+            && let Some(container) = children_attr
+        {
+            significant += 1;
+            self.plan_expression_child(container, &mut plans)?;
         }
 
         let multi = significant > 1;
@@ -991,10 +989,10 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
         // Text nodes get hoisted ids in multi-child mode so they can serve as
         // insertion anchors.
         for plan in &mut plans {
-            if let ChildPlan::Text { id, .. } = plan {
-                if multi {
-                    *id = Some(self.next_element_id());
-                }
+            if let ChildPlan::Text { id, .. } = plan
+                && multi
+            {
+                *id = Some(self.next_element_id());
             }
         }
 
@@ -1241,8 +1239,8 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
                 self.ast().vec(),
                 self.ast()
                     .binding_pattern_binding_identifier(span, self.ast().ident(name)),
-                oxc_ast::NONE,
-                oxc_ast::NONE,
+                None,
+                None,
                 false,
                 None,
                 false,
@@ -1253,18 +1251,11 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
             span,
             oxc_ast::ast::FormalParameterKind::ArrowFormalParameters,
             params,
-            oxc_ast::NONE,
+            None,
         );
         let body = self.ast().function_body(span, self.ast().vec(), statements);
-        self.ast().expression_arrow_function(
-            span,
-            false,
-            false,
-            oxc_ast::NONE,
-            params,
-            oxc_ast::NONE,
-            body,
-        )
+        self.ast()
+            .expression_arrow_function(span, false, false, None, params, None, body)
     }
 
     /// `({ a, b }, _p$) => { ... }`
@@ -1286,15 +1277,15 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
                 false,
             )
         }));
-        let object_pattern =
-            self.ast()
-                .binding_pattern_object_pattern(span, properties, oxc_ast::NONE);
+        let object_pattern = self
+            .ast()
+            .binding_pattern_object_pattern(span, properties, None);
         let first = self.ast().formal_parameter(
             span,
             self.ast().vec(),
             object_pattern,
-            oxc_ast::NONE,
-            oxc_ast::NONE,
+            None,
+            None,
             false,
             None,
             false,
@@ -1305,8 +1296,8 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
             self.ast().vec(),
             self.ast()
                 .binding_pattern_binding_identifier(span, self.ast().ident(prev_name)),
-            oxc_ast::NONE,
-            oxc_ast::NONE,
+            None,
+            None,
             false,
             None,
             false,
@@ -1319,18 +1310,11 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
             span,
             oxc_ast::ast::FormalParameterKind::ArrowFormalParameters,
             params_vec,
-            oxc_ast::NONE,
+            None,
         );
         let body = self.ast().function_body(span, self.ast().vec(), statements);
-        self.ast().expression_arrow_function(
-            span,
-            false,
-            false,
-            oxc_ast::NONE,
-            params,
-            oxc_ast::NONE,
-            body,
-        )
+        self.ast()
+            .expression_arrow_function(span, false, false, None, params, None, body)
     }
 
     fn lower_component(
@@ -1560,7 +1544,7 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
     pub(crate) fn process_statements(&mut self, statements: &mut ArenaVec<'a, Statement<'a>>) {
         self.statement_depth += 1;
         self.enter_binding_scope(crate::shared::bindings::BindingScopeKind::Block);
-        let mut body = ArenaVec::new_in(self.allocator);
+        let mut body = ArenaVec::new_in(&self.allocator);
         for mut statement in statements.drain(..) {
             if self.error.is_some() {
                 body.push(statement);
@@ -1573,11 +1557,11 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
                 // the capture precedes the setup statements that use it.
                 // `getStatementParent().insertBefore` targets the JSX's own
                 // statement wherever it nests, so no depth gate applies.
-                if self.in_class_method_scope() {
-                    if let Some(capture) = self.take_this_capture_statement(statement.span()) {
-                        body.push(capture);
-                        self.clear_this_capture_context();
-                    }
+                if self.in_class_method_scope()
+                    && let Some(capture) = self.take_this_capture_statement(statement.span())
+                {
+                    body.push(capture);
+                    self.clear_this_capture_context();
                 }
                 body.extend(setup);
                 self.collect_bindings(&statement);
@@ -1586,11 +1570,11 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
             }
             if let Some(setup) = self.lower_return_jsx(&mut statement) {
                 self.lower_deferred_statement_jsx(&mut statement);
-                if self.in_class_method_scope() {
-                    if let Some(capture) = self.take_this_capture_statement(statement.span()) {
-                        body.push(capture);
-                        self.clear_this_capture_context();
-                    }
+                if self.in_class_method_scope()
+                    && let Some(capture) = self.take_this_capture_statement(statement.span())
+                {
+                    body.push(capture);
+                    self.clear_this_capture_context();
                 }
                 body.extend(setup);
                 body.push(statement);
@@ -1599,11 +1583,11 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
             self.visit_statement(&mut statement);
             self.lower_deferred_statement_jsx(&mut statement);
             self.collect_bindings(&statement);
-            if self.in_class_method_scope() {
-                if let Some(capture) = self.take_this_capture_statement(statement.span()) {
-                    body.push(capture);
-                    self.clear_this_capture_context();
-                }
+            if self.in_class_method_scope()
+                && let Some(capture) = self.take_this_capture_statement(statement.span())
+            {
+                body.push(capture);
+                self.clear_this_capture_context();
             }
             body.push(statement);
         }
@@ -1624,8 +1608,8 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
         // targets the whole statement, including through `export const`.
         let declaration = match statement {
             Statement::VariableDeclaration(declaration) => declaration,
-            Statement::ExportNamedDeclaration(export) => match &mut export.declaration {
-                Some(oxc_ast::ast::Declaration::VariableDeclaration(declaration)) => declaration,
+            Statement::ExportDeclaration(export) => match &mut export.declaration {
+                oxc_ast::ast::Declaration::VariableDeclaration(declaration) => declaration,
                 _ => return None,
             },
             _ => return None,

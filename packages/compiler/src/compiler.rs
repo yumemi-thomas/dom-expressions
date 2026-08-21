@@ -155,23 +155,23 @@ fn compile_inner(source: &str, options: &CompileOptions) -> Result<CompileOutput
         })
         .parse();
 
-    if let Some(error) = parsed.errors.into_iter().next() {
-        return Err(CompileError::parse(error.to_string()));
+    if let Some(error) = crate::shared::parser::first_parser_error(parsed.diagnostics) {
+        return Err(CompileError::parse(error));
     }
 
-    if let Some(lib) = options.require_import_source.as_deref() {
-        if !has_jsx_import_source(&parsed.program, source, lib) {
-            if options.semantic_trace {
-                return Err(CompileError::configuration(
-                    "semantic tracing cannot claim coverage for a file skipped by requireImportSource",
-                ));
-            }
-            return Ok(CompileOutput {
-                code: source.to_string(),
-                source_map: None,
-                semantic_trace: None,
-            });
+    if let Some(lib) = options.require_import_source.as_deref()
+        && !has_jsx_import_source(&parsed.program, source, lib)
+    {
+        if options.semantic_trace {
+            return Err(CompileError::configuration(
+                "semantic tracing cannot claim coverage for a file skipped by requireImportSource",
+            ));
         }
+        return Ok(CompileOutput {
+            code: source.to_string(),
+            source_map: None,
+            semantic_trace: None,
+        });
     }
 
     let mut program = parsed.program;

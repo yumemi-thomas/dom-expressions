@@ -20,6 +20,7 @@ import {
   ERROR_HEADER,
   FUNCTION_HEADER,
   INSTANCE_HEADER,
+  LIVE_SOURCE,
   SERVER_FUNCTION_METADATA,
   SINGLE_FLIGHT_HEADER,
   configureServerFunctionsCodec,
@@ -28,11 +29,12 @@ import {
   encodeErrorHeaderValue,
   extractBody,
   getHeadersAndBody,
+  getServerFunctionMetadata,
   getServerFunctionsCodec,
   isJSONSafe,
   isServerFunction,
   provideServerFunctionRPC,
-  serializeStream,
+  createChunk,
   withMeta
 } from "./shared.js";
 
@@ -63,7 +65,8 @@ const config = {
   transformFlightResult: undefined,
   transformDirectResult: undefined,
   handleNoJS: undefined,
-  endpoint: "/_server"
+  endpoint: "/_server",
+  csrf: true
 };
 
 /**
@@ -93,6 +96,7 @@ export function configureServerFunctionsServer({
   transformDirectResult,
   handleNoJS,
   endpoint,
+  csrf,
   codec
 } = {}) {
   if (provideEvent !== undefined) config.provideEvent = provideEvent;
@@ -103,6 +107,7 @@ export function configureServerFunctionsServer({
   if (transformDirectResult !== undefined) config.transformDirectResult = transformDirectResult;
   if (handleNoJS !== undefined) config.handleNoJS = handleNoJS;
   if (endpoint !== undefined) config.endpoint = endpoint;
+  if (csrf !== undefined) config.csrf = csrf;
   if (codec !== undefined) configureServerFunctionsCodec(codec);
 }
 
@@ -254,6 +259,55 @@ export function GET(fn) {
   METHODS.set(fn.id, "GET");
   // the declaration itself is a metadata write like any other
   return withMeta(fn, { method: "GET" });
+}
+
+/**
+ * Declares a value-shaped live source: a server function returning an async
+ * iterable whose yields are successive VALUES of one logical query (latest
+ * wins), not events to be accumulated. The declaration is what buys the
+ * managed lifecycle — on the client the reference gains reconnect-with-
+ * backoff and connection sharing (see the client half); faces detect the
+ * declaration on the VALUE via the `LIVE_SOURCE` brand (e.g. SSR taking
+ * the first value and handing the stream to the client rather than
+ * draining it).
+ *
+ * Unlike `GET` (a pure metadata write), `live` carries behavior — so the
+ * behavior lives INSIDE the declaration and treeshakes with it: nothing in
+ * the dispatch path or the shared layer knows live exists; a build that
+ * never imports `live` carries none of this. The server half's whole
+ * behavior is the value brand: in-process calls (SSR) meet the result
+ * after it has left the reference's hands, so the brand must travel on the
+ * value. Dispatch is untouched — over-the-wire calls stream the raw
+ * registered function's result exactly as before. Composes with `GET` but
+ * does not imply it; declare live outermost (`live(GET(fn))`), matching
+ * the client half where live's behavior wraps the call.
+ *
+ * ```ts
+ * export const stockPrice = live(async function* (symbol: string) {
+ *   "use server";
+ *   for await (const tick of subscribe(symbol)) yield tick.price;
+ * });
+ * ```
+ */
+export function live(fn) {
+  if (!isServerFunction(fn) || typeof fn.id !== "string") {
+    throw new Error("live expects a server function reference");
+  }
+  const metadata = { ...getServerFunctionMetadata(fn), live: true };
+  const wrapped = async (...args) => {
+    const result = await fn(...args);
+    if (result !== null && typeof result === "object" && result[Symbol.asyncIterator]) {
+      result[LIVE_SOURCE] = true;
+    }
+    return result;
+  };
+  wrapped[SERVER_FUNCTION_METADATA] = metadata;
+  wrapped.id = fn.id;
+  Object.defineProperty(wrapped, "url", {
+    get: () => fn.url,
+    configurable: true
+  });
+  return wrapped;
 }
 
 /**
@@ -557,13 +611,132 @@ function isFormPost(request) {
   );
 }
 
-function serializedResponse(value, headers, codec) {
-  headers.set(BODY_FORMAT_HEADER, BodyFormat.Serialized);
-  headers.set("Content-Type", "text/plain");
-  return new Response(serializeStream(value, codec), { headers });
+/**
+ * The response-side codec stream: `serializeStream` (shared.js) hardened
+ * with request-lifetime teardown. Server-only on purpose — the shared half
+ * is re-exported into client bundles, where this plumbing is dead weight.
+ *
+ * An abort of `signal` (the platform fires request.signal when the caller's
+ * fetch aborts or the tab goes away) or the consumer cancelling the
+ * ReadableStream (how platforms surface a dropped connection to the body)
+ * stops pending serialization and tears down a top-level async-iterable
+ * value — the producer's `iterator.return()` runs, so generator `finally`
+ * blocks execute instead of the server pumping a stream nobody is reading.
+ * Top-level only: that is the value-tier shape ("return a stream from the
+ * server function"); iterables nested inside user objects are consumed by
+ * the codec directly and stay untouched.
+ */
+export function serializeResponseStream(value, codecOptions, signal) {
+  let closeIterator = null;
+  let closed = false;
+  let cancelSerialize = null;
+  let onAbort = null;
+  const teardown = () => {
+    if (closed) return;
+    closed = true;
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+    if (cancelSerialize) cancelSerialize();
+    if (closeIterator) closeIterator();
+  };
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    typeof value[Symbol.asyncIterator] === "function"
+  ) {
+    // Teardown-aware wrapper, installed BEFORE the codec sees the value:
+    // seroval's stream pump has no cancellation of its own — once it holds
+    // the iterator it pulls until done — so this wrapper is the only seam
+    // where a dropped consumer can stop the producer. The codec only ever
+    // calls next(), so that is all the wrapper exposes.
+    const source = value;
+    value = {
+      [Symbol.asyncIterator]() {
+        const it = source[Symbol.asyncIterator]();
+        let finished = false;
+        closeIterator = () => {
+          if (finished) return;
+          finished = true;
+          try {
+            const returned = it.return && it.return();
+            if (returned && typeof returned.then === "function") returned.then(undefined, () => {});
+          } catch {}
+        };
+        // torn down before the codec opened the value (abort raced the
+        // codec load): close the source immediately, never pull
+        if (closed) closeIterator();
+        return {
+          next: () => (finished ? Promise.resolve({ done: true, value: undefined }) : it.next())
+        };
+      }
+    };
+  }
+  return new ReadableStream({
+    // async on purpose: the codec is late-loaded (see the loading notes at
+    // the top of shared.js), and a ReadableStream start may return a
+    // promise — reads wait for it, so the stream's contract is unchanged
+    async start(controller) {
+      if (signal) {
+        if (signal.aborted) {
+          teardown();
+          controller.close();
+          return;
+        }
+        // Beyond producer teardown, an abort must TERMINATE the stream for
+        // anyone still reading it (an in-process consumer's drain would
+        // otherwise hang on a stream nobody will ever close). The cancel()
+        // path below must NOT do this — there the stream is already
+        // cancelled and the controller unusable.
+        onAbort = () => {
+          const alreadyClosed = closed;
+          teardown();
+          if (!alreadyClosed) {
+            try {
+              controller.error(signal.reason || new Error("The operation was aborted."));
+            } catch {}
+          }
+        };
+        signal.addEventListener("abort", onAbort);
+      }
+      const { serializeJSON } = await import("../serializer.js");
+      if (closed) {
+        // torn down while the codec was loading; nothing was started
+        try {
+          controller.close();
+        } catch {}
+        return;
+      }
+      cancelSerialize = serializeJSON(value, {
+        ...codecOptions,
+        onParse(node) {
+          if (!closed) controller.enqueue(createChunk(JSON.stringify(node)));
+        },
+        onDone() {
+          if (closed) return;
+          closed = true;
+          if (onAbort) signal.removeEventListener("abort", onAbort);
+          controller.close();
+        },
+        onError(error) {
+          if (closed) return;
+          closed = true;
+          if (onAbort) signal.removeEventListener("abort", onAbort);
+          controller.error(error);
+        }
+      });
+    },
+    cancel() {
+      teardown();
+    }
+  });
 }
 
-function encodeResult(value, headers, status, codec) {
+function serializedResponse(value, headers, codec, signal) {
+  headers.set(BODY_FORMAT_HEADER, BodyFormat.Serialized);
+  headers.set("Content-Type", "text/plain");
+  return new Response(serializeResponseStream(value, codec, signal), { headers });
+}
+
+function encodeResult(value, headers, status, codec, signal) {
   const direct = getHeadersAndBody(value);
   if (direct) {
     for (const [key, val] of Object.entries(direct.headers || {})) {
@@ -603,7 +776,7 @@ function encodeResult(value, headers, status, codec) {
     // fall through — serializedResponse overwrites the format headers the
     // JSON attempt may have set before stringify threw
   }
-  const response = serializedResponse(value, headers, codec);
+  const response = serializedResponse(value, headers, codec, signal);
   return status === 200 ? response : new Response(response.body, { status, headers });
 }
 
@@ -663,6 +836,76 @@ export function sanitizeServerError(value) {
   return new Error(GENERIC_SERVER_ERROR_MESSAGE);
 }
 
+// Client-only inspection seam. Present as a no-op so isomorphic
+// `@solidjs/web/server-functions` imports resolve on the server entry.
+export function observeServerFunctionCalls() {
+  return () => {};
+}
+
+async function matchesOrigin(origin, request, matcher) {
+  if (matcher === undefined) return origin === new URL(request.url).origin;
+  if (typeof matcher === "function") return !!(await matcher(origin, request));
+  return Array.isArray(matcher) ? matcher.includes(origin) : origin === matcher;
+}
+
+async function allowsServerFunctionRequest(request, options) {
+  const fetchSite = request.headers.get("Sec-Fetch-Site");
+  if (fetchSite === "same-origin") return true;
+  if (fetchSite === "same-site" || fetchSite === "cross-site" || fetchSite === "none") {
+    return false;
+  }
+
+  const origin = request.headers.get("Origin");
+  if (origin !== null) return matchesOrigin(origin, request, options.origin);
+
+  const referer = request.headers.get("Referer");
+  if (referer !== null) {
+    try {
+      return matchesOrigin(new URL(referer).origin, request, options.origin);
+    } catch {
+      return false;
+    }
+  }
+
+  return options.allowRequestsWithoutOriginCheck === true;
+}
+
+const CSRF_VARY = ["Sec-Fetch-Site", "Origin", "Referer"];
+
+function withCSRFVary(response) {
+  const current = response.headers.get("Vary");
+  if (current === "*") return response;
+
+  const values = current ? current.split(",").map(value => value.trim()) : [];
+  const names = new Set(values.map(value => value.toLowerCase()));
+  for (const value of CSRF_VARY) {
+    if (!names.has(value.toLowerCase())) values.push(value);
+  }
+  const vary = values.join(", ");
+
+  try {
+    response.headers.set("Vary", vary);
+    return response;
+  } catch {
+    const headers = new Headers(response.headers);
+    headers.set("Vary", vary);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers
+    });
+  }
+}
+
+function forbiddenResponse() {
+  return withCSRFVary(
+    new Response(DEV ? "Forbidden" : null, {
+      status: 403,
+      headers: { "Cache-Control": "no-store" }
+    })
+  );
+}
+
 /**
  * Web-standard HTTP handler for server function calls. Mount it on the
  * endpoint the client transport targets (default `/_server`).
@@ -710,23 +953,34 @@ export function sanitizeServerError(value) {
  *   `createNoJSHandler()` for browser form posts (redirect back with the
  *   outcome in a flash cookie); other no-instance callers, such as direct
  *   HTTP requests, get the normal serialized response.
+ * - `csrf`: configures same-origin request validation, or disables it with
+ *   `false`. Enabled by default.
  * - `codec`: overrides the configured codec options for this handler.
  */
 export async function handleServerFunctionRequest(request, options = {}) {
   const codec = options.codec !== undefined ? options.codec : getServerFunctionsCodec();
   const url = new URL(request.url);
+  const csrf = options.csrf !== undefined ? options.csrf : config.csrf;
+  const protectsRequest = csrf !== false;
+  if (protectsRequest && !(await allowsServerFunctionRequest(request, csrf === true ? {} : csrf))) {
+    return forbiddenResponse();
+  }
   const instance = request.headers.get(INSTANCE_HEADER);
   const functionId = resolveFunctionId(request, url);
 
   if (!functionId) {
-    return new Response(DEV ? "Server function not found" : null, { status: 404 });
+    const response = new Response(DEV ? "Server function not found" : null, { status: 404 });
+    return protectsRequest ? withCSRFVary(response) : response;
   }
 
   let serverFunction;
   try {
     serverFunction = getServerFunction(functionId);
   } catch {
-    return new Response(DEV ? `Unknown server function: ${functionId}` : null, { status: 404 });
+    const response = new Response(DEV ? `Unknown server function: ${functionId}` : null, {
+      status: 404
+    });
+    return protectsRequest ? withCSRFVary(response) : response;
   }
 
   // method enforcement: GET requests only dispatch to functions that
@@ -736,10 +990,14 @@ export async function handleServerFunctionRequest(request, options = {}) {
   // default transport (e.g. a query()-wrapped function also called
   // directly).
   if (request.method === "GET" && METHODS.get(functionId) !== "GET") {
-    return new Response(DEV ? `Method not allowed for server function: ${functionId}` : null, {
-      status: 405,
-      headers: { Allow: "POST" }
-    });
+    const response = new Response(
+      DEV ? `Method not allowed for server function: ${functionId}` : null,
+      {
+        status: 405,
+        headers: { Allow: "POST" }
+      }
+    );
+    return protectsRequest ? withCSRFVary(response) : response;
   }
 
   const event = options.createEvent ? options.createEvent(request) : { request, locals: {} };
@@ -873,10 +1131,10 @@ export async function handleServerFunctionRequest(request, options = {}) {
       if (!instance) {
         if (handleNoJS) return handleNoJS(result, request, parsed);
         if (result instanceof Response) return result;
-        return encodeResult(result, headers, 200, codec);
+        return encodeResult(result, headers, 200, codec, request.signal);
       }
 
-      return encodeResult(result, headers, status, codec);
+      return encodeResult(result, headers, status, codec, request.signal);
     } catch (x) {
       if (x instanceof Response || isResponseEnvelope(x)) {
         if (transformResult) {
@@ -944,7 +1202,7 @@ export async function handleServerFunctionRequest(request, options = {}) {
           if (handleNoJS) return handleNoJS(x ?? metadata, request, parsed, true);
           if (x instanceof Response) return x;
         }
-        return encodeResult(x, headers, status, codec);
+        return encodeResult(x, headers, status, codec, request.signal);
       }
 
       // Plain thrown value (not a Response/envelope): the security-sensitive
@@ -965,8 +1223,9 @@ export async function handleServerFunctionRequest(request, options = {}) {
       // above U+00FF, so non-latin1 messages ride percent-encoded (the client
       // decodes symmetrically; the structured error still travels in the body)
       headers.set(ERROR_HEADER, encodeErrorHeaderValue(error));
-      return encodeResult(safe, headers, 200, codec);
+      return encodeResult(safe, headers, 200, codec, request.signal);
     }
   };
-  return commitEventResponse(await dispatch(), event);
+  const response = commitEventResponse(await dispatch(), event);
+  return protectsRequest ? withCSRFVary(response) : response;
 }

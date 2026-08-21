@@ -351,76 +351,73 @@ impl ExecutionCensus {
                             if !component
                                 && !has_spread
                                 && (name == "class" || (name == "style" && self.inline_styles))
-                            {
-                                if let Some(oxc_ast::ast::Expression::ObjectExpression(object)) =
+                                && let Some(oxc_ast::ast::Expression::ObjectExpression(object)) =
                                     container.expression.as_expression()
-                                {
-                                    let has_spread = object.properties.iter().any(|property| {
-                                        matches!(
-                                            property,
-                                            oxc_ast::ast::ObjectPropertyKind::SpreadProperty(_)
-                                        )
-                                    });
-                                    let decomposes = if name == "class" {
-                                        Self::class_object_splits(object)
-                                    } else {
-                                        !has_spread
-                                    };
-                                    if decomposes {
-                                        if name == "style"
-                                            && object.properties.iter().any(|property| {
-                                                matches!(
-                                                    property,
-                                                    oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property)
-                                                        if property.computed
-                                                )
-                                            })
-                                        {
-                                            self.push(
-                                                container.expression.span(),
-                                                ExecutionSiteKind::NativeAttribute,
-                                            );
-                                        }
-                                        for property in &object.properties {
-                                            let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(
+                            {
+                                let has_spread = object.properties.iter().any(|property| {
+                                    matches!(
+                                        property,
+                                        oxc_ast::ast::ObjectPropertyKind::SpreadProperty(_)
+                                    )
+                                });
+                                let decomposes = if name == "class" {
+                                    Self::class_object_splits(object)
+                                } else {
+                                    !has_spread
+                                };
+                                if decomposes {
+                                    if name == "style"
+                                        && object.properties.iter().any(|property| {
+                                            matches!(
                                                 property,
-                                            ) = property
-                                            else {
-                                                unreachable!("fixed object checked above");
-                                            };
-                                            if property.computed {
-                                                continue;
-                                            }
-                                            if is_literal_only_expression(&property.value) {
-                                                continue;
-                                            }
-                                            self.push(
-                                                property.value.span(),
-                                                ExecutionSiteKind::NativeAttribute,
-                                            );
-                                        }
-                                        continue;
+                                                oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property)
+                                                    if property.computed
+                                            )
+                                        })
+                                    {
+                                        self.push(
+                                            container.expression.span(),
+                                            ExecutionSiteKind::NativeAttribute,
+                                        );
                                     }
+                                    for property in &object.properties {
+                                        let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(
+                                            property,
+                                        ) = property
+                                        else {
+                                            unreachable!("fixed object checked above");
+                                        };
+                                        if property.computed {
+                                            continue;
+                                        }
+                                        if is_literal_only_expression(&property.value) {
+                                            continue;
+                                        }
+                                        self.push(
+                                            property.value.span(),
+                                            ExecutionSiteKind::NativeAttribute,
+                                        );
+                                    }
+                                    continue;
                                 }
                             }
-                            if !component && !has_spread && name == "class" {
-                                if let Some(expression) = container.expression.as_expression() {
-                                    if let Some(object) = Self::split_class_array_object(expression)
-                                    {
-                                        for property in &object.properties {
-                                            let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(
-                                                property,
-                                            ) = property
-                                            else {
-                                                unreachable!("split class array is fixed");
-                                            };
-                                            if !is_literal_only_expression(&property.value) {
-                                                self.push(
-                                                    property.value.span(),
-                                                    ExecutionSiteKind::NativeAttribute,
-                                                );
-                                            }
-                                        }
+                            if !component
+                                && !has_spread
+                                && name == "class"
+                                && let Some(expression) = container.expression.as_expression()
+                                && let Some(object) = Self::split_class_array_object(expression)
+                            {
+                                for property in &object.properties {
+                                    let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(property) =
+                                        property
+                                    else {
+                                        unreachable!("split class array is fixed");
+                                    };
+                                    if !is_literal_only_expression(&property.value) {
+                                        self.push(
+                                            property.value.span(),
+                                            ExecutionSiteKind::NativeAttribute,
+                                        );
                                     }
                                 }
                             }
@@ -656,13 +653,13 @@ impl TraceRecorder {
             ));
             return;
         }
-        if let Some(previous) = self.decisions.insert(key, decision) {
-            if previous != decision {
-                self.fail(format!(
-                    "semantic site {kind:?} at {}..{} received conflicting terminal decisions",
-                    span.start, span.end
-                ));
-            }
+        if let Some(previous) = self.decisions.insert(key, decision)
+            && previous != decision
+        {
+            self.fail(format!(
+                "semantic site {kind:?} at {}..{} received conflicting terminal decisions",
+                span.start, span.end
+            ));
         }
     }
 
@@ -797,6 +794,13 @@ mod tests {
             ExecutionSiteKind::JsxChild,
             ValueDecision::ReactiveRerun,
         );
-        assert!(recorder.finish().unwrap().unwrap().ownership_sites.is_empty());
+        assert!(
+            recorder
+                .finish()
+                .unwrap()
+                .unwrap()
+                .ownership_sites
+                .is_empty()
+        );
     }
 }

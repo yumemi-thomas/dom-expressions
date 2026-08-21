@@ -1,7 +1,7 @@
 //! `lazy()` module-URL pass, ported from the Babel implementation in
 //! vite-plugin-solid (`src/lazy-module-url.ts`). Detects
 //! `lazy(() => import("specifier"))` calls where `lazy` is a named import
-//! from `solid-js` and appends a placeholder string second argument
+//! from `solid-js` and appends a placeholder string argument
 //! (`"__SOLID_LAZY_MODULE__:<specifier>"`). The placeholder format is a
 //! frozen contract: the bundler plugin's `resolveLazyModuleUrls` regex
 //! (`"__SOLID_LAZY_MODULE__:([^"]+)"`) rewrites it to a resolved
@@ -9,26 +9,28 @@
 //!
 //! The same pass recognizes `clientOnly(() => import("specifier"))` where
 //! `clientOnly` is a named import from `@solidjs/web`, so the server half
-//! can emit early modulepreload hints for the browser-only module. Because
-//! `clientOnly` already takes an options bag in second position, the
-//! placeholder is appended as a *third* argument, padding the options slot
-//! with `void 0` when the call site omits it — the runtime's `moduleUrl`
-//! parameter is positionally stable either way.
+//! can emit early modulepreload hints for the browser-only module.
+//!
+//! Both runtimes take an options bag in second position (`lazy`'s
+//! `{ export }`, `clientOnly`'s `{ lazy, export }`), so the placeholder is
+//! appended as a *third* argument, padding the options slot with `void 0`
+//! when the call site omits it — the runtime's `moduleUrl` parameter is
+//! positionally stable either way.
 
+use crate::shared::ast_builder::AstBuilder;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, CallExpression, Expression, ImportDeclarationSpecifier, Program, Statement,
 };
-use oxc_ast::AstBuilder;
-use oxc_ast_visit::{walk, walk_mut, Visit, VisitMut};
+use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::{Codegen, CodegenOptions};
 use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, Span};
 
-use crate::config::{source_type_for_filename, TransformResult};
+use crate::config::{TransformResult, source_type_for_filename};
 
 pub const LAZY_PLACEHOLDER_PREFIX: &str = "__SOLID_LAZY_MODULE__:";
 
@@ -59,8 +61,8 @@ pub fn transform_lazy(
             ..ParseOptions::default()
         })
         .parse();
-    if let Some(error) = parsed.errors.into_iter().next() {
-        return Err(Error::from_reason(error.to_string()));
+    if let Some(error) = crate::shared::parser::first_parser_error(parsed.diagnostics) {
+        return Err(Error::from_reason(error));
     }
 
     let mut program = parsed.program;
@@ -112,10 +114,9 @@ struct Target {
 ///   callee must be spelled with the canonical name,
 /// - the first argument is a function/arrow whose body is directly
 ///   `import("literal")` (or a block whose sole statement returns one),
-/// - `lazy` takes exactly one argument; `clientOnly` takes one (options
-///   omitted — the placeholder needs a `void 0` filler) or two (the second
-///   being its options bag). More arguments mean the call is already
-///   annotated and is left untouched.
+/// - the call takes one argument (options omitted — the placeholder needs a
+///   `void 0` filler) or two (the second being the options bag). More
+///   arguments mean the call is already annotated and is left untouched.
 fn collect_targets(program: &Program<'_>) -> Vec<Target> {
     let semantic = SemanticBuilder::new().build(program).semantic;
     let scoping = semantic.scoping();
@@ -135,10 +136,10 @@ fn collect_targets(program: &Program<'_>) -> Vec<Target> {
             _ => continue,
         };
         for specifier in import.specifiers.iter().flatten() {
-            if let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier {
-                if let Some(symbol_id) = specifier.local.symbol_id.get() {
-                    set.insert(symbol_id);
-                }
+            if let ImportDeclarationSpecifier::ImportSpecifier(specifier) = specifier
+                && let Some(symbol_id) = specifier.local.symbol_id.get()
+            {
+                set.insert(symbol_id);
             }
         }
     }
@@ -187,9 +188,9 @@ fn eligible_target(
     let Expression::Identifier(callee) = &call.callee else {
         return None;
     };
-    let (eligible, max_arguments) = match callee.name.as_str() {
-        "lazy" => (lazy_symbols, 1),
-        "clientOnly" => (client_only_symbols, 2),
+    let eligible = match callee.name.as_str() {
+        "lazy" => lazy_symbols,
+        "clientOnly" => client_only_symbols,
         _ => return None,
     };
     let symbol = callee
@@ -201,7 +202,7 @@ fn eligible_target(
     }
     // Babel: bail on more arguments than the bare form takes (already
     // annotated) and on 0 arguments.
-    if call.arguments.is_empty() || call.arguments.len() > max_arguments {
+    if call.arguments.is_empty() || call.arguments.len() > 2 {
         return None;
     }
     // A spread in the options slot hides the real arity — leave it alone.
@@ -213,9 +214,9 @@ fn eligible_target(
     Some(Target {
         span: call.span,
         specifier,
-        // The placeholder always lands in `clientOnly`'s third slot; a
-        // callsite without an options bag gets `void 0` filler.
-        pad_options: max_arguments == 2 && call.arguments.len() == 1,
+        // The placeholder always lands in the third slot; a callsite
+        // without an options bag gets `void 0` filler.
+        pad_options: call.arguments.len() == 1,
     })
 }
 
@@ -223,19 +224,12 @@ fn eligible_target(
 /// `() => import("x")`, `() => { return import("x"); }`, and the
 /// `function` equivalents, returning the literal specifier.
 fn extract_dynamic_import_specifier(node: &Expression<'_>) -> Option<String> {
-    let body = match node {
-        Expression::ArrowFunctionExpression(arrow) => &arrow.body,
-        Expression::FunctionExpression(function) => function.body.as_ref()?,
-        _ => return None,
-    };
     let import = match node {
-        Expression::ArrowFunctionExpression(arrow) if arrow.expression => {
-            match body.statements.first()? {
-                Statement::ExpressionStatement(statement) => &statement.expression,
-                _ => return None,
-            }
+        Expression::ArrowFunctionExpression(arrow) if arrow.is_expression() => {
+            arrow.get_expression()?
         }
-        _ => {
+        Expression::ArrowFunctionExpression(arrow) => {
+            let body = arrow.get_function_body()?;
             if body.statements.len() != 1 {
                 return None;
             }
@@ -244,6 +238,17 @@ fn extract_dynamic_import_specifier(node: &Expression<'_>) -> Option<String> {
                 _ => return None,
             }
         }
+        Expression::FunctionExpression(function) => {
+            let body = function.body.as_ref()?;
+            if body.statements.len() != 1 {
+                return None;
+            }
+            match body.statements.first()? {
+                Statement::ReturnStatement(statement) => statement.argument.as_ref()?,
+                _ => return None,
+            }
+        }
+        _ => return None,
     };
     let Expression::ImportExpression(import) = import else {
         return None;
@@ -281,7 +286,7 @@ impl<'a> VisitMut<'a> for Rewriter<'a> {
             call.arguments
                 .push(Argument::StringLiteral(ast.alloc_string_literal(
                     Span::new(0, 0),
-                    ast.atom(&value),
+                    ast.str(&value),
                     None,
                 )));
         }

@@ -28,7 +28,7 @@ export type {
 } from "./shared.js";
 export { decodeFlashCookie, encodeFlashCookie } from "./flash.js";
 export type { FlashSubmission } from "./flash.js";
-import { ServerFunction } from "./shared.js";
+import { ServerFunction, ServerFunctionMetadata } from "./shared.js";
 
 /**
  * The request event a server function call runs under: the base
@@ -197,6 +197,26 @@ export function createNoJSHandler(
   options?: NoJSHandlerOptions
 ): (result: unknown, request: Request, args: unknown[], thrown?: boolean) => Response;
 
+export type ServerFunctionOriginMatcher =
+  | string
+  | readonly string[]
+  | ((origin: string, request: Request) => boolean | Promise<boolean>);
+
+/** Same-origin validation options for server function requests. */
+export interface ServerFunctionCSRFOptions {
+  /**
+   * Expected public origin. Defaults to the incoming request URL's origin.
+   * A function can validate origins dynamically for multi-tenant hosts.
+   */
+  origin?: ServerFunctionOriginMatcher;
+  /**
+   * Allows requests without `Sec-Fetch-Site`, `Origin`, or `Referer`.
+   * Cross-origin metadata is still rejected.
+   * @default false
+   */
+  allowRequestsWithoutOriginCheck?: boolean;
+}
+
 /** Options for `configureServerFunctionsServer`. */
 export interface ServerFunctionsServerConfig {
   /**
@@ -287,6 +307,12 @@ export interface ServerFunctionsServerConfig {
    * @default "/_server"
    */
   endpoint?: string;
+  /**
+   * Same-origin protection for HTTP server function calls. Enabled by
+   * default. Set to `false` only when another trusted layer protects the
+   * endpoint.
+   */
+  csrf?: boolean | ServerFunctionCSRFOptions;
   /**
    * Codec options (extra plugins etc.) for decoding arguments and encoding
    * results — must match the client's. Stored in the shared layer, so
@@ -391,6 +417,34 @@ export function createServerReference<T extends any[], R>(
 export function GET<A extends readonly any[], R>(
   fn: (...args: A) => R
 ): ServerFunction<A, Awaited<R>>;
+
+/** Wire-state transitions a live call's iterable can report (client side). */
+export type LiveSourceStatus = "connected" | "reconnecting" | "closed";
+
+/**
+ * Type-level mirror of the client's live answer shape so isomorphic code
+ * assigning `onstatus` typechecks against either build's declarations. On
+ * the server the hook is inert: in-process calls hand back the source's
+ * own iterable — there is no connection to report on.
+ */
+export type LiveSource<R> = R & {
+  onstatus?: (state: LiveSourceStatus, error?: unknown) => void;
+};
+
+/**
+ * Declares a value-shaped live source: a server function returning an async
+ * iterable whose yields are successive VALUES of one logical query, with
+ * the contract that the source re-yields current state on every invocation.
+ * Writes `live: true` on the metadata channel and brands the resolved
+ * iterable (registered symbol `solid.LiveSource`) so SSR faces meeting the
+ * value in-process can apply live policy (document face: first value, then
+ * client takeover). Dispatch is untouched — over-the-wire calls stream the
+ * raw registered function's result. Declare live outermost:
+ * `live(GET(fn))`.
+ */
+export function live<A extends readonly any[], R>(
+  fn: (...args: A) => R
+): ServerFunction<A, LiveSource<Awaited<R>>>;
 
 /** Identity of the currently executing server function call. */
 export interface ServerFunctionInvocation {
@@ -501,6 +555,11 @@ export interface HandleServerFunctionOptions {
     args: unknown[],
     thrown?: boolean
   ): Response | Promise<Response>;
+  /**
+   * Overrides same-origin protection for this handler. Set to `false` only
+   * when another trusted layer protects the endpoint.
+   */
+  csrf?: boolean | ServerFunctionCSRFOptions;
   /** Overrides the configured codec options for this handler. */
   codec?: JSONCodecOptions;
 }
@@ -514,6 +573,10 @@ export interface HandleServerFunctionOptions {
  * through headers). Mount it on the endpoint the client transport targets
  * (default `/_server`); platform adapters (h3, express, ...) convert their
  * request shape to a web `Request` around it.
+ *
+ * Requests are same-origin by default. The handler accepts browser requests
+ * proven by `Sec-Fetch-Site`, `Origin`, or `Referer`, and rejects requests
+ * without usable metadata unless explicitly configured otherwise.
  *
  * When the event carries a `response` head stub (`event.response`, see the
  * server entry's `ResponseStub`), the handler folds it onto every outgoing
@@ -577,6 +640,34 @@ export const GENERIC_SERVER_ERROR_MESSAGE: string;
  * Exposed for frameworks composing their own dispatch around the same policy.
  */
 export function sanitizeServerError(value: unknown): unknown;
+
+export interface ServerFunctionRequestCall {
+  type: "request";
+  id: string;
+  instance: string;
+  request: Request;
+  meta: ServerFunctionMetadata | undefined;
+  time: number;
+}
+
+export interface ServerFunctionResponseCall {
+  type: "response";
+  id: string;
+  instance: string;
+  response: Response;
+  meta: ServerFunctionMetadata | undefined;
+  time: number;
+}
+
+export type ServerFunctionCall = ServerFunctionRequestCall | ServerFunctionResponseCall;
+
+/**
+ * Client-only inspection seam. A no-op on this entry so isomorphic
+ * `@solidjs/web/server-functions` imports resolve.
+ */
+export function observeServerFunctionCalls(
+  observer: (call: ServerFunctionCall) => void
+): () => void;
 
 /**
  * Overrides the build-variant dev flag for this module instance — the seam

@@ -163,6 +163,13 @@ var _tmpl$50 = [
 	"></video><video src=\"test.mp4\" muted></video></div>"
 ];
 var _tmpl$51 = ["<video", " src=\"test.mp4\" muted></video>"];
+var _tmpl$52 = [
+	"<div",
+	"><div>",
+	"</div><div>",
+	"</div><input type=\"checkbox\"",
+	"></div>"
+];
 import * as styles from "./styles.module.css";
 import { binding } from "somewhere";
 function refFn() {}
@@ -465,8 +472,8 @@ const propsSpread = {
 	something: color(),
 	style: {
 		"background-color": color(),
-		color: color(),
-		"margin-right": props.right
+		color: /* @static*/ color(),
+		"margin-right": /* @static */ props.right
 	}
 };
 const template80 = _$ssrElement("div", propsSpread, undefined, true);
@@ -476,7 +483,7 @@ const template82 = _$ssrElement("div", () => {
 		get ["data-dynamic"]() {
 			return color();
 		},
-		"data-static": color()
+		"data-static": /* @static */ color()
 	});
 }, undefined, true);
 const template83 = _$ssrElement("div", () => {
@@ -484,7 +491,7 @@ const template83 = _$ssrElement("div", () => {
 		get ["data-dynamic"]() {
 			return color();
 		},
-		"data-static": color()
+		"data-static": /* @static */ color()
 	});
 }, undefined, true);
 const template84 = _$ssrElement("div", () => {
@@ -492,7 +499,7 @@ const template84 = _$ssrElement("div", () => {
 		get ["data-dynamic"]() {
 			return color();
 		},
-		"data-static": color()
+		"data-static": /* @static */ color()
 	});
 }, undefined, true);
 // STATIC PROPERTY OF OBJECT ACCESS
@@ -558,3 +565,15 @@ const template97 = _$ssrElement("svg", () => {
 		}
 	});
 }, undefined, true);
+var _v$120 = _$ssrHydrationKey(), _v$121 = () => {
+	return createIcon(props.radius);
+}, _v$122 = () => {
+	return _$escape(getLabel(props.id) || " ");
+}, _v$123 = () => {
+	return _$ssrAttribute("checked", _$escape(checked(), true));
+};
+// solidjs/solid#3015: innerHTML/textContent redirects are opaque content — a
+// call-shaped value must not get the _$scope id reservation (the client
+// applies these as plain prop effects that never allocate hydration ids), or
+// every hydratable sibling after it shifts by one id.
+const template98 = _$ssr(_tmpl$52, _v$120, _v$121, _v$122, _v$123);

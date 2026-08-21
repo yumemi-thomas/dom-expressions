@@ -1,5 +1,5 @@
 use crate::dom::attrs::CloseTagContext;
-use crate::dom::element::{jsx_expression_to_expression, AstDomTransform};
+use crate::dom::element::{AstDomTransform, jsx_expression_to_expression};
 use crate::dom::static_template::lower_static_native_template;
 use crate::dom::template::InsertMarker;
 use crate::error::{Error, Result};
@@ -458,14 +458,13 @@ impl<'a> AstDomTransform<'a, '_> {
     pub(crate) fn detect_expressions(&self, children: &[&JSXChild<'a>], index: usize) -> bool {
         if index > 0 {
             match children[index - 1] {
-                JSXChild::ExpressionContainer(container) => {
+                JSXChild::ExpressionContainer(container)
                     if !matches!(container.expression, JSXExpression::EmptyExpression(_))
                         && self
                             .static_jsx_expression_value(&container.expression)
-                            .is_none()
-                    {
-                        return true;
-                    }
+                            .is_none() =>
+                {
+                    return true;
                 }
                 JSXChild::Element(element) if is_component_name(&element.opening_element.name) => {
                     return true;
@@ -475,14 +474,13 @@ impl<'a> AstDomTransform<'a, '_> {
         }
         for child in &children[index..] {
             match child {
-                JSXChild::ExpressionContainer(container) => {
+                JSXChild::ExpressionContainer(container)
                     if !matches!(container.expression, JSXExpression::EmptyExpression(_))
                         && self
                             .static_jsx_expression_value(&container.expression)
-                            .is_none()
-                    {
-                        return true;
-                    }
+                            .is_none() =>
+                {
+                    return true;
                 }
                 JSXChild::Element(element) => {
                     if is_component_name(&element.opening_element.name) {
@@ -623,6 +621,24 @@ impl<'a> AstDomTransform<'a, '_> {
                 initial: None,
             });
         }
+        // Boxed by text — Babel's `wrappedByText` arm of the marker decision:
+        // a dedicated placeholder is structurally required, because the
+        // preceding and following template texts would otherwise merge into a
+        // single node during HTML parsing, leaving the following-sibling walk
+        // pointing past the slot (solidjs/solid#3004: a component between two
+        // static texts was inserted after the trailing text).
+        if self.slot_boxed_by_text(children, index) {
+            return Some(InsertMarker {
+                marker: self.dedicated_slot_placeholder(
+                    span,
+                    element_id,
+                    child_node_index,
+                    template,
+                    declarations,
+                ),
+                initial: None,
+            });
+        }
         if has_following_static_content(&children[following_start..]) {
             return Some(InsertMarker {
                 marker: self.child_walk_expression(span, element_id, *child_node_index),
@@ -704,6 +720,19 @@ impl<'a> AstDomTransform<'a, '_> {
         {
             return self.child_walk_expression(span, element_id, *child_node_index);
         }
+        self.dedicated_slot_placeholder(span, element_id, child_node_index, template, declarations)
+    }
+
+    /// Emit a dedicated `<!>` placeholder at the slot's template position and
+    /// declare a positional walk var referencing it.
+    fn dedicated_slot_placeholder(
+        &mut self,
+        span: oxc_span::Span,
+        element_id: &str,
+        child_node_index: &mut usize,
+        template: &mut crate::dom::template::TemplateHtml,
+        declarations: &mut std::vec::Vec<Statement<'a>>,
+    ) -> Expression<'a> {
         template.push_both("<!>");
         let marker_name = self.next_element_id();
         let lookup = self.child_walk_expression(span, element_id, *child_node_index);
@@ -730,10 +759,8 @@ impl<'a> AstDomTransform<'a, '_> {
     {
         for child in children {
             match child {
-                JSXChild::Text(text) => {
-                    if !trim_jsx_text(&text.value).is_empty() {
-                        return true;
-                    }
+                JSXChild::Text(text) if !trim_jsx_text(&text.value).is_empty() => {
+                    return true;
                 }
                 JSXChild::ExpressionContainer(container) => {
                     if matches!(container.expression, JSXExpression::EmptyExpression(_)) {
@@ -796,9 +823,9 @@ impl<'a> AstDomTransform<'a, '_> {
             Some(previous) => self.static_member_expression(child.span, previous, "nextSibling"),
             None => self.static_member_expression(child.span, parent_id, "firstChild"),
         };
-        let tag =
-            self.ast()
-                .expression_string_literal(child.span, self.ast().atom(&tag_name), None);
+        let tag = self
+            .ast()
+            .expression_string_literal(child.span, self.ast().str(&tag_name), None);
         Ok(self.call_identifier(child.span, "_$getNextMatch", vec![base, tag]))
     }
 
@@ -899,9 +926,9 @@ impl<'a> AstDomTransform<'a, '_> {
         let value = if already_function {
             value
         } else {
-            let call =
-                self.ast()
-                    .expression_call(span, value, oxc_ast::NONE, self.ast().vec(), false);
+            let call = self
+                .ast()
+                .expression_call(span, value, None, self.ast().vec(), false);
             self.arrow_return_expression(span, call)
         };
         self.call_identifier(span, "_$scope", vec![value])
@@ -920,7 +947,7 @@ impl<'a> AstDomTransform<'a, '_> {
 
         let tag = self
             .ast()
-            .expression_string_literal(span, self.ast().atom(tag_name), None);
+            .expression_string_literal(span, self.ast().str(tag_name), None);
 
         if index == 0 {
             self.template_state.uses_get_first_child = true;

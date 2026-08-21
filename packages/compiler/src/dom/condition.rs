@@ -4,7 +4,7 @@ use oxc_span::{GetSpan, Span};
 
 use crate::dom::element::AstDomTransform;
 use crate::shared::condition::{
-    is_condition_shape, memo_wrap_thunk, transform_condition, zero_arg_call_thunk, ConditionBuilder,
+    ConditionBuilder, is_condition_shape, memo_wrap_thunk, transform_condition, zero_arg_call_thunk,
 };
 use crate::shared::mode_lower::ModeLower;
 

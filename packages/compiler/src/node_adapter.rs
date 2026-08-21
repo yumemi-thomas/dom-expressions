@@ -141,16 +141,16 @@ fn legacy_preflight(
             ..ParseOptions::default()
         })
         .parse();
-    if let Some(error) = parsed.errors.into_iter().next() {
-        return Err(Error::from_reason(error.to_string()));
+    if let Some(error) = crate::shared::parser::first_parser_error(parsed.diagnostics) {
+        return Err(Error::from_reason(error));
     }
-    if let Some(lib) = options.require_import_source.as_deref() {
-        if !crate::compiler::has_jsx_import_source(&parsed.program, code, lib) {
-            return Ok(TransformResult {
-                code: code.to_owned(),
-                map: None,
-            });
-        }
+    if let Some(lib) = options.require_import_source.as_deref()
+        && !crate::compiler::has_jsx_import_source(&parsed.program, code, lib)
+    {
+        return Ok(TransformResult {
+            code: code.to_owned(),
+            map: None,
+        });
     }
     Err(Error::from_reason(validation_error))
 }
@@ -193,9 +193,11 @@ mod tests {
         let Err(error) = result else {
             panic!("a transformed file still requires a module name");
         };
-        assert!(error
-            .to_string()
-            .contains("AST-native transform requires a `moduleName` option"));
+        assert!(
+            error
+                .to_string()
+                .contains("AST-native transform requires a `moduleName` option")
+        );
     }
 
     #[test]

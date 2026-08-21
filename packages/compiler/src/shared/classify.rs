@@ -137,19 +137,18 @@ fn is_dynamic_with_namespaces(
 ) -> bool {
     match value {
         Expression::StaticMemberExpression(member) => {
-            if let Expression::Identifier(object) = &member.object {
-                if bindings.is_namespace_import(&object.name) {
-                    return false;
-                }
+            if let Expression::Identifier(object) = &member.object
+                && bindings.is_namespace_import(&object.name)
+            {
+                return false;
             }
         }
         Expression::ComputedMemberExpression(member) => {
-            if let Expression::Identifier(object) = &member.object {
-                if bindings.is_namespace_import(&object.name)
-                    && !is_dynamic_deep(&member.expression, check_tags)
-                {
-                    return false;
-                }
+            if let Expression::Identifier(object) = &member.object
+                && bindings.is_namespace_import(&object.name)
+                && !is_dynamic_deep(&member.expression, check_tags)
+            {
+                return false;
             }
         }
         _ => {}
@@ -306,7 +305,7 @@ pub(crate) mod trace {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::trace::{capture, Question};
+    use super::trace::{Question, capture};
     use crate::{CompileOptions, Generate};
 
     const MODES: [(&str, Generate); 3] = [

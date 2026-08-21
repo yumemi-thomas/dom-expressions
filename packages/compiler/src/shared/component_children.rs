@@ -6,14 +6,13 @@
 use crate::error::Result;
 use oxc_allocator::CloneIn;
 use oxc_ast::ast::{Expression, JSXChild, JSXElement, JSXExpression, Statement};
-use oxc_ast::NONE;
 use oxc_span::GetSpan;
 
 use crate::shared::array::expression_to_array_element;
 use crate::shared::ast::arrow_return_expression;
 use crate::shared::condition::{is_condition_shape, transform_condition_inline};
 use crate::shared::fragment::lower_fragment;
-use crate::shared::mode_lower::{mode_ast, ModeLower};
+use crate::shared::mode_lower::{ModeLower, mode_ast};
 use crate::shared::utils::{decode_html_entities, trim_jsx_text};
 
 /// The extra seam component children need beyond [`ModeLower`]: element
@@ -69,7 +68,7 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
                 let value = decode_html_entities(&trim_jsx_text(&text.value));
                 if !value.is_empty() {
                     values.push(ChildValue {
-                        value: ast.expression_string_literal(span, ast.atom(&value), None),
+                        value: ast.expression_string_literal(span, ast.str(&value), None),
                         kind: ChildKind::Static,
                         setup: std::vec::Vec::new(),
                         semantic_span: None,
@@ -217,7 +216,7 @@ pub(crate) fn component_children<'a, C: ComponentChildLower<'a>>(
                         statements.extend(child.setup);
                         statements.push(ast.statement_return(span, Some(child.value)));
                         let iife = crate::shared::ast::arrow_iife(allocator, span, statements);
-                        ast.expression_call(span, iife, NONE, ast.vec(), false)
+                        ast.expression_call(span, iife, None, ast.vec(), false)
                     } else if matches!(child.kind, ChildKind::DynamicExpression) {
                         let thunk = arrow_return_expression(allocator, span, child.value);
                         ctx.memo_wrap_dynamic_child(span, thunk)

@@ -1,7 +1,8 @@
 use crate::error::Result;
-use oxc_ast::{ast::Expression, AstBuilder};
+use oxc_ast::ast::Expression;
 use oxc_span::Span;
 
+use crate::shared::ast_builder::AstBuilder;
 use crate::shared::component_callee::ComponentCalleeContext;
 use crate::universal::transform::AstUniversalTransform;
 

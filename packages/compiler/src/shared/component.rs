@@ -4,20 +4,18 @@
 
 use crate::error::{Error, Result};
 use oxc_allocator::CloneIn;
-use oxc_ast::{
-    ast::{
-        Expression, JSXAttributeItem, JSXAttributeValue, JSXElement, ObjectPropertyKind, Statement,
-    },
-    AstBuilder,
+use oxc_ast::ast::{
+    Expression, JSXAttributeItem, JSXAttributeValue, JSXElement, ObjectPropertyKind, Statement,
 };
 use oxc_span::{GetSpan, Span};
 
 use crate::dom::element::AstDomTransform;
-use crate::shared::component_callee::{component_callee_expression, ComponentCalleeContext};
-use crate::shared::component_children::{component_children, ComponentChildLower};
+use crate::shared::ast_builder::AstBuilder;
+use crate::shared::component_callee::{ComponentCalleeContext, component_callee_expression};
+use crate::shared::component_children::{ComponentChildLower, component_children};
 use crate::shared::component_props::{
-    component_property, component_props_expression, component_spread_expression,
-    flush_component_props, ComponentPropContext,
+    ComponentPropContext, component_property, component_props_expression,
+    component_spread_expression, flush_component_props,
 };
 use crate::shared::condition::{is_condition_shape, transform_condition_inline};
 use crate::shared::mode_lower::mode_ast;
@@ -104,7 +102,7 @@ pub(crate) fn lower_component_with_setup<'a, C: ComponentLower<'a>>(
                 let span = value.span;
                 let value = decode_html_entities(&value.value);
                 (
-                    ast.expression_string_literal(span, ast.atom(&value), None),
+                    ast.expression_string_literal(span, ast.str(&value), None),
                     false,
                     false,
                 )

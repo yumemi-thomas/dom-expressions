@@ -1,4 +1,4 @@
-import { Feature, fromCrossJSON } from "seroval";
+import { createStream, Feature, fromCrossJSON } from "seroval";
 import {
   AbortSignalPlugin,
   CustomEventPlugin,
@@ -12,7 +12,27 @@ import {
   URLPlugin,
   URLSearchParamsPlugin
 } from "seroval-plugins/web";
-import { ContainerTracePlugin } from "./frame-container-plugin.js";
+import { ContainerTracePlugin, setContainerTraceStreamMint } from "./frame-container-plugin.js";
+
+// Container traces cross as RAW seroval streams so their buffered snapshot
+// replays synchronously on the decode side (see the mint's doc in the
+// plugin module). The mint lives HERE because every face that parses a
+// trace resolves its plugin set through this module, and this module
+// already carries seroval — the plugin module itself must stay seroval-free
+// (it rides the eager frames-client graph; seroval has no `sideEffects`
+// flag for a bundler to shake it out).
+setContainerTraceStreamMint(iterable => {
+  const stream = createStream();
+  (async () => {
+    try {
+      for await (const value of iterable) stream.next(value);
+      stream.return(undefined);
+    } catch (error) {
+      stream.throw(error);
+    }
+  })();
+  return stream;
+});
 
 // The DECODE half of the serialization surface, split out so lazy client
 // consumers (the frames data tables, `deserializeStream`) load only what
@@ -92,9 +112,36 @@ export function resolveCodecOptions({ plugins, disabledFeatures, depthLimit } = 
 export function createJSONDeserializer(options) {
   const refs = new Map();
   const resolved = resolveCodecOptions(options);
-  return function deserializeJSONChunk(node) {
+  function deserializeJSONChunk(node) {
     return fromCrossJSON(node, { refs, ...resolved });
+  }
+  /**
+   * Fails every value still waiting on chunks that will never arrive. The
+   * shared refs map holds seroval's in-progress state between chunks: open
+   * streams (`__SEROVAL_STREAM__`) and pending-promise resolvers (`{p, s, f}`
+   * — the promise under one id, its resolver under the special-reference id
+   * next to it). Both settle idempotently — throwing into a completed stream
+   * and rejecting a resolved promise are no-ops — so the sweep is safe to
+   * run on normal end-of-stream too. The defusing handler on `p` keeps a
+   * rejection nobody awaited (a pending promise the app never touched) from
+   * surfacing as an unhandled rejection.
+   */
+  deserializeJSONChunk.abort = function abort(error) {
+    for (const value of refs.values()) {
+      if (value === null || typeof value !== "object") continue;
+      if (value.__SEROVAL_STREAM__) {
+        value.throw(error);
+      } else if (
+        typeof value.s === "function" &&
+        typeof value.f === "function" &&
+        value.p instanceof Promise
+      ) {
+        value.p.then(undefined, () => {});
+        value.f(error);
+      }
+    }
   };
+  return deserializeJSONChunk;
 }
 
 /**

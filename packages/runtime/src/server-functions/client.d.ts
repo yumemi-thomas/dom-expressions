@@ -127,6 +127,36 @@ export interface ServerFunctionsClientConfig {
  */
 export function configureServerFunctionsClient(config?: ServerFunctionsClientConfig): void;
 
+export interface ServerFunctionRequestCall {
+  type: "request";
+  id: string;
+  instance: string;
+  request: Request;
+  meta: ServerFunctionMetadata | undefined;
+  time: number;
+}
+
+export interface ServerFunctionResponseCall {
+  type: "response";
+  id: string;
+  instance: string;
+  response: Response;
+  meta: ServerFunctionMetadata | undefined;
+  time: number;
+}
+
+export type ServerFunctionCall = ServerFunctionRequestCall | ServerFunctionResponseCall;
+
+/**
+ * Observes cloned requests and responses without handling them. Subscribe
+ * from devtools; do not use this to replace `prepareRequest` /
+ * `responseHandler`. The server entry exports a no-op of the same name so
+ * isomorphic `@solidjs/web/server-functions` imports resolve.
+ */
+export function observeServerFunctionCalls(
+  observer: (call: ServerFunctionCall) => void
+): () => void;
+
 /**
  * Declares a server function callable over HTTP GET: calls to the returned
  * reference go out as GET requests with the arguments codec-encoded in the
@@ -155,6 +185,36 @@ export function configureServerFunctionsClient(config?: ServerFunctionsClientCon
 export function GET<A extends readonly any[], R>(
   fn: (...args: A) => R
 ): ServerFunction<A, Awaited<R>>;
+
+/** Wire-state transitions a live call's iterable can report. */
+export type LiveSourceStatus = "connected" | "reconnecting" | "closed";
+
+/**
+ * A live call's answer: the source's iterable, plus an optional `onstatus`
+ * side channel for the wire facts the reconnect loop erases from the value
+ * stream — `"connected"` on each successful (re)connect, `"reconnecting"`
+ * (with the error) on each post-connect death, `"closed"` when the source
+ * completes or the consumer ends it.
+ */
+export type LiveSource<R> = R & {
+  onstatus?: (state: LiveSourceStatus, error?: unknown) => void;
+};
+
+/**
+ * Declares a value-shaped live source: a server function returning an async
+ * iterable whose yields are successive VALUES of one logical query, with the
+ * contract that the source re-yields current state on every invocation.
+ * Calls to the returned reference produce an iterable that survives the
+ * connection — post-connect deaths re-invoke with exponential backoff
+ * (reset per healthy value, woken early by connectivity returning),
+ * first-connect failures reject like a normal call, and `break` aborts the
+ * in-flight request. Live calls are reads and never opt into single-flight
+ * enveloping. Wire state, if wanted, rides the returned iterable's
+ * `onstatus` hook. Compose with `GET` inside-out: `live(GET(fn))`.
+ */
+export function live<A extends readonly any[], R>(
+  fn: (...args: A) => R
+): ServerFunction<A, LiveSource<Awaited<R>>>;
 
 /**
  * Compiler ABI — emitted by compiled `"use server"` client output where a

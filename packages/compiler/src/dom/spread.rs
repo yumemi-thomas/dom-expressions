@@ -73,6 +73,22 @@ impl<'a> AstDomTransform<'a, '_> {
                     prop_objects.push(value);
                 }
                 JSXAttributeItem::Attribute(attr) => {
+                    // `renameElementKey` runs before Babel's spread handling:
+                    // native DOM output strips `$key` even when another spread
+                    // disables the ordinary attribute planner. Preserve the
+                    // source execution site as explicitly elided.
+                    if matches!(&attr.name, oxc_ast::ast::JSXAttributeName::Identifier(name) if name.name == "$key")
+                    {
+                        if let Some(JSXAttributeValue::ExpressionContainer(container)) = &attr.value
+                            && let Some(expression) = container.expression.as_expression()
+                        {
+                            self.semantic_trace.resolve_lowered_attribute(
+                                expression.span(),
+                                crate::semantic_trace::ValueDecision::Elided,
+                            );
+                        }
+                        continue;
+                    }
                     // Babel's `processSpreads` filters `ref` out of the props
                     // (`key !== "ref"`); it runs through the ref protocol as a
                     // regular attribute instead.
@@ -187,14 +203,17 @@ impl<'a> AstDomTransform<'a, '_> {
                     attr.span,
                     &name,
                     self.ast()
-                        .expression_string_literal(attr.span, self.ast().atom(&value), None),
+                        .expression_string_literal(attr.span, self.ast().str(&value), None),
                 ))
             }
             Some(JSXAttributeValue::ExpressionContainer(container)) => {
-                let dynamic = container.expression.as_expression().is_some_and(|expression| {
-                    self.classify()
-                        .is_dynamic(Some(container.span.start), expression, false)
-                });
+                let dynamic = container
+                    .expression
+                    .as_expression()
+                    .is_some_and(|expression| {
+                        self.classify()
+                            .is_dynamic(Some(container.span.start), expression, false)
+                    });
                 let semantic_kind = if name.starts_with("on") {
                     self.semantic_trace.callback(
                         container.expression.span(),

@@ -9,6 +9,7 @@ import {
   ERROR_HEADER,
   FUNCTION_HEADER,
   INSTANCE_HEADER,
+  LIVE_SOURCE,
   SERVER_FUNCTION_METADATA,
   SINGLE_FLIGHT_HEADER,
   configureServerFunctionsCodec,
@@ -66,6 +67,26 @@ const config = {
   responseHandler: undefined,
   serializeArgs: undefined
 };
+
+const CALL_OBSERVERS = new Set();
+
+function notifyCallObservers(type, id, instance, value, meta) {
+  if (CALL_OBSERVERS.size === 0) return;
+  const field = type === "request" ? "request" : "response";
+  const time = performance.now();
+  for (const observer of new Set(CALL_OBSERVERS)) {
+    try {
+      observer({ type, id, instance, [field]: value.clone(), meta, time });
+    } catch (error) {
+      console.error(error);
+    }
+  }
+}
+
+export function observeServerFunctionCalls(observer) {
+  CALL_OBSERVERS.add(observer);
+  return () => CALL_OBSERVERS.delete(observer);
+}
 
 function serializeArguments(args) {
   if (!config.serializeArgs) {
@@ -129,6 +150,10 @@ function provideRPC() {
   provideServerFunctionRPC({ GET, decodeResponse });
 }
 
+function serverFunctionFailure(response, value) {
+  return value ?? new Error(`Server function call failed with status ${response.status}`);
+}
+
 async function createRequest(base, id, instance, options, meta) {
   const headers = {
     ...options.headers,
@@ -140,7 +165,14 @@ async function createRequest(base, id, instance, options, meta) {
   // mutation call; a consumer-less app never asks the server to do
   // collection work. GET-encoded calls are reads (cacheable URLs) and stay
   // plain — folding per-request flight data into them would defeat caching.
-  if (getFlightDataConsumer() && (!options.method || options.method.toUpperCase() !== "GET")) {
+  // `read: true` marks a POST-shaped call as a read the same way (e.g.
+  // live sources: streams have no envelope story and flight hooks are
+  // mutation policy).
+  if (
+    getFlightDataConsumer() &&
+    !options.read &&
+    (!options.method || options.method.toUpperCase() !== "GET")
+  ) {
     headers[SINGLE_FLIGHT_HEADER] = "true";
   }
   let init = {
@@ -154,7 +186,13 @@ async function createRequest(base, id, instance, options, meta) {
   if (config.prepareRequest) {
     init = (await config.prepareRequest(init, { id, meta })) || init;
   }
-  return fetch(base, init);
+  if (CALL_OBSERVERS.size === 0) return fetch(base, init);
+
+  const request = new Request(new URL(base, globalThis.location?.href || "http://localhost"), init);
+  notifyCallObservers("request", id, instance, request, meta);
+  const response = await fetch(request);
+  notifyCallObservers("response", id, instance, response, meta);
+  return response;
 }
 
 async function initializeResponse(base, id, instance, options, args, meta) {
@@ -275,6 +313,16 @@ async function fetchServerFunction(base, id, options, args, meta, callArgs = arg
   const handler = config.responseHandler;
   const context = handler && handler.capture ? handler.capture({ id, meta }) : undefined;
 
+  // The call owns an AbortController so a streaming result can be ENDED, not
+  // just abandoned: `iterator.return()` on the received iterable aborts the
+  // fetch, which closes the response body here (settling the codec's
+  // bookkeeping through the drain's failure sweep) and fires
+  // `request.signal` on the server (tearing the producer down). Only minted
+  // when the caller didn't bring a signal — a caller-supplied signal already
+  // owns the wire, and cancellation stays theirs.
+  const controller = options.signal ? undefined : new AbortController();
+  if (controller) options = { ...options, signal: controller.signal };
+
   const response = await initializeResponse(base, id, instance, options, args, meta);
 
   // The integration seam sees the response first: a handler that claims it
@@ -283,6 +331,9 @@ async function fetchServerFunction(base, id, options, args, meta, callArgs = arg
     const handled = handler.handle(response, { id, meta, args: callArgs, context });
     if (handled !== undefined) return handled;
   }
+
+  // Proxies may omit the protocol error header on 5xx responses.
+  const failed = response.headers.has(ERROR_HEADER) || response.status >= 500;
 
   // Single-flight responses: with a registered consumer the transport owns
   // the unwrap — the standardized `{ value, data }` body is decoded, `data`
@@ -297,12 +348,8 @@ async function fetchServerFunction(base, id, options, args, meta, callArgs = arg
     if (consumer) {
       const payload = await decodeResponse(response);
       await consumer(payload.data, { response });
-      if (
-        response.headers.has(ERROR_HEADER) &&
-        !response.headers.has("Location") &&
-        !response.headers.has(REVALIDATE_HEADER)
-      ) {
-        throw payload.value;
+      if (failed && !response.headers.has("Location") && !response.headers.has(REVALIDATE_HEADER)) {
+        throw serverFunctionFailure(response, payload.value);
       }
       return payload.value;
     }
@@ -321,8 +368,23 @@ async function fetchServerFunction(base, id, options, args, meta, callArgs = arg
   }
 
   const result = await decodeResponse(response.clone());
-  if (response.headers.has(ERROR_HEADER)) {
-    throw result;
+  if (failed) {
+    throw serverFunctionFailure(response, result);
+  }
+  // Streaming result: wrap so stopping consumption stops the CALL. Without
+  // this, `return()` (a `break` in for-await) only detaches the local
+  // iterator — the fetch keeps downloading and the server keeps producing.
+  // Top-level only, matching the server's value-tier teardown scope.
+  if (controller && result?.[Symbol.asyncIterator]) {
+    return {
+      [Symbol.asyncIterator]() {
+        const it = result[Symbol.asyncIterator]();
+        return {
+          next: () => it.next(),
+          return: value => (controller.abort(), Promise.resolve({ done: true, value }))
+        };
+      }
+    };
   }
   return result;
 }
@@ -425,6 +487,202 @@ export function GET(fn) {
   });
   // the declaration itself is a metadata write like any other
   return withMeta(wrapped, { method: "GET" });
+}
+
+/**
+ * Declares a value-shaped live source: a server function returning an async
+ * iterable whose yields are successive VALUES of one logical query. The
+ * declaration buys the wire-level lifecycle a raw stream doesn't have:
+ * calls to the returned reference produce an iterable that survives the
+ * connection — when the stream dies (network drop, server restart; the
+ * rejections the transport's failure wiring produces) it re-invokes the
+ * function with exponential backoff and keeps yielding, resetting the
+ * backoff on every healthy value. A failure on the FIRST connect still
+ * rejects like a normal call (a typo shouldn't retry silently), normal
+ * completion completes the iterable, and `break` aborts the in-flight
+ * request through the transport's return() wiring.
+ *
+ * Deliberately wire-level ONLY. Each iteration of the returned iterable is
+ * its own connection (that's what makes reconnect trivial); sharing is the
+ * reactive graph's job — ONE call site consumes the stream and every
+ * reader of that memo shares its latest value, so sharing across the tree
+ * means hoisting the memo, the same idiom as any fetch. There is no cached
+ * value by design: the value-shaped contract makes the SERVER the cache —
+ * every (re)connect re-yields current state as its first value. This is
+ * the wire contract a data layer builds ON, not a data layer itself: a
+ * router-level live query can hold ONE iteration open and multicast it
+ * (keying, replay-latest, refcounts all channel-side), and its refresh
+ * stays honest — close the iteration, open a new one, fresh connection by
+ * construction. There is no revalidation here (a live source self-updates;
+ * a mutation's effects arrive through the open stream) and hence no
+ * single-flight participation (live calls are reads and never request
+ * enveloping). All behavior lives inside this declaration — apps that
+ * never import `live` carry none of it. Compose with `GET` inside-out
+ * (`live(GET(fn))`): live must be the outermost declaration, since its
+ * behavior wraps the call.
+ *
+ * Wire state, if a UI wants it, rides an optional `onstatus` hook on the
+ * returned iterable — a side channel for the facts the retry loop
+ * deliberately erases from the value stream: `"connected"` on each
+ * successful (re)connect, `"reconnecting"` (with the error) on each
+ * post-connect death, `"closed"` when the source completes or the
+ * consumer ends it. First-connect failures emit nothing (the rejection
+ * already surfaces through the call). The hook is per CALL: iterating one
+ * object twice interleaves both lifecycles into it. Data freshness is
+ * usually the better question and belongs in the value (timestamps /
+ * heartbeats) — the hook is for genuinely wire-shaped UI.
+ *
+ * ```ts
+ * export const stockPrice = live(async function* (symbol: string) {
+ *   "use server";
+ *   for await (const tick of subscribe(symbol)) yield tick.price;
+ * });
+ *
+ * // consumer, wiring status to a signal:
+ * const src = stockPrice("ACME");
+ * src.onstatus = setStatus;
+ * const price = createMemo(() => src);
+ * ```
+ */
+export function live(fn) {
+  if (!isServerFunction(fn)) {
+    throw new Error("live expects a server function reference");
+  }
+  const id = fn.id;
+  const metadata = { ...getServerFunctionMetadata(fn), live: true };
+  const wrapped = (...args) => {
+    const iterable = {
+      [LIVE_SOURCE]: true,
+      [Symbol.asyncIterator]() {
+        let it; // current underlying iterator (undefined between connections)
+        let connected = false; // a connect succeeded once — later deaths reconnect
+        let attempts = 0;
+        let stopped = false;
+        let ended = false; // "closed" fires exactly once per iteration
+        let timer, wake; // interruptible backoff sleep
+        const DONE = { done: true, value: undefined };
+        // Wire-state side channel: the retry loop erases deaths from the
+        // value stream BY DESIGN (encapsulated reconnect), so the hook is
+        // the only place downstream can learn them. Read late (at fire
+        // time) so consumers can assign after receiving the object; a
+        // throwing hook must not corrupt the loop. Facts only the
+        // transport knows: "connected" (each successful (re)connect),
+        // "reconnecting" (each post-connect death, with the error),
+        // "closed" (source completed or consumer ended — invisible to a
+        // memo consumer, which just latches). First-connect failures emit
+        // nothing: the rejection already surfaces through the call.
+        const emit = (state, error) => {
+          try {
+            iterable.onstatus && iterable.onstatus(state, error);
+          } catch {}
+        };
+        const emitClosed = () => {
+          if (ended) return;
+          ended = true;
+          emit("closed");
+        };
+        const closeIt = value => {
+          const current = it;
+          it = undefined;
+          if (current) {
+            try {
+              const r = current.return && current.return(value);
+              if (r && typeof r.then === "function") r.then(undefined, () => {});
+            } catch {}
+          }
+        };
+        const callOnce = () => {
+          // A GET-composed reference is already a flight-free read with its
+          // own query-string encoding — delegate to it. Otherwise call the
+          // transport directly so the POST is marked a read: live responses
+          // are streams, which have no single-flight envelope story (and
+          // flight collection is mutation policy).
+          if (metadata.method === "GET") return fn(...args);
+          const handler = config.responseHandler;
+          if (handler && handler.intercept) {
+            const hit = handler.intercept({ id, meta: metadata, args });
+            if (hit !== undefined) return hit;
+          }
+          return fetchServerFunction(fn.url, id, { read: true }, args, metadata, args);
+        };
+        const pull = async () => {
+          while (!stopped) {
+            try {
+              if (!it) {
+                const result = await callOnce();
+                connected = true;
+                // a plain-value answer is a one-value stream
+                it =
+                  result !== null && typeof result === "object" && result[Symbol.asyncIterator]
+                    ? result[Symbol.asyncIterator]()
+                    : (async function* () {
+                        yield result;
+                      })();
+                // stopped while connecting: the just-arrived stream must still
+                // be ended (its return() aborts the request)
+                if (stopped) {
+                  closeIt();
+                  return DONE;
+                }
+                emit("connected");
+              }
+              const r = await it.next();
+              if (r.done) {
+                emitClosed();
+                return DONE;
+              }
+              if (stopped) return DONE;
+              attempts = 0; // healthy value: backoff resets
+              return r;
+            } catch (error) {
+              // First-connect failures surface (normal call semantics); a
+              // stream that had connected died — retry with backoff. The next
+              // successful connect starts a NEW logical answer: value-shaped
+              // sources re-yield current state on invocation by contract.
+              if (!connected) throw error;
+              it = undefined;
+              emit("reconnecting", error);
+              await new Promise(resolve => {
+                wake = resolve;
+                timer = setTimeout(resolve, Math.min(500 * 2 ** attempts++, 10000));
+                // connectivity returning wakes the sleep — no reason to sit
+                // out an 8s backoff when the network just came back (typeof
+                // guard: non-browser consumers have no global EventTarget)
+                if (typeof addEventListener === "function")
+                  addEventListener("online", resolve, { once: true });
+              });
+              clearTimeout(timer);
+              if (typeof removeEventListener === "function") removeEventListener("online", wake);
+              timer = wake = undefined;
+            }
+          }
+          return DONE;
+        };
+        return {
+          next: () => pull(),
+          return(value) {
+            stopped = true;
+            if (timer !== undefined) clearTimeout(timer);
+            if (wake) wake();
+            // ends the in-flight call through the transport's return() wiring
+            closeIt(value);
+            emitClosed();
+            return Promise.resolve({ done: true, value });
+          }
+        };
+      }
+    };
+    return iterable;
+  };
+  wrapped[SERVER_FUNCTION_METADATA] = metadata;
+  wrapped.id = id;
+  // lazy like the base proxy's: the endpoint may be configured after the
+  // module-scope live(...) call runs
+  Object.defineProperty(wrapped, "url", {
+    get: () => fn.url,
+    configurable: true
+  });
+  return wrapped;
 }
 
 // Only ever referenced by server-mode compiler output; present so a

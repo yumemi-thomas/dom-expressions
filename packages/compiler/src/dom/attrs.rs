@@ -1,9 +1,6 @@
 use crate::error::Result;
 use oxc_allocator::CloneIn;
-use oxc_ast::{
-    ast::{Expression, FormalParameterKind, JSXAttributeItem, Statement},
-    NONE,
-};
+use oxc_ast::ast::{Expression, FormalParameterKind, JSXAttributeItem, Statement};
 use oxc_span::{GetSpan, Span};
 
 use crate::dom::dynamics::DynamicSlot;
@@ -12,7 +9,7 @@ use crate::dom::set_attr::SetAttrOptions;
 use crate::shared::attr_plan::{AttrPlan, AttrPlanOutcome, AttrPlanner, ConfidentValue, PlanValue};
 use crate::shared::bindings::push_unique;
 use crate::shared::constants::{
-    child_properties, inline_elements, ALWAYS_CLOSE_ELEMENTS, BLOCK_ELEMENTS,
+    ALWAYS_CLOSE_ELEMENTS, BLOCK_ELEMENTS, child_properties, inline_elements,
 };
 use crate::shared::refs::{callable_test, ref_assignment_fallback};
 use crate::shared::utils::{
@@ -127,16 +124,15 @@ impl<'a> AstDomTransform<'a, '_> {
                 }
                 if let Some(oxc_ast::ast::JSXAttributeValue::ExpressionContainer(container)) =
                     &attr.value
+                    && let Some(expression) = container.expression.as_expression()
                 {
-                    if let Some(expression) = container.expression.as_expression() {
-                        self.semantic_trace.callback(
-                            expression.span(),
-                            crate::semantic_trace::ExecutionSiteKind::Ref,
-                            crate::semantic_trace::CallbackDecision::RefApply,
-                        );
-                        let value = expression.clone_in(self.allocator);
-                        front_groups.push(self.dom_ref_statements(attr.span, element_id, value));
-                    }
+                    self.semantic_trace.callback(
+                        expression.span(),
+                        crate::semantic_trace::ExecutionSiteKind::Ref,
+                        crate::semantic_trace::CallbackDecision::RefApply,
+                    );
+                    let value = expression.clone_in(self.allocator);
+                    front_groups.push(self.dom_ref_statements(attr.span, element_id, value));
                 }
             }
             for group in front_groups.into_iter().rev() {
@@ -306,7 +302,7 @@ impl<'a> AstDomTransform<'a, '_> {
             PlanValue::Expr(expression) => expression,
             PlanValue::Literal(value) => {
                 self.ast()
-                    .expression_string_literal(span, self.ast().atom(&value), None)
+                    .expression_string_literal(span, self.ast().str(&value), None)
             }
             PlanValue::None => return Ok(()),
         };
@@ -568,8 +564,8 @@ impl<'a> AstDomTransform<'a, '_> {
                     self.ast().vec(),
                     self.ast()
                         .binding_pattern_binding_identifier(span, self.ast().ident(name)),
-                    NONE,
-                    NONE,
+                    None,
+                    None,
                     false,
                     None,
                     false,
@@ -580,11 +576,11 @@ impl<'a> AstDomTransform<'a, '_> {
             span,
             FormalParameterKind::ArrowFormalParameters,
             params,
-            NONE,
+            None,
         );
         let body = self.ast().function_body(span, self.ast().vec(), statements);
         self.ast()
-            .expression_arrow_function(span, false, false, NONE, params, NONE, body)
+            .expression_arrow_function(span, false, false, None, params, None, body)
     }
 
     pub(crate) fn should_close_tag(&self, tag_name: &str, context: CloseTagContext) -> bool {

@@ -8,13 +8,13 @@
 //! generic while emission stays per-mode.
 
 use crate::error::Result;
+use crate::shared::ast_builder::AstBuilder;
 use oxc_ast::ast::{Expression, JSXElement, JSXFragment};
-use oxc_ast::AstBuilder;
 use oxc_span::Span;
 
 use crate::shared::ast::arrow_return_expression;
 use crate::shared::condition::{
-    is_condition_shape, transform_condition_inline, zero_arg_call_thunk, ConditionBuilder,
+    ConditionBuilder, is_condition_shape, transform_condition_inline, zero_arg_call_thunk,
 };
 
 pub(crate) trait ModeLower<'a>: ConditionBuilder<'a> {

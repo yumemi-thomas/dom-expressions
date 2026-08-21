@@ -36,6 +36,7 @@
 // the cookie codec in ../cookies.js. Re-exported here so every existing
 // import site of the shared wire layer keeps working.
 export {
+  LIVE_SOURCE,
   SERVER_FUNCTION_METADATA,
   getServerFunctionMetadata,
   getServerFunctionRPC,
@@ -275,11 +276,14 @@ export const BodyFormat = {
 
 // Nesting deeper than this is not JSON-safe. The guard itself walks an
 // explicit stack so any depth is CHECKABLE, but claiming safety means
-// JSON.stringify must then deliver, and stringify recursion is
-// engine-dependent at extreme depth — past this ceiling the value goes to
-// the codec, whose own depth limit produces a structured error instead of
-// a RangeError that dispatch would misread as the function failing.
-const JSON_SAFE_DEPTH_LIMIT = 10000;
+// JSON.stringify must then deliver. Stringify is recursive and the cliff
+// is engine-dependent: Node 24.19 (CI) overflows around 5900 nested
+// objects on the default V8 stack; Node 26 still clears 10k. The ceiling
+// sits below the Node 24 cliff with headroom for heavier frames / linux
+// x64 CI. Past it the value goes to the codec, whose own depth limit
+// produces a structured error instead of a RangeError that dispatch
+// would misread as the function failing.
+const JSON_SAFE_DEPTH_LIMIT = 4096;
 
 // Sentinel frame on the traversal stack: "all children of the entry below
 // are done — pop it from the ancestor path". Module-private, so it can
@@ -297,9 +301,8 @@ const EXIT = {};
  *
  * Traversal is iterative on an explicit stack with an ancestor set: the
  * old recursive walk overflowed on cycles (forever) and on deep nesting
- * stringify itself handles fine (~8k levels — the guard's frames are
- * heavier than the stringifier's), and that RangeError escaped into
- * dispatch's catch as a phantom function error. Cycle detection is
+ * stringify itself handles on a given engine, and that RangeError escaped
+ * into dispatch's catch as a phantom function error. Cycle detection is
  * ancestor-based on purpose: a value referenced twice WITHOUT a cycle is
  * still JSON-safe (stringify duplicates it, as the fast path always has)
  * — a seen-forever set would start waking the codec for plain data that
@@ -333,6 +336,11 @@ export function isJSONSafe(value) {
     } else {
       const proto = Object.getPrototypeOf(v);
       if (proto !== Object.prototype && proto !== null) return false;
+      // A plain object carrying an iteration protocol is NOT its enumerable
+      // keys: stringify would drop the symbol-keyed method and ship `{}`,
+      // silently losing the stream (async generators dodge this branch only
+      // by prototype). Such values must ride the codec.
+      if (Symbol.asyncIterator in v || Symbol.iterator in v) return false;
       for (const k in v) stack.push(v[k]);
     }
   }
@@ -528,6 +536,12 @@ export class ChunkReader {
  * Serializes a value as a stream of framed SerovalNode chunks. Async values
  * keep the stream open until they settle. Codec options (plugins, feature
  * policy, depth limit) must match the deserializing peer.
+ *
+ * Deliberately teardown-free: this half is re-exported into CLIENT bundles
+ * (rich-args upload, serializeString), where request-lifetime plumbing is
+ * dead weight. The server response path — the only place a consumer can
+ * disconnect from a still-producing stream — uses the hardened variant in
+ * server.js.
  */
 export function serializeStream(value, codecOptions) {
   return new ReadableStream({
@@ -584,7 +598,18 @@ export async function deserializeStream(source, codecOptions) {
       return deserializeChunk(JSON.parse(chunk));
     }
 
-    void reader.drain(interpretChunk);
+    // Failure wiring for the drain: a network drop or malformed frame must
+    // fail every value still waiting on later chunks — otherwise their
+    // promises hang forever and open streams never terminate (and the drain
+    // rejection itself goes unhandled). Normal completion runs the same
+    // sweep: on a well-formed stream every value has already settled and the
+    // sweep no-ops, while a truncation that lands exactly on a frame
+    // boundary — indistinguishable from completion — leaves stranded values
+    // that can never settle once the body is done.
+    reader.drain(interpretChunk).then(
+      () => deserializeChunk.abort(new Error("Server function stream ended unexpectedly.")),
+      error => deserializeChunk.abort(error)
+    );
 
     return interpretChunk(result.value);
   }

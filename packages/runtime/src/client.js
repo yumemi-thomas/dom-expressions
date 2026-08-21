@@ -1331,6 +1331,24 @@ export function getNextElement(template) {
     if (!template) {
       throw new Error(`Hydration Mismatch. Unable to find DOM nodes for hydration key: ${key}`);
     }
+    // A key miss during the hydration walk is a real mismatch: fresh renders
+    // (portals, rejected fragments, post-hydration content) all run with the
+    // hydrating flag off, so there is no legitimate way to get here. The
+    // detached element returned below keeps the render alive but never lands
+    // in the document — without a report that reads as a silently frozen
+    // page (solidjs/solid#3000).
+    if ("_DX_DEV_" && hydrating) {
+      console.warn(
+        `Hydration key miss for "${key}": no server-rendered element carries this key` +
+          (template._html ? ` (template: ${template._html.slice(0, 60)})` : "") +
+          `. A detached element was created instead; its subtree will not appear in the ` +
+          `document or become interactive. This usually means the server and client ` +
+          `hydration id namespaces are misaligned — when hydrating a subtree of a larger ` +
+          `server render, wrap the document shell in <NoHydration> and re-enter with ` +
+          `<Hydration> around the hydrated subtree (or pass hydrate() a renderId matching ` +
+          `the server's <Hydration id>).`
+      );
+    }
     return template(true);
   }
   if ("_DX_DEV_" && template && template._html) {
@@ -1598,6 +1616,12 @@ function eventHandler(e, container, state) {
       ? container
       : findOwner(e.target, state)?.owner);
   if (state && !owner) return;
+  // Same owner as the walk that already completed: nothing remains. This is a
+  // portal container sharing its app root's ownership (registerDelegatedContainer
+  // with the root as owner) seeing an event from inside the root — the resume
+  // path below assumes the boundary is an ancestor of the resume point, which
+  // only holds for nested roots, and climbing past #document crashes (#3008).
+  if (owner && owner === resumeNode) return;
   e[$$EVENT_OWNER] = owner || true;
 
   let node = resumeNode || e.target;
@@ -1624,7 +1648,7 @@ function eventHandler(e, container, state) {
     return true;
   };
   const walkUpTree = () => {
-    while (handleNode()) {
+    while (node && handleNode()) {
       if (node === boundary || node.parentNode === boundary) break;
       node = node._$host || node.parentNode || node.host;
     }
