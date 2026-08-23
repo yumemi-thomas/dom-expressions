@@ -300,9 +300,9 @@ const b = <pre>{"line1"}
 </pre>;
 `,
   "ssr attribute template literal quasis": `
-const a = <div title={\`a"b&c ${x()} d\`} />;
-const b = <div data-src={\`url("${u()}")\`} />;
-const c = <div>{\`a"b&c<d ${x()}\`}</div>;
+const a = <div title={\`a"b&c \${x()} d\`} />;
+const b = <div data-src={\`url("\${u()}")\`} />;
+const c = <div>{\`a"b&c<d \${x()}\`}</div>;
 `,
   "conditional and logical component props": `
 const a = <Comp value={cond() ? x() : y()} />;
@@ -1923,11 +1923,16 @@ const a = <input disabled={false} />;
 `
 };
 
+// The 2.0 Oxc-vs-Babel parity suite owns the original 2.0 probe prefix.
+// The appended 1.x vocabulary is consumed by the Rust semantic-trace census
+// below; those probes are intentionally not asserted as 2.0 output parity.
+const parityCases = Object.fromEntries(Object.entries(cases).slice(0, 254));
+
 describe("Babel vs Oxc parity probes", () => {
   for (const mode of Object.keys(modes)) {
     describe(mode, () => {
-      test.each(Object.keys(cases))("%s", name => {
-        const source = cases[name];
+      test.each(Object.keys(parityCases))("%s", name => {
+        const source = parityCases[name];
         const options = modes[mode].options;
         // Some inputs must *fail* in some modes (e.g. cross-renderer native
         // nesting in dynamic mode); both compilers rejecting is parity too.
