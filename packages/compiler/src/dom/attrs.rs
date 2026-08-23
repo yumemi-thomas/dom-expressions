@@ -403,6 +403,7 @@ impl<'a> AstDomTransform<'a, '_> {
             };
             dynamics.push(DynamicSlot {
                 span,
+                trace_span: semantic_span,
                 elem,
                 key: plan.key,
                 value,

@@ -5,6 +5,8 @@ sidecar is produced by the same lowering pass as `CompileOutput::code`; it
 does not alter generated code. The producer is intentionally conservative:
 facts are source spans and lowering observations, not claims about runtime
 ownership, ancestry, timing, or whether a render eventually occurs.
+The serialized sidecar carries `version: 2` (`SEMANTIC_TRACE_VERSION`) and
+rejects unknown fields.
 
 ## Totality and reconciliation
 
@@ -43,6 +45,10 @@ that never reaches a 2.0 lowering path is not invented as a separate site.
 
 `owner_establishments` contains `{ span, wrapper, group_id? }`. It records
 where a wrapper was emitted and preserves the wrapper identity as a string.
+For a wrapper around an execution site, `span` is exactly the same original
+source span as that `ExecutionSite` (the expression span, not an enclosing
+attribute or generated-AST span); the legacy and successor facts use this
+same site-span rule.
 The consumer maps audited identities through its dialect and maps an unknown
 or unaudited identity to `Unknown`; it must not infer runtime meaning from the
 string. Current producer identities include:

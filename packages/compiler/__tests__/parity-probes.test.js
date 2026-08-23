@@ -1933,8 +1933,8 @@ const parityCases = cases;
 // the parent-output baseline still proves that trace enrichment did not move
 // any bytes. The nine `children` cases exercise the 2.0 component prop-loop
 // gap (an explicit children prop is emitted alongside JSX children); the three
-// namespace cases use 1.x namespaced-attribute syntax that the 2.0 AST-native
-// milestone rejects before lowering.
+// namespace cases and one namespaced directive use 1.x syntax that the 2.0
+// AST-native milestone rejects before lowering.
 const parityExclusions = new Map([
   [
     "1x children attribute shadowed by jsx child",
@@ -1981,18 +1981,7 @@ const parityExclusions = new Map([
   [
     "1x ref after spread with directive",
     "2.0 AST-native lowering rejects this namespaced directive ordering"
-  ],
-  [
-    "ssr attribute template literal quasis",
-    "2.0 SSR Oxc preserves decoded quasis where the 1.x reference re-escapes them"
-  ],
-  ["innerHTML and textContent", "2.0 hydratable SSR records the 2.0-only scope wrapper"],
-  ["1x bool namespace function value", "2.0 SSR Oxc rejects this 1.x namespace form"],
-  [
-    "1x innerHTML dynamic with sibling attribute",
-    "2.0 hydratable SSR records the 2.0-only scope wrapper"
-  ],
-  ["1x innerText dynamic", "2.0 hydratable SSR records the 2.0-only scope wrapper"]
+  ]
 ]);
 
 describe("Babel vs Oxc parity probes", () => {

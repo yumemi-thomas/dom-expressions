@@ -20,8 +20,8 @@ pub use compiler::{CompileOptions, CompileOutput, Generate, Renderer, Wrapper, c
 pub use error::{CompileError, CompileErrorKind};
 pub use semantic_trace::{
     CallbackDecision, ComponentRenderSite, DeferredCallbackSite, ExecutionSite, ExecutionSiteKind,
-    OwnerEstablishment, OwnershipDecision, OwnershipSite, SemanticTrace, SourceSpan,
-    TerminalDecision, ValueDecision,
+    OwnerEstablishment, OwnershipDecision, OwnershipSite, SEMANTIC_TRACE_VERSION, SemanticTrace,
+    SourceSpan, TerminalDecision, ValueDecision,
 };
 
 /// Cargo package version of the compiler implementation producing semantic

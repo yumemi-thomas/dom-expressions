@@ -571,6 +571,7 @@ mod tests {
         assert_eq!(
             traced.semantic_trace,
             Some(SemanticTrace {
+                version: crate::semantic_trace::SEMANTIC_TRACE_VERSION,
                 sites: vec![
                     ExecutionSite {
                         span: span(source, "name()"),
@@ -605,7 +606,7 @@ mod tests {
                 ],
                 owner_establishments: vec![
                     crate::semantic_trace::OwnerEstablishment {
-                        span: span(source, "title={name()}"),
+                        span: span(source, "name()"),
                         wrapper: "effect".into(),
                         group_id: None,
                     },
@@ -703,6 +704,7 @@ mod tests {
         assert_eq!(
             output.semantic_trace,
             Some(SemanticTrace {
+                version: crate::semantic_trace::SEMANTIC_TRACE_VERSION,
                 sites: vec![
                     ExecutionSite {
                         span: span(source, "items()"),
@@ -880,6 +882,7 @@ mod tests {
         assert_eq!(
             output.semantic_trace,
             Some(SemanticTrace {
+                version: crate::semantic_trace::SEMANTIC_TRACE_VERSION,
                 sites: vec![ExecutionSite {
                     span: span(source, "signal()"),
                     kind: ExecutionSiteKind::NativeAttribute,

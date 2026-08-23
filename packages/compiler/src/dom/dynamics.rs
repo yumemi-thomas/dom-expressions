@@ -12,6 +12,9 @@ use crate::shared::utils::get_numbered_id;
 /// wrapped into a single effect by `wrap_dynamics_statement`.
 pub(crate) struct DynamicSlot<'a> {
     pub(crate) span: Span,
+    /// Original source span of the execution site. `span` is retained for
+    /// generated AST locations; trace facts must join the census site.
+    pub(crate) trace_span: Option<Span>,
     pub(crate) elem: String,
     pub(crate) key: String,
     pub(crate) value: Expression<'a>,
@@ -36,8 +39,10 @@ impl<'a> AstDomTransform<'a, '_> {
         if let Some(wrapper) = self.effect_wrapper.as_deref() {
             let group_id = (dynamics.len() > 1).then(|| self.semantic_trace.next_group_id());
             for slot in &dynamics {
-                self.semantic_trace
-                    .owner_establishment(slot.span, wrapper, group_id);
+                if let Some(span) = slot.trace_span {
+                    self.semantic_trace
+                        .owner_establishment(span, wrapper, group_id);
+                }
             }
         }
 

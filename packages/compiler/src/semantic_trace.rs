@@ -9,6 +9,9 @@ use oxc_ast::ast::{
 use oxc_ast_visit::Visit;
 use oxc_span::{GetSpan, Span};
 
+/// Version of the typed semantic-trace schema.
+pub const SEMANTIC_TRACE_VERSION: u32 = 2;
+
 use crate::shared::attr_plan::static_style_key;
 use crate::shared::bindings::BindingTable;
 use crate::shared::utils::{
@@ -16,6 +19,7 @@ use crate::shared::utils::{
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceSpan {
     pub start: u32,
     pub end: u32,
@@ -83,6 +87,7 @@ pub enum TerminalDecision {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionSite {
     pub span: SourceSpan,
     pub kind: ExecutionSiteKind,
@@ -101,6 +106,7 @@ pub enum OwnershipDecision {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnershipSite {
     pub span: SourceSpan,
     pub decision: OwnershipDecision,
@@ -109,6 +115,7 @@ pub struct OwnershipSite {
 /// Experimental facts about how JSX source values and callbacks are lowered
 /// and executed in DOM mode.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnerEstablishment {
     pub span: SourceSpan,
     pub wrapper: String,
@@ -117,19 +124,22 @@ pub struct OwnerEstablishment {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComponentRenderSite {
     pub span: SourceSpan,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeferredCallbackSite {
     pub span: SourceSpan,
     pub receiver_span: SourceSpan,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticTrace {
+    pub version: u32,
     pub sites: Vec<ExecutionSite>,
     pub ownership_sites: Vec<OwnershipSite>,
     #[serde(default)]
@@ -138,6 +148,19 @@ pub struct SemanticTrace {
     pub component_render_sites: Vec<ComponentRenderSite>,
     #[serde(default)]
     pub deferred_callback_sites: Vec<DeferredCallbackSite>,
+}
+
+impl Default for SemanticTrace {
+    fn default() -> Self {
+        Self {
+            version: SEMANTIC_TRACE_VERSION,
+            sites: Vec::new(),
+            ownership_sites: Vec::new(),
+            owner_establishments: Vec::new(),
+            component_render_sites: Vec::new(),
+            deferred_callback_sites: Vec::new(),
+        }
+    }
 }
 
 impl ValueDecision {
@@ -905,6 +928,7 @@ impl TraceRecorder {
         deferred_callback_sites.sort_unstable();
         deferred_callback_sites.dedup();
         Ok(Some(SemanticTrace {
+            version: SEMANTIC_TRACE_VERSION,
             sites,
             ownership_sites,
             owner_establishments,

@@ -91,10 +91,7 @@ fn owner_facts_preserve_wrapper_identity_and_shared_effect_groups() {
             )
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        effects,
-        [("title={props.title}", Some(0)), ("id={props.id}", Some(0))]
-    );
+    assert_eq!(effects, [("props.title", Some(0)), ("props.id", Some(0))]);
 
     let custom = compile(
         "const C = (props) => <div title={props.value} />;",
@@ -112,8 +109,35 @@ fn owner_facts_preserve_wrapper_identity_and_shared_effect_groups() {
                 "const C = (props) => <div title={props.value} />;",
                 fact.span.start,
                 fact.span.end,
-            ) == "title={props.value}"
+            ) == "props.value"
     }));
+}
+
+#[test]
+fn effect_facts_join_their_execution_site_spans() {
+    for source in [
+        "const C = (props) => <div title={props.title} />;",
+        "const C = (props) => <div style={{ color: props.color }} />;",
+        "const C = (props) => <div class={{ active: props.active }} />;",
+    ] {
+        let rendered = trace(source);
+        let site_spans = rendered
+            .sites
+            .iter()
+            .filter(|site| {
+                site.kind == ExecutionSiteKind::NativeAttribute
+                    && site.decision == TerminalDecision::Value(ValueDecision::ReactiveRerun)
+            })
+            .map(|site| source_text(source, site.span.start, site.span.end))
+            .collect::<Vec<_>>();
+        let effect_spans = rendered
+            .owner_establishments
+            .iter()
+            .filter(|fact| fact.wrapper == "effect")
+            .map(|fact| source_text(source, fact.span.start, fact.span.end))
+            .collect::<Vec<_>>();
+        assert_eq!(effect_spans, site_spans, "effect span drift for {source}");
+    }
 }
 
 #[test]
@@ -131,7 +155,7 @@ fn owner_facts_cover_insert_events_refs_and_the_2_0_scope_wrapper() {
         })
         .collect::<Vec<_>>();
     for expected in [
-        ("effect", "title={props.title}"),
+        ("effect", "props.title"),
         ("insert", "props.child"),
         ("delegated", "props.onClick"),
         ("ref-apply", "props.ref"),

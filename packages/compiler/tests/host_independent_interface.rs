@@ -90,6 +90,10 @@ fn public_core_returns_owned_code_and_typed_semantics() {
 
     assert!(output.code.contains("insert"));
     let trace = output.semantic_trace.expect("semantic trace");
+    assert_eq!(
+        trace.version,
+        dom_expressions_compiler::SEMANTIC_TRACE_VERSION
+    );
     assert_eq!(trace.sites.len(), 1);
     assert_eq!(trace.sites[0].kind, ExecutionSiteKind::JsxChild);
     assert_eq!(
@@ -306,12 +310,24 @@ fn semantic_trace_facts_round_trip_with_closed_vocabulary() {
 
 #[test]
 fn pinned_ownership_trace_fields_remain_accepted_until_consumer_migration() {
-    let legacy = r#"{"sites":[],"ownership_sites":[]}"#;
+    let legacy = r#"{"version":2,"sites":[],"ownership_sites":[]}"#;
     let trace = serde_json::from_str::<dom_expressions_compiler::SemanticTrace>(legacy)
         .expect("the pinned consumer still reads ownership_sites");
+    assert_eq!(
+        trace.version,
+        dom_expressions_compiler::SEMANTIC_TRACE_VERSION
+    );
     assert!(trace.sites.is_empty());
     assert!(trace.ownership_sites.is_empty());
     assert!(trace.owner_establishments.is_empty());
+}
+
+#[test]
+fn semantic_trace_rejects_unknown_fields() {
+    let result = serde_json::from_str::<dom_expressions_compiler::SemanticTrace>(
+        r#"{"version":2,"sites":[],"ownership_sites":[],"future":[]}"#,
+    );
+    assert!(result.is_err());
 }
 
 #[test]
