@@ -305,9 +305,13 @@ fn semantic_trace_facts_round_trip_with_closed_vocabulary() {
 }
 
 #[test]
-fn legacy_ownership_trace_fields_are_rejected() {
+fn pinned_ownership_trace_fields_remain_accepted_until_consumer_migration() {
     let legacy = r#"{"sites":[],"ownership_sites":[]}"#;
-    assert!(serde_json::from_str::<dom_expressions_compiler::SemanticTrace>(legacy).is_err());
+    let trace = serde_json::from_str::<dom_expressions_compiler::SemanticTrace>(legacy)
+        .expect("the pinned consumer still reads ownership_sites");
+    assert!(trace.sites.is_empty());
+    assert!(trace.ownership_sites.is_empty());
+    assert!(trace.owner_establishments.is_empty());
 }
 
 #[test]

@@ -32,8 +32,6 @@ pub(crate) trait ComponentLower<'a>:
     fn mark_create_component(&mut self);
     /// Records a component render site when this mode supplies a trace.
     fn trace_component_render_site(&mut self, _span: Span) {}
-    /// Records a deferred component callback and its JSX receiver span.
-    fn trace_deferred_callback(&mut self, _span: Span, _receiver_span: Span) {}
     /// Whether this element is the JSX root currently being lowered (Babel
     /// keeps a raw `this` in the root tag callee).
     fn is_jsx_root_tag(&self, span: Span) -> bool;
@@ -164,7 +162,7 @@ pub(crate) fn lower_component_with_setup<'a, C: ComponentLower<'a>>(
             let value_span = value.span();
             if let Some(ref_property) = ctx.component_ref_prop(attr.span, value, &mut setup) {
                 ctx.trace_deferred_callback(value_span, element.span);
-                ctx.trace_wrapper(attr.span, "ref-apply", None);
+                ctx.trace_wrapper(value_span, "ref-apply", None);
                 running_props.push(ref_property);
             }
         } else if needs_getter && !condition_inlined {
@@ -191,7 +189,7 @@ pub(crate) fn lower_component_with_setup<'a, C: ComponentLower<'a>>(
         }
     }
 
-    let children = component_children(ctx, &element.children, render_callbacks)?;
+    let children = component_children(ctx, &element.children, render_callbacks, element.span)?;
     if let Some(children) = children {
         if children.needs_getter {
             running_props.push(crate::shared::ast::object_getter_property_with_setup(
@@ -252,11 +250,6 @@ impl<'a> ComponentLower<'a> for AstDomTransform<'a, '_> {
 
     fn trace_component_render_site(&mut self, span: Span) {
         self.semantic_trace.component_render_site(span);
-    }
-
-    fn trace_deferred_callback(&mut self, span: Span, receiver_span: Span) {
-        self.semantic_trace
-            .deferred_callback_site(span, receiver_span);
     }
 
     fn is_jsx_root_tag(&self, span: Span) -> bool {

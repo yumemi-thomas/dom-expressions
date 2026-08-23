@@ -11,13 +11,16 @@ ownership, ancestry, timing, or whether a render eventually occurs.
 Before lowering, `ExecutionCensus` enumerates every supported JSX execution
 site. During lowering, `TraceRecorder` records the decision at the emission
 site. `finish()` rejects an unresolved censused site, a conflicting decision,
-or a decision for a site absent from the census. The corpus test runs the DOM
-fixture corpus and more than 400 parity probes through this reconciliation.
+or a decision for a site absent from the census. The corpus test runs every
+fixture family and all 449 parity probes through this reconciliation.
 
-The harness also compiles every probe with tracing enabled and disabled and
-asserts byte-identical `CompileOutput::code`. This is the invariant for all
-future semantic-trace changes: enrichment may add facts, but `transform()`
-output must not move.
+The transform invariant is checked separately against the checked-in
+`tests/transform-output-baseline.txt`, generated from the parent compiler
+revision. It compares the exact `CompileOutput::code` bytes for every corpus
+entry, including explicit parent rejections, and includes a one-byte canary
+that the comparator must reject. A trace-on/trace-off comparison is only an
+additive side-channel smoke test; it cannot prove base-vs-head identity when
+both sides are produced by the same build.
 
 ## Execution sites
 
@@ -32,7 +35,9 @@ terminal decision. The kind and decision describe the lowering branch:
   than re-deriving built-in identity from their own JSX walk.
 
 Unconfigured or shadowed built-ins remain ordinary `component-child` sites.
-Literal-only expressions and values discarded by lowering are not sites.
+Literal-only expressions are not sites. When a lowering path discards a
+censused value, the value itself may be recorded as `elided`; nested source
+that never reaches a 2.0 lowering path is not invented as a separate site.
 
 ## Additive wrapper facts
 
@@ -45,8 +50,7 @@ string. Current producer identities include:
 - `effect` (or the configured effect wrapper), with one shared `group_id` for
   the entries emitted by one multi-dynamic effect;
 - `memo` (or the configured memo wrapper);
-- `createComponent`, `insert`, `addEventListener`, `delegated-event`, and
-  `ref-apply`;
+- `createComponent`, `insert`, `direct`, `delegated`, and `ref-apply`;
 - `scope`, the 2.0-only hydration-scope emission site.
 
 `group_id` links spans sharing one wrapper invocation. It is not a runtime
@@ -63,10 +67,11 @@ deferred component prop, spread, or ref value to the enclosing JSX component
 span. It is a source relationship only; the consumer may attach the callback
 to the receiver span but must not infer callback timing or receiver behavior.
 
-This vocabulary replaces the retired ownership-decision fields. Consumers
-must migrate to the three additive fact collections before consuming this
-producer pin. Unknown wrapper identities remain representable so the consumer
-can fail closed to `Unknown` without losing the source location.
+`owner_establishments` is the additive successor vocabulary. The legacy
+`ownership_sites` field and `OwnershipDecision::{Owned, Unowned, Leaf}` remain
+emitted for the currently pinned consumer and will be removed only after that
+consumer migrates. Unknown wrapper identities remain representable so the
+consumer can fail closed to `Unknown` without losing the source location.
 
 ## Scope
 

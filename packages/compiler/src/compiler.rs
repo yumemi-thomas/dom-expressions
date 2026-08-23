@@ -605,29 +605,28 @@ mod tests {
                 ],
                 owner_establishments: vec![
                     crate::semantic_trace::OwnerEstablishment {
-                        span: span(
-                            source,
-                            "<div title={name()} onClick={handle} ref={node}>{count()}</div>"
-                        ),
-                        wrapper: "insert".into(),
-                        group_id: None,
-                    },
-                    crate::semantic_trace::OwnerEstablishment {
                         span: span(source, "title={name()}"),
                         wrapper: "effect".into(),
                         group_id: None,
                     },
                     crate::semantic_trace::OwnerEstablishment {
-                        span: span(source, "onClick={handle}"),
-                        wrapper: "addEventListener".into(),
+                        span: span(source, "handle"),
+                        wrapper: "delegated".into(),
                         group_id: None,
                     },
                     crate::semantic_trace::OwnerEstablishment {
-                        span: span(source, "ref={node}"),
+                        span: span(source, "node"),
                         wrapper: "ref-apply".into(),
                         group_id: None,
                     },
+                    crate::semantic_trace::OwnerEstablishment {
+                        span: span(source, "count()"),
+                        wrapper: "insert".into(),
+                        group_id: None,
+                    },
                 ],
+                component_render_sites: vec![],
+                deferred_callback_sites: vec![],
             })
         );
     }
@@ -735,7 +734,7 @@ mod tests {
                         group_id: None,
                     },
                     crate::semantic_trace::OwnerEstablishment {
-                        span: span(source, "<span>{item.name}</span>"),
+                        span: span(source, "item.name"),
                         wrapper: "insert".into(),
                         group_id: None,
                     },
@@ -746,13 +745,22 @@ mod tests {
                         "<For each={items()}>{item => <span>{item.name}</span>}</For>"
                     ),
                 }],
-                deferred_callback_sites: vec![crate::semantic_trace::DeferredCallbackSite {
-                    span: span(source, "items()"),
-                    receiver_span: span(
-                        source,
-                        "<For each={items()}>{item => <span>{item.name}</span>}</For>"
-                    ),
-                }],
+                deferred_callback_sites: vec![
+                    crate::semantic_trace::DeferredCallbackSite {
+                        span: span(source, "items()"),
+                        receiver_span: span(
+                            source,
+                            "<For each={items()}>{item => <span>{item.name}</span>}</For>"
+                        ),
+                    },
+                    crate::semantic_trace::DeferredCallbackSite {
+                        span: span(source, "item => <span>{item.name}</span>"),
+                        receiver_span: span(
+                            source,
+                            "<For each={items()}>{item => <span>{item.name}</span>}</For>"
+                        ),
+                    }
+                ],
             })
         );
     }

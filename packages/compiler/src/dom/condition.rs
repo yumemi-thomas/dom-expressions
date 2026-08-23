@@ -4,7 +4,8 @@ use oxc_span::{GetSpan, Span};
 
 use crate::dom::element::AstDomTransform;
 use crate::shared::condition::{
-    ConditionBuilder, is_condition_shape, memo_wrap_thunk, transform_condition, zero_arg_call_thunk,
+    ConditionBuilder, is_condition_shape, memo_wrap_thunk, memo_wrap_thunk_with_trace,
+    zero_arg_call_thunk,
 };
 use crate::shared::mode_lower::ModeLower;
 
@@ -27,6 +28,10 @@ impl<'a> ConditionBuilder<'a> for AstDomTransform<'a, '_> {
             .owner_establishment(span, wrapper, group_id);
     }
 
+    fn trace_enabled(&self) -> bool {
+        self.semantic_trace.is_recording()
+    }
+
     fn memo_wrapper_identity(&self) -> Option<&str> {
         self.memo_wrapper.as_deref()
     }
@@ -41,6 +46,11 @@ impl<'a> ConditionBuilder<'a> for AstDomTransform<'a, '_> {
 }
 
 impl<'a> crate::shared::component_children::ComponentChildLower<'a> for AstDomTransform<'a, '_> {
+    fn trace_deferred_callback(&mut self, span: Span, receiver_span: Span) {
+        self.semantic_trace
+            .deferred_callback_site(span, receiver_span);
+    }
+
     fn lower_child_element_with_setup(
         &mut self,
         element: &JSXElement<'a>,
@@ -83,6 +93,15 @@ impl<'a> ModeLower<'a> for AstDomTransform<'a, '_> {
         memo_wrap_thunk(self, span, thunk)
     }
 
+    fn memo_wrap_dynamic_child_with_trace(
+        &mut self,
+        span: Span,
+        trace_span: Span,
+        thunk: Expression<'a>,
+    ) -> Expression<'a> {
+        memo_wrap_thunk_with_trace(self, span, trace_span, thunk)
+    }
+
     fn fragment_array_span(&self, fragment: &JSXFragment<'a>) -> Span {
         fragment
             .children
@@ -98,11 +117,14 @@ impl<'a> AstDomTransform<'a, '_> {
     pub(crate) fn dom_child_expression(
         &mut self,
         span: Span,
+        trace_span: Span,
         value: Expression<'a>,
     ) -> Expression<'a> {
         if self.wrap_conditionals && is_condition_shape(&value) {
-            return transform_condition(self, span, value, false)
-                .into_expression(self.allocator, span);
+            return crate::shared::condition::transform_condition_with_trace(
+                self, span, trace_span, value, false,
+            )
+            .into_expression(self.allocator, span);
         }
         if let Some(callee) = zero_arg_call_thunk(&value, self.allocator) {
             return callee;

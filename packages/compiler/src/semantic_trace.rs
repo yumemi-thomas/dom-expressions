@@ -92,8 +92,7 @@ pub struct ExecutionSite {
 /// Reactive owner state established by compiler-generated lowering around a
 /// source region. The trace reports only states the compiler proves; absence
 /// means the surrounding runtime or caller determines ownership.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OwnershipDecision {
     Owned,
@@ -576,6 +575,9 @@ impl ExecutionCensus {
                     }
                 }
 
+                // Void native elements discard their child list before the
+                // 2.0 lowering pass reaches it; do not census expressions the
+                // emitter cannot resolve.
                 if native_tag_name.is_some_and(is_void_element) {
                     oxc_ast_visit::walk::walk_jsx_opening_element(self, &element.opening_element);
                     return;
@@ -691,6 +693,10 @@ impl TraceRecorder {
         let group_id = self.next_group_id;
         self.next_group_id = self.next_group_id.wrapping_add(1);
         group_id
+    }
+
+    pub(crate) fn is_recording(&self) -> bool {
+        self.census.is_some()
     }
 
     pub(crate) fn owner_establishment(&mut self, span: Span, wrapper: &str, group_id: Option<u64>) {
@@ -841,7 +847,10 @@ impl TraceRecorder {
                 span.start, span.end
             ));
         } else if self.default_effect_wrapper
-            && matches!(decision, TerminalDecision::Value(ValueDecision::ReactiveRerun))
+            && matches!(
+                decision,
+                TerminalDecision::Value(ValueDecision::ReactiveRerun)
+            )
         {
             self.ownership_sites.push(OwnershipSite {
                 span: span.into(),
@@ -972,6 +981,11 @@ mod tests {
 
         let mut recorder = TraceRecorder::new(census(ExecutionSiteKind::JsxChild), true);
         let group_id = recorder.next_group_id();
+        recorder.value(
+            Span::new(1, 2),
+            ExecutionSiteKind::JsxChild,
+            ValueDecision::EagerOnce,
+        );
         recorder.owner_establishment(Span::new(3, 4), "effect", Some(group_id));
         recorder.owner_establishment(Span::new(1, 2), "effect", Some(group_id));
         let trace = recorder.finish().unwrap().unwrap();

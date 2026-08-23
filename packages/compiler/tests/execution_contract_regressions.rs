@@ -7,8 +7,8 @@
 #![cfg(not(feature = "node"))]
 
 use dom_expressions_compiler::{
-    compile, CallbackDecision, CompileOptions, ExecutionSiteKind, SemanticTrace, TerminalDecision,
-    ValueDecision, Wrapper,
+    CallbackDecision, CompileOptions, ExecutionSiteKind, SemanticTrace, TerminalDecision,
+    ValueDecision, Wrapper, compile,
 };
 
 fn options(semantic_trace: bool) -> CompileOptions {
@@ -28,7 +28,7 @@ fn trace(source: &str) -> SemanticTrace {
         .expect("semantic trace")
 }
 
-fn source_text<'a>(source: &'a str, start: u32, end: u32) -> &'a str {
+fn source_text(source: &str, start: u32, end: u32) -> &str {
     &source[start as usize..end as usize]
 }
 
@@ -36,19 +36,21 @@ fn source_text<'a>(source: &'a str, start: u32, end: u32) -> &'a str {
 fn control_flow_render_is_authoritative_and_requires_configuration() {
     let source = r#"const C = () => <Show>{() => <span>{value()}</span>}</Show>;"#;
     let configured = trace(source);
-    assert!(configured
-        .sites
-        .contains(&dom_expressions_compiler::ExecutionSite {
-            span: configured
-                .sites
-                .iter()
-                .find(|site| source_text(source, site.span.start, site.span.end)
-                    == "() => <span>{value()}</span>")
-                .expect("function child site")
-                .span,
-            kind: ExecutionSiteKind::ControlFlowRender,
-            decision: TerminalDecision::Callback(CallbackDecision::LaterRender),
-        }));
+    assert!(
+        configured
+            .sites
+            .contains(&dom_expressions_compiler::ExecutionSite {
+                span: configured
+                    .sites
+                    .iter()
+                    .find(|site| source_text(source, site.span.start, site.span.end)
+                        == "() => <span>{value()}</span>")
+                    .expect("function child site")
+                    .span,
+                kind: ExecutionSiteKind::ControlFlowRender,
+                decision: TerminalDecision::Callback(CallbackDecision::LaterRender),
+            })
+    );
 
     let unconfigured = compile(
         source,
@@ -130,12 +132,9 @@ fn owner_facts_cover_insert_events_refs_and_the_2_0_scope_wrapper() {
         .collect::<Vec<_>>();
     for expected in [
         ("effect", "title={props.title}"),
-        (
-            "insert",
-            "<div title={props.title} onClick={props.onClick} ref={props.ref}>{props.child}</div>",
-        ),
-        ("addEventListener", "onClick={props.onClick}"),
-        ("ref-apply", "ref={props.ref}"),
+        ("insert", "props.child"),
+        ("delegated", "props.onClick"),
+        ("ref-apply", "props.ref"),
     ] {
         assert!(facts.contains(&expected), "missing owner fact {expected:?}");
     }
@@ -151,10 +150,29 @@ fn owner_facts_cover_insert_events_refs_and_the_2_0_scope_wrapper() {
     .expect("compile hydratable source")
     .semantic_trace
     .expect("semantic trace");
-    assert!(hydration
-        .owner_establishments
-        .iter()
-        .any(|fact| fact.wrapper == "scope"));
+    assert!(
+        hydration
+            .owner_establishments
+            .iter()
+            .any(|fact| fact.wrapper == "scope")
+    );
+}
+
+#[test]
+fn memo_wrapper_facts_use_the_original_expression_span() {
+    for source in [
+        "const C = () => <Show>{value() ? left() : right()}</Show>;",
+        "const C = () => <div>{value() ? left() : right()}</div>;",
+    ] {
+        let rendered = trace(source);
+        let memos = rendered
+            .owner_establishments
+            .iter()
+            .filter(|fact| fact.wrapper == "memo")
+            .map(|fact| source_text(source, fact.span.start, fact.span.end))
+            .collect::<Vec<_>>();
+        assert_eq!(memos, ["value() ? left() : right()"]);
+    }
 }
 
 #[test]
@@ -213,8 +231,10 @@ fn disabled_wrappers_do_not_invent_wrapper_facts() {
     .expect("compile with disabled wrappers")
     .semantic_trace
     .expect("semantic trace");
-    assert!(rendered
-        .owner_establishments
-        .iter()
-        .all(|fact| fact.wrapper != "effect" && fact.wrapper != "memo"));
+    assert!(
+        rendered
+            .owner_establishments
+            .iter()
+            .all(|fact| fact.wrapper != "effect" && fact.wrapper != "memo")
+    );
 }

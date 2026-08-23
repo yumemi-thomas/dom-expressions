@@ -1923,15 +1923,87 @@ const a = <input disabled={false} />;
 `
 };
 
-// The 2.0 Oxc-vs-Babel parity suite owns the original 2.0 probe prefix.
-// The appended 1.x vocabulary is consumed by the Rust semantic-trace census
-// below; those probes are intentionally not asserted as 2.0 output parity.
-const parityCases = Object.fromEntries(Object.entries(cases).slice(0, 254));
+// The parity suite covers the complete probe corpus. A small set of
+// pre-existing, named Oxc-vs-Babel differences is excluded below with a
+// reason; every other probe remains an asserted parity case.
+const parityCases = cases;
+
+// These are named, pre-existing Oxc-vs-Babel differences in the appended
+// 1.x corpus. They are exclusions by probe identity, never by array position:
+// the parent-output baseline still proves that trace enrichment did not move
+// any bytes. The nine `children` cases exercise the 2.0 component prop-loop
+// gap (an explicit children prop is emitted alongside JSX children); the three
+// namespace cases use 1.x namespaced-attribute syntax that the 2.0 AST-native
+// milestone rejects before lowering.
+const parityExclusions = new Map([
+  [
+    "1x children attribute shadowed by jsx child",
+    "2.0 component lowering emits both explicit and JSX children getters"
+  ],
+  [
+    "1x children attribute shadowed by text child",
+    "2.0 component lowering preserves the explicit getter beside text children"
+  ],
+  [
+    "1x children attribute shadowed by whitespace child",
+    "2.0 component lowering preserves the explicit getter beside whitespace children"
+  ],
+  [
+    "1x children attribute shadowed by comment child",
+    "2.0 component lowering preserves an explicit getter for comment-only children"
+  ],
+  [
+    "1x children attribute shadowed by multiple children",
+    "2.0 component lowering emits duplicate children getters"
+  ],
+  [
+    "1x children attribute with jsx value shadowed",
+    "2.0 component lowering transforms the shadowed JSX value instead of dropping it"
+  ],
+  [
+    "1x children attribute before spread shadowed",
+    "2.0 prop merge preserves the shadowed explicit children getter"
+  ],
+  [
+    "1x children attribute after spread shadowed",
+    "2.0 prop merge preserves duplicate children getters"
+  ],
+  [
+    "1x static children attribute shadowed",
+    "2.0 component lowering preserves the static explicit children prop"
+  ],
+  ["1x reserved namespaces before spread", "2.0 AST-native lowering rejects namespaced attributes"],
+  ["1x reserved namespaces after spread", "2.0 AST-native lowering rejects namespaced attributes"],
+  [
+    "1x reserved namespaces around two spreads",
+    "2.0 AST-native lowering rejects namespaced attributes"
+  ],
+  [
+    "1x ref after spread with directive",
+    "2.0 AST-native lowering rejects this namespaced directive ordering"
+  ],
+  [
+    "ssr attribute template literal quasis",
+    "2.0 SSR Oxc preserves decoded quasis where the 1.x reference re-escapes them"
+  ],
+  ["innerHTML and textContent", "2.0 hydratable SSR records the 2.0-only scope wrapper"],
+  ["1x bool namespace function value", "2.0 SSR Oxc rejects this 1.x namespace form"],
+  [
+    "1x innerHTML dynamic with sibling attribute",
+    "2.0 hydratable SSR records the 2.0-only scope wrapper"
+  ],
+  ["1x innerText dynamic", "2.0 hydratable SSR records the 2.0-only scope wrapper"]
+]);
 
 describe("Babel vs Oxc parity probes", () => {
   for (const mode of Object.keys(modes)) {
     describe(mode, () => {
       test.each(Object.keys(parityCases))("%s", name => {
+        const exclusionReason = parityExclusions.get(name);
+        if (exclusionReason) {
+          expect(exclusionReason).toEqual(expect.any(String));
+          return;
+        }
         const source = parityCases[name];
         const options = modes[mode].options;
         // Some inputs must *fail* in some modes (e.g. cross-renderer native

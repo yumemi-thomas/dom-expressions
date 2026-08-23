@@ -166,7 +166,7 @@ impl<'a> AstDomTransform<'a, '_> {
                             marker,
                         ));
                         self.semantic_trace
-                            .owner_establishment(element.span, "insert", None);
+                            .owner_establishment(child.span, "insert", None);
                     } else if let Some(static_template) = lower_static_native_template(
                         self,
                         child,
@@ -321,7 +321,11 @@ impl<'a> AstDomTransform<'a, '_> {
                         let value =
                             jsx_expression_to_expression(&container.expression, self.allocator);
                         let value = if dynamic {
-                            self.dom_child_expression(container.span, value)
+                            self.dom_child_expression(
+                                container.span,
+                                container.expression.span(),
+                                value,
+                            )
                         } else {
                             value
                         };
@@ -361,8 +365,11 @@ impl<'a> AstDomTransform<'a, '_> {
                             value,
                             marker,
                         ));
-                        self.semantic_trace
-                            .owner_establishment(element.span, "insert", None);
+                        self.semantic_trace.owner_establishment(
+                            container.expression.span(),
+                            "insert",
+                            None,
+                        );
                     }
                     index = run_end;
                     continue;
@@ -400,8 +407,11 @@ impl<'a> AstDomTransform<'a, '_> {
                         declarations,
                     );
                     operations.push(self.insert_statement(element.span, element_id, value, marker));
-                    self.semantic_trace
-                        .owner_establishment(element.span, "insert", None);
+                    self.semantic_trace.owner_establishment(
+                        spread.expression.span(),
+                        "insert",
+                        None,
+                    );
                 }
                 _ => {
                     return Err(Error::from_reason(

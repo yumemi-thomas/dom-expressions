@@ -3,13 +3,15 @@
 //! The source census is independent of DOM lowering. Compiling the complete
 //! Babel fixture corpus and adversarial probe corpus with tracing enabled makes
 //! every lowering path prove that it reported the sites the census found. The
-//! same corpus is then compiled with tracing disabled to prove that trace
-//! collection is additive and cannot change generated code.
+//! transform half is checked against a checked-in output baseline produced
+//! from the parent compiler revision. A trace-on/trace-off comparison is still
+//! useful as a local additive check, but it is not the invariant: both sides
+//! of that comparison can share the same codegen regression.
 #![cfg(not(feature = "node"))]
 
 use std::path::{Path, PathBuf};
 
-use dom_expressions_compiler::{compile, CompileOptions};
+use dom_expressions_compiler::{CompileOptions, compile};
 
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -18,9 +20,9 @@ fn fixture_root() -> PathBuf {
         .expect("the Babel fixture corpus is a workspace sibling")
 }
 
-/// Every DOM fixture source in the Babel corpus. Semantic tracing is currently
-/// a DOM-only compiler contract, so SSR/universal fixture directories are
-/// intentionally outside this producer-stage census.
+/// Every fixture source in every Babel family. The producer is DOM-only, so
+/// all families are fed through the same DOM options; inputs the parent
+/// compiler rejects remain explicit `reject` entries in the output baseline.
 fn fixture_sources() -> Vec<(String, String)> {
     let mut sources = Vec::new();
     let root = fixture_root();
@@ -29,7 +31,7 @@ fn fixture_sources() -> Vec<(String, String)> {
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            name.starts_with("__dom").then(|| (name, entry.path()))
+            name.starts_with("__").then(|| (name, entry.path()))
         })
         .collect::<Vec<_>>();
     dirs.sort();
@@ -121,12 +123,24 @@ fn options(semantic_trace: bool) -> CompileOptions {
     }
 }
 
+fn corpus_sources() -> Vec<(String, String)> {
+    fixture_sources()
+        .into_iter()
+        .map(|(id, source)| (format!("fixture/{id}"), source))
+        .chain(
+            probe_sources()
+                .into_iter()
+                .map(|(id, source)| (format!("probe/{id}"), source)),
+        )
+        .collect()
+}
+
 #[test]
 fn every_fixture_reconciles_census_against_lowering() {
     let sources = fixture_sources();
     assert!(
-        sources.len() > 40,
-        "expected the full fixture corpus, found {}",
+        sources.len() >= 88,
+        "expected all fixture families, found only {} fixtures",
         sources.len()
     );
 
@@ -169,9 +183,10 @@ fn every_fixture_reconciles_census_against_lowering() {
 #[test]
 fn every_parity_probe_reconciles_census_against_lowering() {
     let sources = probe_sources();
-    assert!(
-        sources.len() > 400,
-        "expected the full probe corpus, extracted {}",
+    assert_eq!(
+        sources.len(),
+        449,
+        "expected the complete probe corpus, extracted {}",
         sources.len()
     );
     assert!(
@@ -212,42 +227,83 @@ fn every_parity_probe_reconciles_census_against_lowering() {
     );
 }
 
-/// Semantic tracing is an observation-only side channel. Every input that
-/// compiles with tracing disabled must emit byte-identical code when tracing
-/// is enabled, while the trace itself is present only in the latter result.
-#[test]
-fn tracing_does_not_change_generated_output() {
-    for (id, source) in fixture_sources() {
-        let plain = match compile(&source, &options(false)) {
-            Ok(output) => output,
-            Err(_) => continue,
-        };
-        let traced = compile(&source, &options(true))
-            .unwrap_or_else(|error| panic!("{id}: tracing failed: {error}"));
-        assert_eq!(plain.code, traced.code, "output changed for {id}");
-        assert!(plain.semantic_trace.is_none());
-        assert!(traced.semantic_trace.is_some());
-    }
+fn expected_baseline() -> std::collections::BTreeMap<&'static str, (bool, Vec<u8>)> {
+    include_str!("transform-output-baseline.txt")
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let id = fields.next().expect("baseline id");
+            match fields.next().expect("baseline status") {
+                "reject" => (id, (false, Vec::new())),
+                "ok" => {
+                    let encoded = fields.next().expect("baseline output");
+                    let bytes = (0..encoded.len())
+                        .step_by(2)
+                        .map(|index| {
+                            u8::from_str_radix(&encoded[index..index + 2], 16)
+                                .expect("baseline hex")
+                        })
+                        .collect();
+                    (id, (true, bytes))
+                }
+                status => panic!("unknown baseline status {status:?}"),
+            }
+        })
+        .collect()
+}
 
-    for (name, source) in probe_sources() {
-        let plain = match compile(&source, &options(false)) {
-            Ok(output) => output,
-            Err(_) => continue,
-        };
-        let traced = compile(&source, &options(true))
-            .unwrap_or_else(|error| panic!("{name}: tracing failed: {error}"));
-        assert_eq!(plain.code, traced.code, "output changed for probe {name}");
-        assert!(plain.semantic_trace.is_none());
-        assert!(traced.semantic_trace.is_some());
+fn compare_output(id: &str, actual: &[u8], expected: &[u8]) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{id}: transform output differs from the checked-in parent baseline ({} vs {} bytes)",
+            actual.len(),
+            expected.len()
+        ))
     }
-    for (id, source) in probe_sources() {
-        let Ok(plain) = compile(&source, &options(false)) else {
-            continue;
-        };
-        let traced = compile(&source, &options(true))
-            .unwrap_or_else(|error| panic!("{id}: traced transform failed: {error}"));
-        assert_eq!(plain.code, traced.code, "output changed for probe {id}");
-        assert!(plain.semantic_trace.is_none());
-        assert!(traced.semantic_trace.is_some());
+}
+
+/// The checked-in bytes are generated from `origin/main`, not from the same
+/// build as the code under test. This is the transform() byte-identity
+/// invariant for this branch; trace enrichment cannot move output.
+#[test]
+fn transform_output_matches_parent_baseline() {
+    let expected = expected_baseline();
+    let sources = corpus_sources();
+    assert_eq!(sources.len(), expected.len(), "baseline corpus drifted");
+    let mut failures = Vec::new();
+    for (id, source) in sources {
+        let (compiled, expected_bytes) = expected
+            .get(id.as_str())
+            .unwrap_or_else(|| panic!("{id}: missing parent baseline"));
+        match compile(&source, &options(false)) {
+            Ok(output) if *compiled => {
+                if let Err(error) = compare_output(&id, output.code.as_bytes(), expected_bytes) {
+                    failures.push(error);
+                }
+            }
+            Ok(_) => failures.push(format!("{id}: parent rejected this input")),
+            Err(_) if !compiled => {}
+            Err(error) => failures.push(format!("{id}: transform failed: {error}")),
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "{} output mismatches:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn output_baseline_rejects_a_one_byte_canary() {
+    let (_, (_, expected)) = expected_baseline()
+        .into_iter()
+        .find(|(_, (compiled, bytes))| *compiled && !bytes.is_empty())
+        .expect("baseline has a non-empty output");
+    let mut canary = expected.clone();
+    canary[0] ^= 1;
+    assert!(compare_output("one-byte canary", &canary, &expected).is_err());
 }

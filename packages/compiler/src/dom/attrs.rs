@@ -344,9 +344,9 @@ impl<'a> AstDomTransform<'a, '_> {
                     crate::semantic_trace::ExecutionSiteKind::Ref,
                     crate::semantic_trace::CallbackDecision::RefApply,
                 );
+                self.semantic_trace
+                    .owner_establishment(span, "ref-apply", None);
             }
-            self.semantic_trace
-                .owner_establishment(span, "ref-apply", None);
             front_groups.push(self.dom_ref_statements(span, element_id, raw));
             return Ok(());
         }

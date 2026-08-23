@@ -1,6 +1,6 @@
 use oxc_allocator::CloneIn;
 use oxc_ast::ast::{AssignmentOperator, AssignmentTarget, Expression, Statement};
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 
 use crate::dom::element::AstDomTransform;
 use crate::shared::constants::delegated_events;
@@ -17,6 +17,13 @@ impl<'a> AstDomTransform<'a, '_> {
         handler: Expression<'a>,
     ) -> std::vec::Vec<Statement<'a>> {
         let event_name = to_event_name(name);
+        let identity = if self.should_delegate_event(&event_name) {
+            "delegated"
+        } else {
+            "direct"
+        };
+        self.semantic_trace
+            .owner_establishment(handler.span(), identity, None);
 
         if self.should_delegate_event(&event_name) {
             self.register_delegated_event(&event_name);
@@ -138,8 +145,6 @@ impl<'a> AstDomTransform<'a, '_> {
         property: &str,
         handler: Expression<'a>,
     ) -> Statement<'a> {
-        self.semantic_trace
-            .owner_establishment(span, "delegated-event", None);
         let target = self.static_member_assignment_target(span, element_id, property);
         self.ast().statement_expression(
             span,
@@ -156,8 +161,6 @@ impl<'a> AstDomTransform<'a, '_> {
         event_name: &str,
         handler: Expression<'a>,
     ) -> Statement<'a> {
-        self.semantic_trace
-            .owner_establishment(span, "addEventListener", None);
         let callee = self.static_member_expression(span, element_id, "addEventListener");
         let event_name_expression =
             self.ast()
@@ -177,8 +180,6 @@ impl<'a> AstDomTransform<'a, '_> {
         delegated: bool,
     ) -> Statement<'a> {
         self.template_state.uses_add_event_listener = true;
-        self.semantic_trace
-            .owner_establishment(span, "addEventListener", None);
         let mut args = vec![
             self.identifier_expression(span, element_id),
             self.ast()
