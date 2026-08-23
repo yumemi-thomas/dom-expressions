@@ -174,29 +174,198 @@ fn owner_facts_cover_insert_events_refs_and_the_2_0_scope_wrapper() {
     .expect("compile hydratable source")
     .semantic_trace
     .expect("semantic trace");
-    assert!(
+    // The scope wrapper is emitted around the JSX container but recorded at
+    // the wrapped expression, exactly like the `insert` fact beside it.
+    assert_eq!(
         hydration
             .owner_establishments
             .iter()
-            .any(|fact| fact.wrapper == "scope")
+            .filter(|fact| fact.wrapper == "scope")
+            .map(|fact| source_text(hydration_source, fact.span.start, fact.span.end))
+            .collect::<Vec<_>>(),
+        ["props.child()"]
     );
 }
 
+/// Every wrapper fact has to land on a span the consumer can find again: an
+/// `ExecutionSite` for an expression, a `ComponentRenderSite` or
+/// `DeferredCallbackSite` for a JSX node. The join is by containment, because
+/// a conditional's memo is spanned at the test it memoizes and is a strict
+/// sub-span of its site; every other identity joins by equality. The
+/// fragment-child and hydration-scope paths are here because both used to
+/// report the JSX expression container, braces included, which joins nothing
+/// under either rule.
 #[test]
-fn memo_wrapper_facts_use_the_original_expression_span() {
-    for source in [
-        "const C = () => <Show>{value() ? left() : right()}</Show>;",
-        "const C = () => <div>{value() ? left() : right()}</div>;",
+fn owner_facts_join_a_site_or_jsx_node_span() {
+    for (source, hydratable) in [
+        ("const C = (p) => <div>{p.a()}</div>;", true),
+        ("const C = (p) => <><div/>{p.a ? p.b : p.c}</>;", false),
+        ("const C = (p) => <><div/>{p.a ? p.b : p.c}</>;", true),
+        ("const C = (p) => <>{...p.items}</>;", true),
+        (
+            "const C = (p) => <div><span/>{p.a ? p.b : p.c}<span/></div>;",
+            false,
+        ),
+        (
+            "const C = (p) => <div title={p.t} onClick={p.c} ref={p.r}>{p.child}</div>;",
+            true,
+        ),
+        (
+            "const C = (p) => <Thing prop={p.v}>{p.child}</Thing>;",
+            true,
+        ),
     ] {
-        let rendered = trace(source);
-        let memos = rendered
+        let rendered = compile(
+            source,
+            &CompileOptions {
+                hydratable,
+                ..options(true)
+            },
+        )
+        .expect("compile")
+        .semantic_trace
+        .expect("semantic trace");
+        let joinable = rendered
+            .sites
+            .iter()
+            .map(|site| site.span)
+            .chain(rendered.component_render_sites.iter().map(|fact| fact.span))
+            .chain(
+                rendered
+                    .deferred_callback_sites
+                    .iter()
+                    .map(|fact| fact.span),
+            )
+            .collect::<Vec<_>>();
+        let orphans = rendered
             .owner_establishments
             .iter()
-            .filter(|fact| fact.wrapper == "memo")
-            .map(|fact| source_text(source, fact.span.start, fact.span.end))
+            .filter(|fact| {
+                !joinable
+                    .iter()
+                    .any(|span| span.start <= fact.span.start && fact.span.end <= span.end)
+            })
+            .map(|fact| {
+                (
+                    fact.wrapper.as_str(),
+                    source_text(source, fact.span.start, fact.span.end),
+                )
+            })
             .collect::<Vec<_>>();
-        assert_eq!(memos, ["value() ? left() : right()"]);
+        assert!(
+            orphans.is_empty(),
+            "unjoinable facts for {source} (hydratable={hydratable}): {orphans:?}"
+        );
+        // Only memo may be a strict sub-span; every other identity is exactly
+        // its site.
+        let equality = joinable
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let inexact = rendered
+            .owner_establishments
+            .iter()
+            .filter(|fact| fact.wrapper != "memo" && !equality.contains(&fact.span))
+            .map(|fact| {
+                (
+                    fact.wrapper.as_str(),
+                    source_text(source, fact.span.start, fact.span.end),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            inexact.is_empty(),
+            "non-memo facts that do not equality-join for {source} (hydratable={hydratable}): {inexact:?}"
+        );
+        assert!(
+            !rendered.owner_establishments.is_empty(),
+            "no facts at all for {source}"
+        );
     }
+}
+
+/// Every memo fact as `(start, end, source text)`, in report order.
+fn memos(source: &str) -> Vec<(u32, u32, &str)> {
+    trace(source)
+        .owner_establishments
+        .into_iter()
+        .filter(|fact| fact.wrapper == "memo")
+        .map(|fact| {
+            (
+                fact.span.start,
+                fact.span.end,
+                source_text(source, fact.span.start, fact.span.end),
+            )
+        })
+        .collect::<Vec<_>>()
+}
+
+/// The emitted `memo(...)` calls, which every memo fact must correspond to
+/// one-for-one.
+fn emitted_memo_count(source: &str) -> usize {
+    compile(source, &options(true))
+        .expect("compile with semantic tracing")
+        .code
+        .matches("_$memo(")
+        .count()
+}
+
+#[test]
+fn condition_memo_facts_span_the_booleanized_test_one_per_emission() {
+    // The memo wraps `!!value()`; `left()` and `right()` run in the insert's
+    // or child getter's scope, not inside the memo, so the fact covers the
+    // test alone and is a strict sub-span of the site.
+    for (source, expected) in [
+        (
+            "const C = () => <Show>{value() ? left() : right()}</Show>;",
+            (23, 30, "value()"),
+        ),
+        (
+            "const C = () => <div>{value() ? left() : right()}</div>;",
+            (22, 29, "value()"),
+        ),
+        (
+            "const C = () => <div><span/>{value() ? left() : right()}<span/></div>;",
+            (29, 36, "value()"),
+        ),
+        // `left && right` memoizes the booleanized left operand only.
+        (
+            "const C = () => <div>{cond() && x()}</div>;",
+            (22, 28, "cond()"),
+        ),
+    ] {
+        assert_eq!(memos(source), [expected], "memo facts for {source}");
+        assert_eq!(emitted_memo_count(source), 1, "memo emissions for {source}");
+    }
+}
+
+#[test]
+fn nested_condition_memos_are_reported_one_per_memo() {
+    // Two tests are memoized (`!!x()` and `!!y()`), so two facts exist. A
+    // fact spanning the whole conditional would collapse them into one and
+    // would also claim the branches are memoized, which they are not.
+    let source = "const C = () => <div>{x() ? (y() ? a() : b()) : c()}</div>;";
+    assert_eq!(memos(source), [(22, 25, "x()"), (29, 32, "y()")]);
+    assert_eq!(emitted_memo_count(source), 2);
+}
+
+#[test]
+fn a_fragment_child_condition_memo_is_brace_free_and_one_fact_per_memo() {
+    // The path that reaches `transform_condition_inline` through
+    // `dynamic_child_thunk`. Two memos are emitted — the condition test and
+    // the fragment child's own thunk wrapper — and each is reported at its
+    // own span. Neither covers `{`…`}`.
+    let source = "const C = () => <><div/>{value() ? left() : right()}</>;";
+    assert_eq!(
+        memos(source),
+        [(25, 32, "value()"), (25, 51, "value() ? left() : right()")]
+    );
+    assert_eq!(emitted_memo_count(source), 2);
+
+    // A fragment spread child is memo-wrapped at the spread's expression.
+    let spread = "const C = (p) => <>{...p.items}</>;";
+    assert_eq!(memos(spread), [(23, 30, "p.items")]);
+    assert_eq!(emitted_memo_count(spread), 1);
 }
 
 #[test]

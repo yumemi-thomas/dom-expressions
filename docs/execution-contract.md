@@ -44,11 +44,35 @@ that never reaches a 2.0 lowering path is not invented as a separate site.
 ## Additive wrapper facts
 
 `owner_establishments` contains `{ span, wrapper, group_id? }`. It records
-where a wrapper was emitted and preserves the wrapper identity as a string.
-For a wrapper around an execution site, `span` is exactly the same original
-source span as that `ExecutionSite` (the expression span, not an enclosing
-attribute or generated-AST span); the legacy and successor facts use this
-same site-span rule.
+where a wrapper was emitted and preserves the wrapper identity as a string,
+one fact per wrapper call the lowering emits.
+`span` is the exact original source span of the expression or JSX node whose
+lowering is wrapped — never the JSX expression container including braces, the
+whole attribute, or a generated-AST span. For a wrapper around an execution
+site the spans are equality-joinable, and the legacy and successor facts use
+that same site-span rule.
+Where the construct is a JSX node rather than an expression, the fact joins a
+`ComponentRenderSite` or `DeferredCallbackSite` span instead: `createComponent`
+and a component child's `insert` are spanned at the JSX element, which is a
+component render site and not an execution site.
+
+A conditional's memo is the one case where the wrapped expression is smaller
+than the site: `{cond() ? left() : right()}` lowers to `memo(() => !!cond())`,
+with the branches evaluated in the insert's or getter's scope, so the memo fact
+is spanned at `cond()` — the test it actually memoizes — and is *contained by*
+the enclosing site's span rather than equal to it. Each memo the lowering emits
+gets its own fact, so a nested conditional reports one fact per memoized test,
+and a fragment or component child whose thunk is also memo-wrapped reports that
+memo separately at the child expression's span. A consumer joining owner facts
+to sites must therefore join by containment, not by equality alone.
+A span is also not a unique key: a `createComponent` and its child's
+`insert` can share one span, so consumers key on `(span, identity)`.
+
+And a fact need not join anything at all: a literal-only hole such as
+`<div>{true}{undefined}{null}</div>` really does emit an `insert` per hole, and
+those inserts are reported, but literal-only leaves are deliberately not
+`ExecutionSite`s, so those facts join to nothing.
+
 The consumer maps audited identities through its dialect and maps an unknown
 or unaudited identity to `Unknown`; it must not infer runtime meaning from the
 string. Current producer identities include:

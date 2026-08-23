@@ -45,18 +45,17 @@ pub(crate) trait ModeLower<'a>: ConditionBuilder<'a> {
     /// Babel's `createTemplate(wrap: true)` for a dynamic child thunk:
     /// `memo(thunk)` in the client generates; ssr wraps the accessor body
     /// with `_$escape` first.
-    fn memo_wrap_dynamic_child(&mut self, span: Span, thunk: Expression<'a>) -> Expression<'a>;
-
-    /// Variant retaining the emitted AST span while giving semantic tracing
-    /// the exact source expression span. Non-DOM generates do not trace.
-    fn memo_wrap_dynamic_child_with_trace(
+    ///
+    /// `span` is the emitted AST span and `trace_span` the source span of the
+    /// wrapped expression — deliberately two required arguments rather than a
+    /// defaulting overload, so a caller cannot silently trace at the emission
+    /// span. Non-DOM generates ignore `trace_span`; they do not trace.
+    fn memo_wrap_dynamic_child(
         &mut self,
         span: Span,
-        _trace_span: Span,
+        trace_span: Span,
         thunk: Expression<'a>,
-    ) -> Expression<'a> {
-        self.memo_wrap_dynamic_child(span, thunk)
-    }
+    ) -> Expression<'a>;
 
     /// Span stamped on a multi-child fragment array (the dom generate keeps
     /// the first child's span; ssr and universal use the fragment's own).
@@ -69,6 +68,10 @@ pub(crate) trait ModeLower<'a>: ConditionBuilder<'a> {
 /// their memos inline first (`transformCondition(..., true)`), bare zero-arg
 /// calls unwrap to their callee, everything else gets a plain arrow. The
 /// caller has already applied the `is_dynamic` gate.
+///
+/// `span` is Babel's emission span. The inlined condition needs no trace span:
+/// every memo it emits is spanned at the test it memoizes, derived inside
+/// `transform_condition_*` itself.
 pub(crate) fn dynamic_child_thunk<'a, C: ModeLower<'a>>(
     ctx: &mut C,
     span: Span,
