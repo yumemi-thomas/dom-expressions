@@ -108,19 +108,7 @@ fn probe_sources() -> Vec<(String, String)> {
         cases.push((name.to_string(), source));
         rest = &source_start[source_end..];
     }
-    // These parity probes exercise existing 2.0 output edge cases whose
-    // syntax is deliberately discarded or shadowed before a semantic wrapper
-    // exists. They remain in the Babel/Oxc parity suite; the trace census is
-    // limited to probes with a source site that the current DOM contract can
-    // observe. The remaining corpus is still well above 400 cases.
-    let excluded = [
-        "void elements discard children",
-        "stateful property aliases use last value",
-    ];
     cases
-        .into_iter()
-        .filter(|(name, _)| !excluded.contains(&name.as_str()))
-        .collect()
 }
 
 fn options(semantic_trace: bool) -> CompileOptions {
@@ -249,6 +237,16 @@ fn tracing_does_not_change_generated_output() {
         let traced = compile(&source, &options(true))
             .unwrap_or_else(|error| panic!("{name}: tracing failed: {error}"));
         assert_eq!(plain.code, traced.code, "output changed for probe {name}");
+        assert!(plain.semantic_trace.is_none());
+        assert!(traced.semantic_trace.is_some());
+    }
+    for (id, source) in probe_sources() {
+        let Ok(plain) = compile(&source, &options(false)) else {
+            continue;
+        };
+        let traced = compile(&source, &options(true))
+            .unwrap_or_else(|error| panic!("{id}: traced transform failed: {error}"));
+        assert_eq!(plain.code, traced.code, "output changed for probe {id}");
         assert!(plain.semantic_trace.is_none());
         assert!(traced.semantic_trace.is_some());
     }

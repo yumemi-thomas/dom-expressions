@@ -603,6 +603,31 @@ mod tests {
                         decision: OwnershipDecision::Owned,
                     },
                 ],
+                owner_establishments: vec![
+                    crate::semantic_trace::OwnerEstablishment {
+                        span: span(
+                            source,
+                            "<div title={name()} onClick={handle} ref={node}>{count()}</div>"
+                        ),
+                        wrapper: "insert".into(),
+                        group_id: None,
+                    },
+                    crate::semantic_trace::OwnerEstablishment {
+                        span: span(source, "title={name()}"),
+                        wrapper: "effect".into(),
+                        group_id: None,
+                    },
+                    crate::semantic_trace::OwnerEstablishment {
+                        span: span(source, "onClick={handle}"),
+                        wrapper: "addEventListener".into(),
+                        group_id: None,
+                    },
+                    crate::semantic_trace::OwnerEstablishment {
+                        span: span(source, "ref={node}"),
+                        wrapper: "ref-apply".into(),
+                        group_id: None,
+                    },
+                ],
             })
         );
     }
@@ -699,6 +724,34 @@ mod tests {
                 ownership_sites: vec![OwnershipSite {
                     span: span(source, "item.name"),
                     decision: OwnershipDecision::Owned,
+                }],
+                owner_establishments: vec![
+                    crate::semantic_trace::OwnerEstablishment {
+                        span: span(
+                            source,
+                            "<For each={items()}>{item => <span>{item.name}</span>}</For>"
+                        ),
+                        wrapper: "createComponent".into(),
+                        group_id: None,
+                    },
+                    crate::semantic_trace::OwnerEstablishment {
+                        span: span(source, "<span>{item.name}</span>"),
+                        wrapper: "insert".into(),
+                        group_id: None,
+                    },
+                ],
+                component_render_sites: vec![crate::semantic_trace::ComponentRenderSite {
+                    span: span(
+                        source,
+                        "<For each={items()}>{item => <span>{item.name}</span>}</For>"
+                    ),
+                }],
+                deferred_callback_sites: vec![crate::semantic_trace::DeferredCallbackSite {
+                    span: span(source, "items()"),
+                    receiver_span: span(
+                        source,
+                        "<For each={items()}>{item => <span>{item.name}</span>}</For>"
+                    ),
                 }],
             })
         );
@@ -825,6 +878,9 @@ mod tests {
                     decision: TerminalDecision::Value(ValueDecision::EagerOnce),
                 }],
                 ownership_sites: vec![],
+                owner_establishments: vec![],
+                component_render_sites: vec![],
+                deferred_callback_sites: vec![],
             })
         );
         let byte_span = span(source, "signal()");

@@ -33,6 +33,14 @@ impl<'a> AstDomTransform<'a, '_> {
         }
         self.template_state.uses_effect = true;
 
+        if let Some(wrapper) = self.effect_wrapper.as_deref() {
+            let group_id = (dynamics.len() > 1).then(|| self.semantic_trace.next_group_id());
+            for slot in &dynamics {
+                self.semantic_trace
+                    .owner_establishment(slot.span, wrapper, group_id);
+            }
+        }
+
         if dynamics.len() == 1 {
             let slot = dynamics.pop().expect("single dynamic slot exists");
             let span = slot.span;

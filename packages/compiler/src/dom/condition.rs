@@ -22,6 +22,15 @@ impl<'a> ConditionBuilder<'a> for AstDomTransform<'a, '_> {
         self.memo_wrapper_local()
     }
 
+    fn trace_wrapper(&mut self, span: Span, wrapper: &str, group_id: Option<u64>) {
+        self.semantic_trace
+            .owner_establishment(span, wrapper, group_id);
+    }
+
+    fn memo_wrapper_identity(&self) -> Option<&str> {
+        self.memo_wrapper.as_deref()
+    }
+
     fn next_condition_id(&mut self) -> String {
         AstDomTransform::next_condition_id(self)
     }

@@ -19,6 +19,13 @@ pub(crate) trait ConditionBuilder<'a> {
     fn memo_wrapper_enabled(&self) -> bool;
     /// Marks the memo helper as used and returns its local identifier.
     fn register_memo(&mut self) -> String;
+    /// Records a wrapper emitted around a source span. Non-DOM modes keep
+    /// this as a no-op so the shared traversal remains mode-agnostic.
+    fn trace_wrapper(&mut self, _span: Span, _wrapper: &str, _group_id: Option<u64>) {}
+    /// Identity of the memo wrapper emitted by this mode, when enabled.
+    fn memo_wrapper_identity(&self) -> Option<&str> {
+        None
+    }
     /// Fresh identifier for a hoisted memoized condition (Babel's `_c$` uid).
     fn next_condition_id(&mut self) -> String;
     /// The shared classification authority (Babel's `isDynamic` probes on
@@ -178,6 +185,9 @@ pub(crate) fn memo_wrap_thunk<'a, C: ConditionBuilder<'a>>(
 ) -> Expression<'a> {
     if !ctx.memo_wrapper_enabled() {
         return thunk;
+    }
+    if let Some(wrapper) = ctx.memo_wrapper_identity().map(str::to_owned) {
+        ctx.trace_wrapper(span, &wrapper, None);
     }
     let allocator = ctx.condition_allocator();
     let memo_local = ctx.register_memo();

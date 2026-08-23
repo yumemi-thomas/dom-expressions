@@ -282,6 +282,35 @@ fn semantic_tracing_does_not_change_code_or_source_maps() {
 }
 
 #[test]
+fn semantic_trace_facts_round_trip_with_closed_vocabulary() {
+    let source = "const C = (props) => <Thing value={props.value} />;";
+    let trace = compile(
+        source,
+        &CompileOptions {
+            semantic_trace: true,
+            ..CompileOptions::default()
+        },
+    )
+    .expect("compile with tracing")
+    .semantic_trace
+    .expect("semantic trace");
+
+    let json = serde_json::to_string(&trace).expect("serialize semantic trace");
+    assert!(json.contains("component_render_sites"));
+    assert!(json.contains("deferred_callback_sites"));
+    assert!(json.contains("owner_establishments"));
+    let decoded: dom_expressions_compiler::SemanticTrace =
+        serde_json::from_str(&json).expect("deserialize semantic trace");
+    assert_eq!(decoded, trace);
+}
+
+#[test]
+fn legacy_ownership_trace_fields_are_rejected() {
+    let legacy = r#"{"sites":[],"ownership_sites":[]}"#;
+    assert!(serde_json::from_str::<dom_expressions_compiler::SemanticTrace>(legacy).is_err());
+}
+
+#[test]
 fn static_string_attributes_are_not_execution_sites() {
     for (source, inline_styles) in [
         ("const view = <div innerHTML=\"x\" />;", true),

@@ -132,12 +132,14 @@ impl<'a> AstDomTransform<'a, '_> {
 
     /// `<element_id>.<property> = <handler>;`
     fn delegated_assignment_statement(
-        &self,
+        &mut self,
         span: Span,
         element_id: &str,
         property: &str,
         handler: Expression<'a>,
     ) -> Statement<'a> {
+        self.semantic_trace
+            .owner_establishment(span, "delegated-event", None);
         let target = self.static_member_assignment_target(span, element_id, property);
         self.ast().statement_expression(
             span,
@@ -148,12 +150,14 @@ impl<'a> AstDomTransform<'a, '_> {
 
     /// `<element_id>.addEventListener("<event>", <handler>);`
     fn add_event_listener_statement(
-        &self,
+        &mut self,
         span: Span,
         element_id: &str,
         event_name: &str,
         handler: Expression<'a>,
     ) -> Statement<'a> {
+        self.semantic_trace
+            .owner_establishment(span, "addEventListener", None);
         let callee = self.static_member_expression(span, element_id, "addEventListener");
         let event_name_expression =
             self.ast()
@@ -173,6 +177,8 @@ impl<'a> AstDomTransform<'a, '_> {
         delegated: bool,
     ) -> Statement<'a> {
         self.template_state.uses_add_event_listener = true;
+        self.semantic_trace
+            .owner_establishment(span, "addEventListener", None);
         let mut args = vec![
             self.identifier_expression(span, element_id),
             self.ast()

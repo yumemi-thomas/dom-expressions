@@ -165,6 +165,8 @@ impl<'a> AstDomTransform<'a, '_> {
                             lowered,
                             marker,
                         ));
+                        self.semantic_trace
+                            .owner_establishment(element.span, "insert", None);
                     } else if let Some(static_template) = lower_static_native_template(
                         self,
                         child,
@@ -359,6 +361,8 @@ impl<'a> AstDomTransform<'a, '_> {
                             value,
                             marker,
                         ));
+                        self.semantic_trace
+                            .owner_establishment(element.span, "insert", None);
                     }
                     index = run_end;
                     continue;
@@ -396,6 +400,8 @@ impl<'a> AstDomTransform<'a, '_> {
                         declarations,
                     );
                     operations.push(self.insert_statement(element.span, element_id, value, marker));
+                    self.semantic_trace
+                        .owner_establishment(element.span, "insert", None);
                 }
                 _ => {
                     return Err(Error::from_reason(
@@ -915,6 +921,7 @@ impl<'a> AstDomTransform<'a, '_> {
         value: Expression<'a>,
     ) -> Expression<'a> {
         self.template_state.uses_scope = true;
+        self.semantic_trace.owner_establishment(span, "scope", None);
         let already_function = match &value {
             Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_) => true,
             Expression::CallExpression(call) => matches!(
