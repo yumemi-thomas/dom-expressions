@@ -934,7 +934,13 @@ impl<'a> AstDomTransform<'a, '_> {
             &tag_name,
             &child_id,
             !child.children.is_empty(),
-            captured_child.is_some(),
+            // `children_from_attribute` is only read on the spread branch of
+            // `lower_template_attributes`, and `captured_child` above is
+            // gated on `!has_spread` — so on that branch it is always `None`
+            // and this argument is always dead. Literal `false`, not
+            // `captured_child.is_some()`, documents that invariant instead
+            // of silently depending on it.
+            false,
             &mut child_template.html,
             &mut child_declarations,
             &mut child_operations,

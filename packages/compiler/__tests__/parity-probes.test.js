@@ -597,6 +597,9 @@ const a = <div class="one" class="two" title={t1()} title={t2()}>{x()}</div>;
   "duplicate children attributes": `
 const a = <div children={a()} children={b()} />;
 `,
+  "duplicate children attributes literal last": `
+const a = <span children={x()} children={"s"} />;
+`,
   "children attribute before spread": `
 const a = <div children={fallback()} {...props} />;
 `,
@@ -1988,6 +1991,18 @@ const a = <div><span ref={node} onClick={handler} children={content()} /></div>;
 `,
   "nested children attribute inside a component child": `
 const a = <Comp><div><span children={content()} /></div></Comp>;
+`,
+  "nested children attribute literal duplicate wins": `
+const a = <div><span children={x()} children={"s"} /></div>;
+`,
+  "nested children attribute literal duplicate unbraced": `
+const a = <div><span children={x()} children="s" /></div>;
+`,
+  "nested children attribute literal duplicate after dynamic textContent": `
+const a = <div><span textContent={t()} children={x()} children={"s"} /></div>;
+`,
+  "nested children attribute literal duplicate before dynamic textContent": `
+const a = <div><span children={x()} children={"s"} textContent={t()} /></div>;
 `
 };
 
