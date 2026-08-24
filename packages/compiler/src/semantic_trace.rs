@@ -736,6 +736,9 @@ impl ExecutionCensus {
 pub(crate) struct TraceRecorder {
     census: Option<ExecutionCensus>,
     decisions: BTreeMap<SiteKey, TerminalDecision>,
+    /// Spans a lowering path *synthesizes* rather than reads from the source
+    /// tree. See [`Self::ignore_synthesized_child`].
+    synthesized_spans: BTreeSet<SourceSpan>,
     default_effect_wrapper: bool,
     // Compatibility output for the currently pinned checker. This is filled
     // when lowering resolves a reactive value, rather than reconstructed from
@@ -875,10 +878,11 @@ impl TraceRecorder {
     ///
     /// Reached when a lowering path discards a whole child list rather than
     /// deciding it value by value — a nested native element whose dynamic
-    /// `textContent` replaces its children with a text placeholder. Nothing in
-    /// the range is emitted, so no site there exists to decide; retracting is
-    /// the truthful outcome, and the alternative is a file-wide "unresolved
-    /// execution sites" failure over expressions that never run.
+    /// `textContent` replaces its children with a text placeholder, the
+    /// textarea `value` fold, an inert `<noscript>`. Nothing in the range is
+    /// emitted, so no site there exists to decide; retracting is the truthful
+    /// outcome, and the alternative is a file-wide "unresolved execution
+    /// sites" failure over expressions that never run.
     ///
     /// A site already decided is kept, matching [`Self::retract`]: this only
     /// removes sites nothing has spoken for.
@@ -892,6 +896,28 @@ impl TraceRecorder {
         census.sites.retain(|site| {
             decisions.contains_key(site) || site.span.start < span.start || site.span.end > span.end
         });
+    }
+
+    /// Declare that a span carries a child the lowering *synthesized*, so a
+    /// decision recorded there is not an execution site.
+    ///
+    /// The textarea `value` fold builds its replacement child out of the
+    /// attribute (`stateful_value_child`) and spans it at the attribute. That
+    /// child is not a source expression — nothing the author wrote executes at
+    /// that span — so the census, which only walks source, rightly claims no
+    /// site there. Where the synthesized value is a string or number the
+    /// census has already ignored the literal it was cloned from; where it is
+    /// the `true` of a valueless `value` the expression does not exist in the
+    /// source at all, and lowering's `insert` decision would otherwise fail
+    /// the file as a decision for an uncensused site.
+    ///
+    /// Silence, not a site, is the truthful outcome: the emitted `insert` is
+    /// still reported as an `owner_establishment`, exactly as for a
+    /// literal-only source hole, and joins to no site.
+    pub(crate) fn ignore_synthesized_child(&mut self, span: Span) {
+        if self.census.is_some() && span.start < span.end {
+            self.synthesized_spans.insert(span.into());
+        }
     }
 
     pub(crate) fn value(&mut self, span: Span, kind: ExecutionSiteKind, decision: ValueDecision) {
@@ -915,11 +941,12 @@ impl TraceRecorder {
             span: span.into(),
             kind,
         };
+        let not_a_site = census
+            .ignored_literal_spans
+            .contains(&SourceSpan::from(span))
+            || self.synthesized_spans.contains(&SourceSpan::from(span));
         if !census.sites.contains(&key) {
-            if census
-                .ignored_literal_spans
-                .contains(&SourceSpan::from(span))
-            {
+            if not_a_site {
                 return;
             }
             self.fail(format!(
