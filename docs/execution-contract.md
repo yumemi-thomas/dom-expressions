@@ -14,7 +14,9 @@ Before lowering, `ExecutionCensus` enumerates every supported JSX execution
 site. During lowering, `TraceRecorder` records the decision at the emission
 site. `finish()` rejects an unresolved censused site, a conflicting decision,
 or a decision for a site absent from the census. The corpus test runs every
-fixture family and all 449 parity probes through this reconciliation.
+fixture family and all 469 parity probes through this reconciliation.
+
+### The transform baseline
 
 The transform invariant is checked separately against the checked-in
 `tests/transform-output-baseline.txt`, generated from the parent compiler
@@ -23,6 +25,16 @@ entry, including explicit parent rejections, and includes a one-byte canary
 that the comparator must reject. A trace-on/trace-off comparison is only an
 additive side-channel smoke test; it cannot prove base-vs-head identity when
 both sides are produced by the same build.
+
+A branch that changes `transform()` on purpose moves entries, so regenerating
+the baseline is part of the change rather than a cleanup after it. The order is
+fixed: run `transform_output_matches_parent_baseline` first and read the entries
+it names, confirm every one is a shape the change predicts, then regenerate with
+the `#[ignore]`d, environment-gated `regenerate_transform_output_baseline` and
+review the diff line by line. An entry that moves for a reason the branch cannot
+explain is a codegen regression, not a stale baseline. Resolving divergence 4
+moved no existing entry at all — no corpus entry had the shape — and added the
+twenty `nested children attribute …` probes that could not be asserted before.
 
 ### The trace describes this compiler, not the parity target
 
@@ -43,8 +55,9 @@ binding on both producer and consumer:
   *this* compiler emitted nothing there; it does not say the expression is
   dead.
 
-Known divergences, all pre-existing and out of scope while `transform()`
-output is frozen:
+Known divergences. Each is a `transform()` difference, not a trace defect, and
+resolving one is a deliberate transform change with its own baseline
+regeneration — see "The transform baseline" below:
 
 1. **Nested void-element children.** `<div><br>{x()}</br></div>`: this fork's
    `lower_dynamic_native_child` walks into `lower_dom_children` unconditionally
@@ -71,18 +84,47 @@ output is frozen:
    `jsx-child` site inside a `<noscript>` as **uncertifiable**. (The same
    applies to a nested `<noscript>` whose attributes force it off the fast
    path.)
-4. **Nested `children` attribute promotion.** `<div><span children={x()}/></div>`:
-   Babel promotes the attribute to `_$insert(_el$2, x)`; this fork emits
-   nothing, because `lower_dynamic_native_child` never captures a `children`
-   attribute the way `lower_dom_element` does. This one deliberately **remains
-   a hard reconciliation failure** — the census names a `jsx-child` site that
-   lowering never resolves, and the file is rejected. That failure is the
-   divergence's only detection signal, so it is kept rather than papered over
-   with a retraction. It fails only when the element has **no source
-   children**: with them (`<div><span children={x()}>{y()}</span></div>`) both
-   compilers insert only `y` and ignore the attribute, which this fork reports
-   as `native-attribute`/`elided`, and the file reconciles. The same shape at
-   template root (`<span children={x()}/>`) agrees with Babel and reconciles.
+4. **Nested `children` attribute promotion.** *Resolved.*
+   `<div><span children={x()}/></div>`: Babel promotes the attribute to
+   `_$insert(_el$2, x)`; this fork emitted nothing, because
+   `lower_dynamic_native_child` never captured a `children` attribute the way
+   `lower_dom_element` did. Until it was fixed the shape was left as a **hard
+   reconciliation failure** — the census named a `jsx-child` site that lowering
+   never resolved, and the file was rejected — because that failure was the
+   divergence's only detection signal. `lower_dynamic_native_child` now
+   performs the promotion, so the nested shape emits Babel's insert, the site
+   resolves as `jsx-child`/`reactive-rerun`, and the file reconciles. The
+   shapes that already agreed still do: with source children
+   (`<div><span children={x()}>{y()}</span></div>`) both compilers insert only
+   `y` and report the attribute as `native-attribute`/`elided`, a void
+   element's attribute is never promoted, a spread keeps `children` in the
+   merged props, and a value the constant fold resolves stays a `children`
+   property write. See "Discarded child lists" for the three writers that can
+   take the slot away from a `children` attribute.
+
+Divergences found while resolving 4 above, all pre-existing, none of them
+nesting-specific, and all still open:
+
+5. **Template-root slot order.** `<span children={x()} textContent={t()}/>`:
+   Babel's `transformAttributes` keeps one `children` slot, so the later
+   `textContent` overwrites the captured attribute value with its synthesized
+   text node and `x` is dropped; `lower_dom_element` captures the attribute
+   without regard to attribute order and inserts `x`. Nested lowering follows
+   Babel's order (both writers are compared there); the template root does not.
+6. **JSX-valued holes.** `<span children={<b>{x()}</b>}/>` and the plain
+   `<span>{<b>{x()}</b>}</span>` both emit Babel's `() => (() => {…})()` as
+   `() => {…}` — the same expression, a different lowering shape. Unrelated to
+   `children`; it is how this fork lowers a JSX element inside a hole.
+7. **`undefined`/`null` `children` attribute.** `<span children={undefined}/>`
+   (and `null`): Babel judges "literal" as "evaluates to a string or number",
+   so it promotes and emits `_$insert(_el$, undefined)`; this fork's promotion
+   filter asks whether the constant fold is confident at all, so it keeps the
+   value as an attribute and emits nothing. Identical in both positions.
+8. **Nested custom-element owner context.** `<div><my-widget id={i()}/></div>`
+   with `contextToCustomElements`: `lower_dom_element` emits the
+   `_$owner = _$getOwner()` assignment for a template-root custom element,
+   `lower_dynamic_native_child` emits nothing for a nested one. Independent of
+   `children` — a nested custom element with any dynamic content shows it.
 
 ## Execution sites
 
@@ -119,8 +161,28 @@ discard a child list:
   and an attribute value all discard the list unlowered and claim nothing
   inside it.
 - A `children` **attribute** on a void element is never promoted to a child
-  insert — the capture in `lower_dom_element` is gated on `!is_void_element` —
-  so it stays a `native-attribute` site resolved as `elided`.
+  insert — the capture is gated on `!is_void_element` in both
+  `lower_dom_element` and `lower_dynamic_native_child` — so it stays a
+  `native-attribute` site resolved as `elided`.
+- A `children` **attribute another writer of Babel's `children` slot takes
+  away**. `transformAttributes` fills one slot per element, so the value can be
+  captured and then discarded unlowered. This is a discarded *value*, not a
+  discarded list: nothing is emitted for it, so the census's `jsx-child` site is
+  decided as `elided` rather than retracted, and Babel emits nothing for it
+  either, so the decision is parity-clean. Three writers take the slot in
+  nested native-child position: a **dynamic `textContent` later in the
+  attribute list** (`<div><span children={x()} textContent={t()}/></div>` —
+  Babel's `children = t.jsxText(" ")` overwrites the capture; a `textContent`
+  *before* the attribute loses, and then both the effect and the insert are
+  emitted), the **textarea `value` fold**, which fills the child list in
+  preprocessing so `!hasChildren` blocks the push
+  (`<div><textarea value="lit" children={x()}/></div>`), and **`<noscript>`**,
+  whose pushed child list Babel never visits at all
+  (`if (tagName !== "noscript") transformChildren(…)`), so the capture is
+  discarded rather than promoted into an insert Babel does not emit. At the
+  template root the same shapes are reached differently: the fold retracts the
+  already-promoted child instead of eliding it, `<noscript>` is divergence 3
+  above, and the attribute-order contest is divergence 5.
 - A **nested** native element with a dynamic `textContent` replaces its content
   with a text placeholder and discards its source children; the recorder
   retracts their censused sites (divergence 2 above). The **template-root**
