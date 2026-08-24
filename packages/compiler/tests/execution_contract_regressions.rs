@@ -847,6 +847,15 @@ fn inert_noscript_children_reconcile_in_every_position() {
 /// fact-side-channel change; it may not move a byte of `transform()` output.
 #[test]
 fn discarded_child_shapes_do_not_move_transform_output() {
+    // Compare source maps for real: the shared `options()` leaves
+    // `source_map: false`, which would make the assertion below `None == None`.
+    let with_map = |semantic_trace: bool| CompileOptions {
+        source_map: true,
+        ..options(semantic_trace)
+    };
+    // One warm-up compile keeps Oxc's lazy source-map initialization out of
+    // the comparison, as host_independent_interface.rs does.
+    let _warmup = compile("const el = <div>{w()}</div>;", &with_map(false));
     for source in [
         "const el = <div><textarea value=\"lit\">{y()}</textarea></div>;",
         "const el = <div><textarea value>{y()}</textarea></div>;",
@@ -866,8 +875,8 @@ fn discarded_child_shapes_do_not_move_transform_output() {
         "const el = <div><br>{x()}</br></div>;",
         "const el = <br>{x()}</br>;",
     ] {
-        let traced = compile(source, &options(true)).expect("compile with tracing");
-        let plain = compile(source, &options(false)).expect("compile without tracing");
+        let traced = compile(source, &with_map(true)).expect("compile with tracing");
+        let plain = compile(source, &with_map(false)).expect("compile without tracing");
         assert_eq!(
             traced.code, plain.code,
             "{source}: tracing changed the emitted code"

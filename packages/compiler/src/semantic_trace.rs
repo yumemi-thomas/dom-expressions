@@ -914,6 +914,12 @@ impl TraceRecorder {
     /// Silence, not a site, is the truthful outcome: the emitted `insert` is
     /// still reported as an `owner_establishment`, exactly as for a
     /// literal-only source hole, and joins to no site.
+    ///
+    /// Invariant: `resolve()` consults these spans only when the census holds
+    /// no site there, and every span registered here is an attribute span,
+    /// which no source expression can exactly occupy. A future caller that
+    /// registers a span a censused source expression *does* occupy would
+    /// silence that site's decision instead of failing the file — do not.
     pub(crate) fn ignore_synthesized_child(&mut self, span: Span) {
         if self.census.is_some() && span.start < span.end {
             self.synthesized_spans.insert(span.into());

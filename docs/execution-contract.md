@@ -53,16 +53,20 @@ output is frozen:
    is reported as `jsx-child`/`reactive-rerun`. A consumer must treat a
    `jsx-child` site inside a void native element as **uncertifiable**.
 2. **Nested dynamic-`textContent` children.**
-   `<div><span textContent={x()}>{y()}</span></div>`: Babel emits both the text
-   placeholder and `_$insert(_el$2, y)`; this fork takes the placeholder branch
-   and drops the insert (it is missing Babel's `!hasChildren` gate, which the
-   template-root path does have). The discarded children's sites are retracted,
-   so a consumer must read that absence as **uncertifiable**, not as
-   no-execution.
+   `<div><span textContent={x()}>{y()}</span></div>`: Babel emits no
+   placeholder there — template `` `<div><span>` ``, `_$insert(_el$2, y)`, and
+   an effect writing `_el$3.data` where `_el$3 = _el$2.firstChild` is whatever
+   the insert produced; its text placeholder appears only in the no-children
+   shape (`<div><span textContent={x()}/>`). This fork takes the placeholder
+   branch even with children — it is missing Babel's `!hasChildren` gate,
+   which its own template-root path does have — and drops the insert. The
+   discarded children's sites are retracted, so a consumer must read that
+   absence as **uncertifiable**, not as no-execution.
 3. **Template-root `<noscript>` children.** `<noscript>{x()}</noscript>`: Babel
    drops `<noscript>` children in every position; this fork drops them only on
    the static-template fast path, and where the `<noscript>` is its own template
-   root (a bare root, a fragment child) emits `_$insert(_el$, x)`. The census
+   root (a bare root, a fragment child, a component child, an attribute
+   value) emits `_$insert(_el$, x)`. The census
    follows the emission, so the site is reported; a consumer must treat a
    `jsx-child` site inside a `<noscript>` as **uncertifiable**. (The same
    applies to a nested `<noscript>` whose attributes force it off the fast
@@ -74,8 +78,11 @@ output is frozen:
    a hard reconciliation failure** — the census names a `jsx-child` site that
    lowering never resolves, and the file is rejected. That failure is the
    divergence's only detection signal, so it is kept rather than papered over
-   with a retraction; the same shape at template root (`<span children={x()}/>`)
-   agrees with Babel and reconciles.
+   with a retraction. It fails only when the element has **no source
+   children**: with them (`<div><span children={x()}>{y()}</span></div>`) both
+   compilers insert only `y` and ignore the attribute, which this fork reports
+   as `native-attribute`/`elided`, and the file reconciles. The same shape at
+   template root (`<span children={x()}/>`) agrees with Babel and reconciles.
 
 ## Execution sites
 
@@ -141,7 +148,9 @@ discard a child list:
   like a literal-only source hole's `insert` it joins to no site.
 - **`<noscript>` on the static-template fast path.** Its markup is inert, so
   `lower_static_native_template` emits the tag and returns without visiting the
-  children at all — the fold's replacement included. Babel drops them too, so
+  children at all — the fold's replacement included. The retraction prunes
+  every site in the unvisited subtree, attribute, `ref` and handler sites
+  included, not only `jsx-child` ones. Babel drops the same subtree, so
   the retraction is parity-clean. A `<noscript>` whose attributes force it off
   the fast path, and one that is its own template root, do lower their children
   and keep their sites (divergence 3 above).
