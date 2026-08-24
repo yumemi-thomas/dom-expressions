@@ -41,6 +41,35 @@ Literal-only expressions are not sites. When a lowering path discards a
 censused value, the value itself may be recorded as `elided`; nested source
 that never reaches a 2.0 lowering path is not invented as a separate site.
 
+### Discarded child lists
+
+A child list a lowering path drops without visiting produces no sites at all —
+not even `elided` ones, because no value is written. The census and lowering
+must agree on which lists those are:
+
+- A **void native element** keeps its children only in nested native-child
+  position, where `lower_dynamic_native_child` walks into `lower_dom_children`
+  unconditionally: `<div><br>{x()}</br></div>` emits a real reactive `insert`
+  into the `<br>`, and the child is a `jsx-child` site like any other. In every
+  other position the void element is its own template root and
+  `lower_dom_element` gates child lowering on `!is_void_element`, so a bare JSX
+  root, a fragment child, a component child and an attribute value all discard
+  the list unlowered and claim nothing inside it.
+  (The parity-target Babel plugin discards the list in *all* positions; the
+  nested `insert` is a transform divergence in this fork, and the trace reports
+  what this compiler emits.)
+- A `children` **attribute** on a void element is never promoted to a child
+  insert — the capture in `lower_dom_element` is gated on `!is_void_element` —
+  so it stays a `native-attribute` site resolved as `elided`.
+- A nested native element with a dynamic `textContent` replaces its content
+  with a text placeholder and discards its source children; the recorder
+  retracts their censused sites. The template-root path only takes the
+  placeholder branch when the element has no children of its own, so nothing is
+  discarded there.
+
+Attributes are not children: a void element's attributes, events and refs lower
+in both positions and keep their sites.
+
 ## Additive wrapper facts
 
 `owner_establishments` contains `{ span, wrapper, group_id? }`. It records

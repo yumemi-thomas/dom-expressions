@@ -845,6 +845,20 @@ impl<'a> AstDomTransform<'a, '_> {
         Ok(self.call_identifier(child.span, "_$getNextMatch", vec![base, tag]))
     }
 
+    /// Withdraw the censused execution sites of a child list this lowering
+    /// discards without visiting. The children occupy one contiguous source
+    /// range, so every site inside it belongs to the discarded subtree.
+    fn retract_children_sites(&mut self, children: &[JSXChild<'a>]) {
+        let Some(first) = children.first() else {
+            return;
+        };
+        let last = children
+            .last()
+            .expect("a non-empty child list has a last child");
+        self.semantic_trace
+            .retract_within(oxc_span::Span::new(first.span().start, last.span().end));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn lower_dynamic_native_child(
         &mut self,
@@ -876,6 +890,10 @@ impl<'a> AstDomTransform<'a, '_> {
             dynamics,
         )?;
 
+        // The source child list, before any attribute-driven replacement: this
+        // is the range the placeholder branch below discards.
+        let source_children = child.children.as_slice();
+
         // Babel's textarea `value` fold replaces the element's children.
         let child: &JSXElement<'a> = match attrs_lowering.children_replacement {
             Some(replacement) => {
@@ -889,6 +907,14 @@ impl<'a> AstDomTransform<'a, '_> {
 
         child_template.push_both(">");
         if attrs_lowering.needs_text_placeholder {
+            // A dynamic `textContent` takes over this element's content: the
+            // template gets a single-space text node the effect writes into and
+            // the source child list is discarded, unlowered. (The template-root
+            // path in `element.rs` only does this when the element has no
+            // children of its own — Babel's `!hasChildren` gate — so nothing is
+            // discarded there.) Withdraw the discarded children's censused
+            // sites: no code is emitted for them, so there is nothing to decide.
+            self.retract_children_sites(source_children);
             child_template.html.push(' ');
         } else {
             self.lower_dom_children(

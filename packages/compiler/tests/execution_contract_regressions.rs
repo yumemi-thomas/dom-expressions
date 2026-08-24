@@ -431,3 +431,208 @@ fn disabled_wrappers_do_not_invent_wrapper_facts() {
             .all(|fact| fact.wrapper != "effect" && fact.wrapper != "memo")
     );
 }
+
+/// A void element's child list is dropped by the parity-target Babel plugin in
+/// every position; this fork's `lower_dynamic_native_child` keeps it in *nested*
+/// native-child position and emits a real reactive `insert` into the void
+/// element (a transform-parity divergence that is out of scope here, since
+/// `transform()` output is frozen). Either way the census and lowering must
+/// agree: the nested shape reports the site it emits, the template-root shapes
+/// report nothing, and no file fails reconciliation.
+#[test]
+fn void_element_children_reconcile_in_every_position() {
+    let nested = "const el = <div><br>{x()}</br></div>;";
+    let rendered = trace(nested);
+    assert_eq!(
+        rendered
+            .sites
+            .iter()
+            .map(|site| (
+                source_text(nested, site.span.start, site.span.end),
+                site.kind,
+                site.decision
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            "x()",
+            ExecutionSiteKind::JsxChild,
+            TerminalDecision::Value(ValueDecision::ReactiveRerun)
+        )],
+        "a nested void element's lowered child must be censused and decided"
+    );
+    assert_eq!(
+        rendered
+            .ownership_sites
+            .iter()
+            .map(|site| source_text(nested, site.span.start, site.span.end))
+            .collect::<Vec<_>>(),
+        ["x()"]
+    );
+
+    // Every other position makes the void element its own template root, where
+    // `lower_dom_element` discards the child list without emitting anything.
+    // The discarded child list is the source range between the void element's
+    // `>` and its closing tag; nothing inside it may claim a site. (An
+    // attribute-position void element still has its own attribute-value site
+    // for the whole JSX expression, which is why this checks the range rather
+    // than emptiness.)
+    for (source, discarded) in [
+        ("const el = <br>{x()}</br>;", "{x()}"),
+        ("const el = <><br>{x()}</br></>;", "{x()}"),
+        ("const el = <Comp><br>{x()}</br></Comp>;", "{x()}"),
+        ("const el = <div a={<br>{x()}</br>} />;", "{x()}"),
+        (
+            "const el = <br><span class={x()}>{y()}</span></br>;",
+            "<span class={x()}>{y()}</span>",
+        ),
+        ("const el = <br>{...x}</br>;", "{...x}"),
+    ] {
+        let start = source.find(discarded).expect("discarded range") as u32;
+        let end = start + discarded.len() as u32;
+        let rendered = trace(source);
+        let inside = rendered
+            .sites
+            .iter()
+            .filter(|site| site.span.start >= start && site.span.end <= end)
+            .collect::<Vec<_>>();
+        assert!(
+            inside.is_empty(),
+            "{source}: a discarded void child list must claim no site, got {inside:?}"
+        );
+        assert!(
+            rendered
+                .ownership_sites
+                .iter()
+                .all(|site| site.span.start < start || site.span.end > end),
+            "{source}: a discarded void child list must claim no ownership site"
+        );
+    }
+
+    // `children` on a void element is never promoted to a child insert —
+    // `lower_dom_element` gates the capture on `!is_void_element`, and like
+    // Babel it emits nothing — so it stays an attribute site resolved as data.
+    for source in [
+        "const el = <br children={x()} />;",
+        "const el = <div><br children={x()} /></div>;",
+    ] {
+        let rendered = trace(source);
+        assert_eq!(
+            rendered
+                .sites
+                .iter()
+                .map(|site| (
+                    source_text(source, site.span.start, site.span.end),
+                    site.kind,
+                    site.decision
+                ))
+                .collect::<Vec<_>>(),
+            [(
+                "x()",
+                ExecutionSiteKind::NativeAttribute,
+                TerminalDecision::Value(ValueDecision::Elided)
+            )],
+            "{source}: a void `children` attribute is not a child insert"
+        );
+    }
+
+    // A void element's *attributes* are not children: they lower in both
+    // positions and must keep their sites.
+    for source in [
+        "const el = <div><br class={x()} /></div>;",
+        "const el = <br class={x()} />;",
+        "const el = <div><br class={x()}>{y()}</br></div>;",
+    ] {
+        let rendered = trace(source);
+        assert!(
+            rendered.sites.iter().any(|site| {
+                source_text(source, site.span.start, site.span.end) == "x()"
+                    && site.kind == ExecutionSiteKind::NativeAttribute
+                    && site.decision == TerminalDecision::Value(ValueDecision::ReactiveRerun)
+            }),
+            "{source}: a void element's attribute site must survive, got {:?}",
+            rendered.sites
+        );
+    }
+}
+
+/// A void element must not perturb its siblings' or a plain element's facts.
+#[test]
+fn void_children_leave_neighbouring_facts_untouched() {
+    let source = "const el = <div><br>{x()}</br><span>{y()}</span></div>;";
+    let rendered = trace(source);
+    assert_eq!(
+        rendered
+            .sites
+            .iter()
+            .map(|site| (
+                source_text(source, site.span.start, site.span.end),
+                site.kind,
+                site.decision
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "x()",
+                ExecutionSiteKind::JsxChild,
+                TerminalDecision::Value(ValueDecision::ReactiveRerun)
+            ),
+            (
+                "y()",
+                ExecutionSiteKind::JsxChild,
+                TerminalDecision::Value(ValueDecision::ReactiveRerun)
+            ),
+        ]
+    );
+
+    let plain = "const el = <div><span>{y()}</span></div>;";
+    let rendered = trace(plain);
+    assert_eq!(
+        rendered
+            .sites
+            .iter()
+            .map(|site| (
+                source_text(plain, site.span.start, site.span.end),
+                site.kind,
+                site.decision
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            "y()",
+            ExecutionSiteKind::JsxChild,
+            TerminalDecision::Value(ValueDecision::ReactiveRerun)
+        )]
+    );
+    assert_eq!(
+        rendered
+            .ownership_sites
+            .iter()
+            .map(|site| source_text(plain, site.span.start, site.span.end))
+            .collect::<Vec<_>>(),
+        ["y()"]
+    );
+}
+
+/// A nested element whose dynamic `textContent` replaces its content discards
+/// the source child list unlowered (the template-root path in `element.rs`
+/// keeps it). The discarded children must claim no site.
+#[test]
+fn dynamic_text_content_retracts_the_children_it_discards() {
+    for source in [
+        "const el = <div><span textContent={x()}>{y()}</span></div>;",
+        "const el = <div><br textContent={x()}>{y()}</br></div>;",
+    ] {
+        let rendered = trace(source);
+        assert_eq!(
+            rendered
+                .sites
+                .iter()
+                .map(|site| (
+                    source_text(source, site.span.start, site.span.end),
+                    site.kind
+                ))
+                .collect::<Vec<_>>(),
+            [("x()", ExecutionSiteKind::NativeAttribute)],
+            "{source}: only the textContent attribute survives"
+        );
+    }
+}
