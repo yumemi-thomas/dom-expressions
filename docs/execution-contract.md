@@ -150,8 +150,8 @@ regeneration — see "The transform baseline" below:
    nested one added here — both call the same function.
 
 Divergences found while resolving 4 above, all pre-existing and none of them
-nested-path-specific. Divergence 5 is resolved for template roots above; the
-remaining entries below are still open:
+nested-path-specific. Divergences 5 and 6 are resolved; entries 7-9 remain
+open:
 
 5. **Template-root slot order.** *Resolved for the template-root path.*
    `<span children={x()} textContent={t()}/>`: Babel's
@@ -163,10 +163,14 @@ remaining entries below are still open:
    retain the `children` insert, matching Babel. This fix is intentionally
    limited to template roots; the reopened nested residue above is a separate
    static-path issue.
-6. **JSX-valued holes.** `<span children={<b>{x()}</b>}/>` and the plain
-   `<span>{<b>{x()}</b>}</span>` both emit Babel's `() => (() => {…})()` as
-   `() => {…}` — the same expression, a different lowering shape. Unrelated to
-   `children`; it is how this fork lowers a JSX element inside a hole.
+6. **JSX-valued holes.** *Resolved across DOM, SSR, universal, and dynamic
+   modes.* `<span children={<b>{x()}</b>}/>` and the plain
+   `<span>{<b>{x()}</b>}</span>` now preserve Babel's raw-expression ordering:
+   the outer child getter is created before deferred JSX lowering, so the
+   element setup remains an IIFE inside the getter (`() => (() => {…})()`) and
+   SSR retains Babel's expression-scope `var` hoisting. The focused probes pin
+   both source forms in all ten parity modes. This is unrelated to `children`
+   promotion; it is the common JSX-valued child-hole path.
 7. **`undefined`/`null` `children` attribute.** `<span children={undefined}/>`
    (and `null`): Babel judges "literal" as "evaluates to a string or number",
    so it promotes and emits `_$insert(_el$, undefined)`; this fork's promotion

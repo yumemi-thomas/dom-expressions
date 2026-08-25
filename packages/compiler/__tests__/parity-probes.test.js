@@ -2058,6 +2058,12 @@ const a = <div><span textContent={t()} children={x()} children={"s"} /></div>;
 `,
   "nested children attribute literal duplicate before dynamic textContent": `
 const a = <div><span children={x()} children={"s"} textContent={t()} /></div>;
+`,
+  "jsx-valued native children attribute": `
+const a = <span children={<b>{x()}</b>} />;
+`,
+  "jsx-valued native child hole": `
+const a = <span>{<b>{x()}</b>}</span>;
 `
 };
 

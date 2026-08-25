@@ -1109,12 +1109,27 @@ impl<'a, 'source> AstUniversalTransform<'a, 'source> {
                     .is_dynamic(Some(container.span.start), expression, false)
             });
         let mut value = jsx_expression_to_expression(&container.expression, self.allocator);
-        self.visit_expression(&mut value);
-        let value = if dynamic {
-            self.universal_child_expression(container.span, value)
+        let jsx_valued = matches!(
+            value,
+            Expression::JSXElement(_) | Expression::JSXFragment(_)
+        );
+        let deferred_jsx = dynamic && jsx_valued;
+        let mut value = if deferred_jsx {
+            // Babel wraps the raw expression first. Deferred JSX lowering
+            // therefore produces `() => (() => { ... })()` rather than
+            // folding the element setup directly into the outer getter.
+            crate::shared::ast::concise_arrow_thunk(self.allocator, container.span, value)
         } else {
-            value
+            self.visit_expression(&mut value);
+            if dynamic {
+                self.universal_child_expression(container.span, value)
+            } else {
+                value
+            }
         };
+        if deferred_jsx {
+            self.visit_expression(&mut value);
+        }
         plans.push(ChildPlan::Value {
             span: container.span,
             value,

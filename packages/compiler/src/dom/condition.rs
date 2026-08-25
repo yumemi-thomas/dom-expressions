@@ -115,6 +115,16 @@ impl<'a> AstDomTransform<'a, '_> {
         span: Span,
         value: Expression<'a>,
     ) -> Expression<'a> {
+        // Babel wraps the raw child expression before its outer traversal
+        // lowers JSX. Keep a JSX-valued hole in a concise thunk so that later
+        // lowering leaves the element setup in an IIFE inside the getter
+        // instead of inlining that setup into the getter body.
+        if matches!(
+            value,
+            Expression::JSXElement(_) | Expression::JSXFragment(_)
+        ) {
+            return crate::shared::ast::concise_arrow_thunk(self.allocator, span, value);
+        }
         if self.wrap_conditionals && is_condition_shape(&value) {
             return transform_condition(self, span, value, false)
                 .into_expression(self.allocator, span);

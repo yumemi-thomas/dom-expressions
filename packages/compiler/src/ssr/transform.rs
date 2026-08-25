@@ -2355,6 +2355,16 @@ impl<'a, 'source> AstSsrTransform<'a, 'source> {
         if !dynamic {
             return expression;
         }
+        // Babel creates the child thunk while the JSX value is still raw;
+        // its outer traversal lowers the element later, leaving the generated
+        // setup IIFE inside this getter and preserving expression-scope var
+        // hoisting in SSR.
+        if matches!(
+            expression,
+            Expression::JSXElement(_) | Expression::JSXFragment(_)
+        ) {
+            return crate::shared::ast::concise_arrow_thunk(self.allocator, span, expression);
+        }
         if self.wrap_conditionals && is_condition_shape(&expression) {
             let transformed = transform_condition(self, span, expression, false);
             return transformed.into_expression(self.allocator, span);
