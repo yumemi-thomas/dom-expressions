@@ -859,6 +859,23 @@ impl<'a> AstDomTransform<'a, '_> {
             .retract_within(oxc_span::Span::new(first.span().start, last.span().end));
     }
 
+    /// Resolve a void element's unvisited template-root child list as one
+    /// elided range. The census suppresses nested sites under the same range,
+    /// so consumers receive positive evidence that nothing inside executes.
+    pub(crate) fn discard_void_children_sites(&mut self, children: &[JSXChild<'a>]) {
+        let Some(first) = children.first() else {
+            return;
+        };
+        let last = children
+            .last()
+            .expect("a non-empty child list has a last child");
+        self.semantic_trace.value(
+            oxc_span::Span::new(first.span().start, last.span().end),
+            crate::ExecutionSiteKind::JsxChild,
+            crate::ValueDecision::Elided,
+        );
+    }
+
     /// Reconcile the census with the textarea `value` fold, which replaces an
     /// element's children with one child synthesized from the attribute
     /// (Babel's `path.node.children = [child]`). Both halves of that swap are

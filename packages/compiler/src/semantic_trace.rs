@@ -438,6 +438,12 @@ impl ExecutionCensus {
                     }
                 }
             }
+
+            fn child_list_span(children: &[JSXChild<'_>]) -> Option<Span> {
+                let first = children.first()?;
+                let last = children.last()?;
+                Some(Span::new(first.span().start, last.span().end))
+            }
         }
 
         impl<'b> Visit<'b> for CensusVisitor<'_, '_> {
@@ -663,6 +669,9 @@ impl ExecutionCensus {
                         .nested_void_elements
                         .contains(&SourceSpan::from(element.span))
                 {
+                    if let Some(span) = Self::child_list_span(&element.children) {
+                        self.push(span, ExecutionSiteKind::JsxChild);
+                    }
                     oxc_ast_visit::walk::walk_jsx_opening_element(self, &element.opening_element);
                     return;
                 }

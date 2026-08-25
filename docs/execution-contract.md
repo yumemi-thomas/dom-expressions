@@ -210,11 +210,10 @@ that never reaches a 2.0 lowering path is not invented as a separate site.
 
 ### Discarded child lists
 
-A child list a lowering path drops without visiting produces no sites at all —
-not even `elided` ones, because no value is written. Where the census, which
-walks source only, cannot see the drop, the recorder retracts the affected
-sites during lowering. This is the complete enumeration of the DOM paths that
-discard a child list:
+A template-root void child list is reported as one `elided` range, giving
+consumers positive evidence that nothing inside it executes. Other child-list
+discards still retract their affected sites where the source-only census cannot
+see the lowering decision. This is the complete enumeration of those DOM paths:
 
 - A **void native element** keeps its children only in nested native-child
   position, where `lower_dynamic_native_child` walks into `lower_dom_children`
@@ -223,8 +222,8 @@ discard a child list:
   (divergence 1 above). In every other position the void element is its own
   template root and `lower_dom_element` gates child lowering on
   `!is_void_element`, so a bare JSX root, a fragment child, a component child
-  and an attribute value all discard the list unlowered and claim nothing
-  inside it.
+  and an attribute value all discard the list unlowered and report the whole
+  list as one `elided` range.
 - A `children` **attribute** on a void element is never promoted to a child
   insert — the capture is gated on `!is_void_element` in both
   `lower_dom_element` and `lower_dynamic_native_child` — so it stays a
