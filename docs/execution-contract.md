@@ -119,7 +119,10 @@ regeneration — see "The transform baseline" below:
    This branch does not add a nested workaround or alter upstream's `children`
    semantics. The semantic trace remains truthful about upstream's output: a
    skipped value is resolved as elided, and no synthetic child site is
-   invented.
+   invented. If that skipped value is itself JSX, every nested census site is
+   withdrawn before the outer value is marked elided; otherwise a shadowed
+   `children={<b>{x()}</b>}` would fail the whole file with an unresolved inner
+   child site even though the emitter deletes that subtree.
 
    The shapes that still agree remain asserted: source children shadow the
    attribute, void elements and spreads do not promote it, and the surviving

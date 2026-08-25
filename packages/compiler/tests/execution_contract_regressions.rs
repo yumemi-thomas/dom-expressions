@@ -636,10 +636,11 @@ fn dynamic_text_content_reports_upstream_discarded_children() {
         )]
     );
     assert!(
-        rendered
-            .owner_establishments
-            .iter()
-            .all(|fact| source_text(source, fact.span.start, fact.span.end) != "y()"),
+        rendered.owner_establishments.iter().all(|fact| source_text(
+            source,
+            fact.span.start,
+            fact.span.end
+        ) != "y()"),
         "the discarded child must not acquire an invented owner"
     );
 
@@ -909,6 +910,39 @@ fn native_children_trace_matches_the_selected_lowering_path() {
             rendered.owner_establishments
         );
     }
+
+    // Source children shadow the whole attribute value. A JSX-valued loser
+    // contains a nested child site of its own; that inner site is absent from
+    // output and must be withdrawn while the outer attribute site remains an
+    // explicit elided region for consumers.
+    let source = "const el = <div><span children={<b>{hidden()}</b>}>{visible()}</span></div>;";
+    let rendered = trace(source);
+    assert!(
+        rendered.sites.iter().any(|site| {
+            source_text(source, site.span.start, site.span.end) == "<b>{hidden()}</b>"
+                && site.kind == ExecutionSiteKind::NativeAttribute
+                && site.decision == TerminalDecision::Value(ValueDecision::Elided)
+        }),
+        "{source}: the discarded outer value remains explicit, got {:?}",
+        rendered.sites
+    );
+    assert!(
+        rendered
+            .sites
+            .iter()
+            .all(|site| { source_text(source, site.span.start, site.span.end) != "hidden()" }),
+        "{source}: the unvisited nested site must be withdrawn, got {:?}",
+        rendered.sites
+    );
+    assert!(
+        rendered.sites.iter().any(|site| {
+            source_text(source, site.span.start, site.span.end) == "visible()"
+                && site.kind == ExecutionSiteKind::JsxChild
+                && site.decision == TerminalDecision::Value(ValueDecision::ReactiveRerun)
+        }),
+        "{source}: the source child remains live, got {:?}",
+        rendered.sites
+    );
 
     // Dynamic attributes or callbacks force full nested lowering, but
     // upstream still does not promote the `children` value there.
