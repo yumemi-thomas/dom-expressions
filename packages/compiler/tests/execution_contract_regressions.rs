@@ -944,6 +944,26 @@ fn native_children_trace_matches_the_selected_lowering_path() {
         rendered.sites
     );
 
+    let source = "const el = <span children={<b>{hidden()}</b>}>{visible()}</span>;";
+    let rendered = trace(source);
+    assert!(
+        rendered.sites.iter().any(|site| {
+            source_text(source, site.span.start, site.span.end) == "<b>{hidden()}</b>"
+                && site.kind == ExecutionSiteKind::NativeAttribute
+                && site.decision == TerminalDecision::Value(ValueDecision::Elided)
+        }),
+        "{source}: the root discarded outer value remains explicit, got {:?}",
+        rendered.sites
+    );
+    assert!(
+        rendered
+            .sites
+            .iter()
+            .all(|site| source_text(source, site.span.start, site.span.end) != "hidden()"),
+        "{source}: the root unvisited nested site must be withdrawn, got {:?}",
+        rendered.sites
+    );
+
     // Dynamic attributes or callbacks force full nested lowering, but
     // upstream still does not promote the `children` value there.
     for source in [

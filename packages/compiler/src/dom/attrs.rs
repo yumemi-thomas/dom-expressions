@@ -191,6 +191,10 @@ impl<'a> AstDomTransform<'a, '_> {
                     // census sites inside its outer attribute-value site. The
                     // whole value is skipped, so withdraw those inner sites
                     // before deciding the retained outer site as elided.
+                    self.semantic_trace.resolve_lowered_attribute(
+                        span,
+                        crate::semantic_trace::ValueDecision::Elided,
+                    );
                     if plan.key == "children"
                         && !children_from_attribute
                         && matches!(
@@ -198,12 +202,11 @@ impl<'a> AstDomTransform<'a, '_> {
                             PlanValue::Expr(Expression::JSXElement(_) | Expression::JSXFragment(_))
                         )
                     {
+                        // Decide first: `span` may include the container around
+                        // the outer census site, and decided sites survive the
+                        // subsequent subtree retraction by contract.
                         self.semantic_trace.retract_within(span);
                     }
-                    self.semantic_trace.resolve_lowered_attribute(
-                        span,
-                        crate::semantic_trace::ValueDecision::Elided,
-                    );
                 }
             }
             match disposition {
