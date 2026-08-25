@@ -357,6 +357,8 @@ impl<'a, 'source> AstDomTransform<'a, 'source> {
                     &mut dynamics,
                 )?;
             }
+        } else {
+            self.discard_void_children_sites(&element.children);
         }
         // All dynamic attribute bindings collected across this template root
         // batch into one patch body (eligible scopes — Babel's wrapPatchMode)

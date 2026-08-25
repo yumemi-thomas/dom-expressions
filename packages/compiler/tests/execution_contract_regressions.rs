@@ -437,8 +437,8 @@ fn disabled_wrappers_do_not_invent_wrapper_facts() {
 /// native-child position and emits a real reactive `insert` into the void
 /// element (divergence 1 in docs/execution-contract.md, still open and out of
 /// scope for this test). Either way the census and lowering must
-/// agree: the nested shape reports the site it emits, the template-root shapes
-/// report nothing, and no file fails reconciliation.
+/// agree: the nested shape reports the site it emits, while each template-root
+/// shape reports its discarded list as one elided range.
 #[test]
 fn void_element_children_reconcile_in_every_position() {
     let nested = "const el = <div><br>{x()}</br></div>;";
@@ -472,7 +472,7 @@ fn void_element_children_reconcile_in_every_position() {
     // Every other position makes the void element its own template root, where
     // `lower_dom_element` discards the child list without emitting anything.
     // The discarded child list is the source range between the void element's
-    // `>` and its closing tag; nothing inside it may claim a site. (An
+    // `>` and its closing tag; it becomes one elided site. (An
     // attribute-position void element still has its own attribute-value site
     // for the whole JSX expression, which is why this checks the range rather
     // than emptiness.)
@@ -495,9 +495,14 @@ fn void_element_children_reconcile_in_every_position() {
             .iter()
             .filter(|site| site.span.start >= start && site.span.end <= end)
             .collect::<Vec<_>>();
-        assert!(
-            inside.is_empty(),
-            "{source}: a discarded void child list must claim no site, got {inside:?}"
+        assert_eq!(inside.len(), 1, "{source}: {inside:?}");
+        assert_eq!(inside[0].span.start, start, "{source}");
+        assert_eq!(inside[0].span.end, end, "{source}");
+        assert_eq!(inside[0].kind, ExecutionSiteKind::JsxChild, "{source}");
+        assert_eq!(
+            inside[0].decision,
+            TerminalDecision::Value(ValueDecision::Elided),
+            "{source}"
         );
         assert!(
             rendered

@@ -8,6 +8,8 @@
 
 ### Patch Changes
 
+- Report template-root void-element child lists as one elided semantic-trace
+  range. Nested native void children remain live under `next` semantics.
 - 152cb59: The WASI compiler binary links on rust-lld 1.95 again. `napi-build` 2.4.1 hard-exported `emnapi_create_env` / `emnapi_delete_env` for emnapi v2 archives; we still ship emnapi 1.x, so those `--export`s now use `--export-if-defined`.
 - b277167: Expose a host-independent Rust compile API while keeping the existing Node
   adapter and its interface enabled by default. The Rust API surface is
