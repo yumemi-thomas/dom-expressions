@@ -187,6 +187,19 @@ impl<'a> AstDomTransform<'a, '_> {
                 // sites and withdraws callback sites, so a folded
                 // `on*`/`ref`/`children` no longer fails the file.
                 if let Some(span) = plan.semantic_span {
+                    // A shadowed JSX-valued `children` attribute owns nested
+                    // census sites inside its outer attribute-value site. The
+                    // whole value is skipped, so withdraw those inner sites
+                    // before deciding the retained outer site as elided.
+                    if plan.key == "children"
+                        && !children_from_attribute
+                        && matches!(
+                            &plan.value,
+                            PlanValue::Expr(Expression::JSXElement(_) | Expression::JSXFragment(_))
+                        )
+                    {
+                        self.semantic_trace.retract_within(span);
+                    }
                     self.semantic_trace.resolve_lowered_attribute(
                         span,
                         crate::semantic_trace::ValueDecision::Elided,
